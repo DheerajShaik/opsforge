@@ -1,0 +1,13 @@
+# Operating system metadata
+.DS_Store
+Thumbs.db
+
+# Editor and temporary files
+*~
+*.swp
+*.swo
+*.tmp
+*.temp
+
+# Local logs
+*.log
