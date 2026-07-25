@@ -4,7 +4,7 @@ OpsForge is an evolving open-source collection of practical Linux, DevOps, and S
 
 The project begins with focused utilities. Useful tools may mature over time through implementation improvements, automated testing, failure-path coverage, real-world usage, community feedback, compatibility validation, security analysis, documentation, and relevant integrations.
 
-OpsForge is currently in **Phase 0: Repository Foundation**. No utility functionality has been implemented yet.
+OpsForge has completed its repository foundation and now includes its first experimental utility, PortLens.
 
 ## Why OpsForge
 
@@ -39,31 +39,29 @@ These principles describe the intended engineering direction. They are not claim
 
 ## Current status
 
-OpsForge is in the repository foundation stage.
+OpsForge is in its early utility implementation stage.
 
-- No utilities have been implemented yet.
-- No utility directories exist yet.
-- PortLens is planned as the first utility in Phase 1.
+- PortLens has an experimental first implementation in Phase 1.
 - The roadmap may evolve as the project learns from implementation and usage.
 - Interfaces may evolve as utilities mature.
 - Nothing in the repository currently represents a production-ready utility.
 
 ## Planned utilities
 
-The following utilities are part of the initial roadmap. They are planned, not currently implemented.
+The following utilities are part of the initial roadmap. PortLens is experimental; the remaining utilities are planned and not currently implemented.
 
-| Utility | Planned purpose |
-| --- | --- |
-| PortLens | Inspect Linux network ports and determine what owns them. |
-| DiskHound | Diagnose filesystem and disk-space consumption. |
-| CertWatch | Inspect TLS certificates and certificate expiration. |
-| SvcDoctor | Diagnose Linux systemd service failures. |
-| LogHound | Analyze Linux and application logs for recurring or abnormal patterns. |
-| ProcWatch | Inspect Linux processes and abnormal resource behavior. |
-| ConfigDiff | Detect Linux configuration drift. |
-| NetDoctor | Provide structured network connectivity diagnostics. |
-| HealthCtl | Future configurable host and service health-check capability whose design should emerge from proven requirements. |
-| Incident Snapshot | Collect useful local Linux diagnostic information during incidents with strong security and privacy considerations. |
+| Utility | Status | Purpose |
+| --- | --- | --- |
+| [PortLens](portlens/README.md) | Experimental | Inspect TCP listening sockets matching a local Linux port and report available process metadata. |
+| DiskHound | Planned | Diagnose filesystem and disk-space consumption. |
+| CertWatch | Planned | Inspect TLS certificates and certificate expiration. |
+| SvcDoctor | Planned | Diagnose Linux systemd service failures. |
+| LogHound | Planned | Analyze Linux and application logs for recurring or abnormal patterns. |
+| ProcWatch | Planned | Inspect Linux processes and abnormal resource behavior. |
+| ConfigDiff | Planned | Detect Linux configuration drift. |
+| NetDoctor | Planned | Provide structured network connectivity diagnostics. |
+| HealthCtl | Planned | Future configurable host and service health-check capability whose design should emerge from proven requirements. |
+| Incident Snapshot | Planned | Collect useful local Linux diagnostic information during incidents with strong security and privacy considerations. |
 
 ## Initial roadmap phases
 
