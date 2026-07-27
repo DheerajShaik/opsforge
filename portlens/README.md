@@ -20,15 +20,6 @@ It does not scan networks, inspect UDP or connected TCP sockets, traverse networ
 - Python 3
 - `ss`, commonly provided by iproute2
 
-PortLens invokes separate fixed `ss` queries for IPv4 and IPv6. The parser is conservatively fixture-tested, including regression fixtures derived from the genuine output described below. No broad `ss` or distribution compatibility is claimed.
-
-Readable procfs is optional and is used only for process enrichment. PortLens can report socket information when procfs metadata is unavailable.
-
-## Tested environment
-
-Manual validation was completed with Python 3 on Ubuntu 24.04.1 LTS under WSL using iproute2 `ss` 6.1.0. Controlled IPv4 and IPv6 listeners were exercised with both loopback and wildcard bindings. Matching sockets returned exit 0, a successful no-match inspection returned exit 1, and invalid input returned exit 2.
-
-This records observed behavior in one tested environment. It is not a compatibility or support matrix, universal Ubuntu, WSL, iproute2, or Linux compatibility evidence, a stability guarantee, or a production-readiness claim.
 
 ## Usage
 
@@ -88,7 +79,7 @@ Run the standard-library test suite from the repository root:
 python3 -m unittest discover -s portlens/tests -v
 ```
 
-The suite covers input validation, sanitized representative `ss` fixtures, regression fixtures derived from the tested live output, conservative parser failures, enrichment degradation, deterministic rendering, subprocess safety, CLI streams, and exit codes. One validated environment does not substitute for broader live integration testing with other `ss` releases and Linux environments.
+
 
 ## Current limitations and future direction
 

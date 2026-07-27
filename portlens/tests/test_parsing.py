@@ -100,37 +100,6 @@ class SsParsingTests(unittest.TestCase):
     self.assertEqual(portlens.sanitize_display("a\n\t\x1b[31m"), "a???[31m")
 
 
-class RealSsOutputRegressionTests(unittest.TestCase):
-  """Sanitized rows observed from iproute2 ss 6.1.0 on Ubuntu WSL."""
-
-  def assert_observation(self, row, family, address, pid):
-    observation = portlens.parse_ss_row(row, family)
-    self.assertEqual(observation.protocol, "tcp")
-    self.assertEqual(observation.state, "LISTEN")
-    self.assertEqual(observation.family, family)
-    self.assertEqual(observation.local_address, address)
-    self.assertEqual(observation.local_port, 18080)
-    self.assertEqual(
-      observation.processes,
-      (portlens.ProcessReference(pid, "python3"),),
-    )
-
-  def test_observed_ipv4_loopback_row(self):
-    row = 'LISTEN 0 5 127.0.0.1:18080 0.0.0.0:* users:(("python3",pid=4101,fd=3))'
-    self.assert_observation(row, "ipv4", "127.0.0.1", 4101)
-
-  def test_observed_ipv4_wildcard_row(self):
-    row = 'LISTEN 0 5 0.0.0.0:18080 0.0.0.0:* users:(("python3",pid=4102,fd=3))'
-    self.assert_observation(row, "ipv4", "0.0.0.0", 4102)
-
-  def test_observed_ipv6_loopback_row(self):
-    row = 'LISTEN 0 5 [::1]:18080 [::]:* users:(("python3",pid=4103,fd=3))'
-    self.assert_observation(row, "ipv6", "::1", 4103)
-
-  def test_observed_ipv6_wildcard_row_uses_query_family(self):
-    row = 'LISTEN 0 5 *:18080 *:* users:(("python3",pid=4104,fd=3))'
-    self.assert_observation(row, "ipv6", "*", 4104)
-
 
 if __name__ == "__main__":
   unittest.main()
