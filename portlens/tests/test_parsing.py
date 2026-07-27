@@ -100,5 +100,6 @@ class SsParsingTests(unittest.TestCase):
     self.assertEqual(portlens.sanitize_display("a\n\t\x1b[31m"), "a???[31m")
 
 
+
 if __name__ == "__main__":
   unittest.main()
