@@ -104,7 +104,7 @@ def display_safe(value: object) -> str:
       result.append("\\\\")
     elif 0xDC80 <= codepoint <= 0xDCFF:
       result.append(f"\\x{codepoint - 0xDC00:02x}")
-    elif character == "\x1b" or unicodedata.category(character) in {"Cc", "Cs"}:
+    elif unicodedata.category(character) in {"Cc", "Cf", "Cs", "Zl", "Zp"}:
       if codepoint <= 0xFF:
         result.append(f"\\x{codepoint:02x}")
       else:

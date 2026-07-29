@@ -163,6 +163,21 @@ class OutputTests(unittest.TestCase):
     unsafe = "a\\b\n\t\r\x1b" + "\udcff"
     self.assertEqual(diskhound.display_safe(unsafe), "a\\\\b\\x0a\\x09\\x0d\\x1b\\xff")
 
+  def test_unicode_format_controls_and_separators_are_escaped(self):
+    unsafe = "before\u202e\u2066\u2028\u2029after"
+    rendered = diskhound.display_safe(unsafe)
+    self.assertEqual(
+      rendered,
+      "before\\u202e\\u2066\\u2028\\u2029after",
+    )
+    for character in ("\u202e", "\u2066", "\u2028", "\u2029"):
+      self.assertNotIn(character, rendered)
+    self.assertEqual(rendered.splitlines(), [rendered])
+
+  def test_normal_printable_unicode_is_unchanged(self):
+    printable = "café-日本語-🙂"
+    self.assertEqual(diskhound.display_safe(printable), printable)
+
   def test_warning_limit_order_and_suppression_are_deterministic(self):
     failures = tuple(
       diskhound.ObservationFailure(f"/target/{index:03}", "metadata", "gone")
@@ -211,6 +226,19 @@ class OutputTests(unittest.TestCase):
     self.assertNotIn("\n", warnings[0])
     self.assertNotIn("\x1b", warnings[0])
     self.assertIn("\\x0a", warnings[0])
+
+  def test_warning_format_controls_and_separators_are_terminal_safe(self):
+    warnings = diskhound.render_warnings(result(failures=(
+      diskhound.ObservationFailure(
+        "/bad\u202ename\u2028path", "metadata", "bad\u2066detail\u2029text",
+      ),
+    )))
+    self.assertEqual(len(warnings), 1)
+    self.assertEqual(warnings[0].splitlines(), [warnings[0]])
+    for character in ("\u202e", "\u2066", "\u2028", "\u2029"):
+      self.assertNotIn(character, warnings[0])
+    for escape in ("\\u202e", "\\u2066", "\\u2028", "\\u2029"):
+      self.assertIn(escape, warnings[0])
 
 
 if __name__ == "__main__":
