@@ -28,9 +28,8 @@ UNIT_SUFFIXES = (
   ".service", ".socket", ".target", ".device", ".mount", ".automount",
   ".swap", ".timer", ".path", ".slice", ".scope", ".snapshot",
 )
+SYSTEMD_GLOB_METACHARACTERS = frozenset("*?[]")
 TIMEOUT_SECONDS = 5
-# Seven short properties should be far below this. The limit protects against a
-# faulty or substituted systemctl producing unbounded captured output.
 MAX_STREAM_BYTES = 64 * 1024
 UNAVAILABLE = "-"
 
@@ -94,6 +93,10 @@ def normalize_target(target: str) -> str:
   if any(unicodedata.category(character) in {"Cc", "Cf", "Cs", "Zl", "Zp"}
          for character in target):
     raise SvcDoctorError(f"service target contains a control character: {display_safe(target)}")
+  if any(character in SYSTEMD_GLOB_METACHARACTERS for character in target):
+    raise SvcDoctorError(
+      f"service target must be a concrete unit, not a pattern: {display_safe(target)}"
+    )
 
   explicit_suffix = next((suffix for suffix in UNIT_SUFFIXES if target.endswith(suffix)), None)
   if explicit_suffix is not None and explicit_suffix != ".service":
@@ -138,7 +141,7 @@ def run_systemctl(target: str) -> CommandResult:
   except OSError as error:
     raise SvcDoctorError("could not execute systemctl") from error
 
-  if process.stdout is None or process.stderr is None:  # pragma: no cover - Popen contract
+  if process.stdout is None or process.stderr is None:
     _stop_process(process)
     raise SvcDoctorError("could not execute systemctl")
 
