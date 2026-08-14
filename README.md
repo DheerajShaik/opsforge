@@ -50,7 +50,7 @@ OpsForge is in its early utility implementation stage.
 
 ## Planned utilities
 
-The following utilities are part of the initial roadmap. PortLens and DiskHound are experimental; the remaining utilities are planned and not currently implemented.
+The following utilities are part of the initial roadmap. PortLens, DiskHound, and SvcDoctor are experimental; the remaining utilities are planned and not currently implemented.
 
 | Utility | Status | Purpose |
 | --- | --- | --- |
