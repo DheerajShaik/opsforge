@@ -4,7 +4,7 @@ OpsForge is an evolving open-source collection of practical Linux, DevOps, and S
 
 The project begins with focused utilities. Useful tools may mature over time through implementation improvements, automated testing, failure-path coverage, real-world usage, community feedback, compatibility validation, security analysis, documentation, and relevant integrations.
 
-OpsForge has completed its repository foundation and now includes experimental implementations of PortLens, DiskHound, and SvcDoctor.
+OpsForge has completed its repository foundation and now includes experimental implementations of PortLens, DiskHound, CertWatch, and SvcDoctor.
 
 ## Why OpsForge
 
@@ -43,6 +43,7 @@ OpsForge is in its early utility implementation stage.
 
 - PortLens has an experimental first implementation in Phase 1.
 - DiskHound has an experimental first implementation in Phase 2.
+- CertWatch has an experimental first implementation in Phase 3.
 - SvcDoctor has an experimental first implementation in Phase 4.
 - The roadmap may evolve as the project learns from implementation and usage.
 - Interfaces may evolve as utilities mature.
@@ -50,13 +51,13 @@ OpsForge is in its early utility implementation stage.
 
 ## Planned utilities
 
-The following utilities are part of the initial roadmap. PortLens, DiskHound, and SvcDoctor are experimental; the remaining utilities are planned and not currently implemented.
+The following utilities are part of the initial roadmap. PortLens, DiskHound, CertWatch, and SvcDoctor are experimental; the remaining utilities are planned and not currently implemented.
 
 | Utility | Status | Purpose |
 | --- | --- | --- |
 | [PortLens](portlens/README.md) | Experimental | Inspect TCP listening sockets matching a local Linux port and report available process metadata. |
 | [DiskHound](diskhound/README.md) | Experimental | Rank a directory's eligible immediate entries by recursively observed allocated space with filesystem-capacity context. |
-| CertWatch | Planned | Inspect TLS certificates and certificate expiration. |
+| [CertWatch](certwatch/README.md) | Experimental | Observe one remote TLS leaf certificate and assess its encoded validity period. |
 | [SvcDoctor](svcdoctor/README.md) | Experimental | Report current systemd state and direct execution evidence for one local system service. |
 | LogHound | Planned | Analyze Linux and application logs for recurring or abnormal patterns. |
 | ProcWatch | Planned | Inspect Linux processes and abnormal resource behavior. |
