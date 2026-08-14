@@ -15,6 +15,10 @@ class TestCli(unittest.TestCase):
  def test_invalid_invocations(self):
   for args in ([],['a','b'],['--no'],['bad_name'],['x','--warn-days','-1'],['--warn-days','+1','x'],['--warn-days','1.5','x'],['--warn-days','١','x']):
    code,out,err=self.invoke(args); self.assertEqual(code,2); self.assertEqual(out,''); self.assertNotIn('Traceback',err)
+ def test_extremely_large_numeric_values_are_invocation_errors(self):
+  huge='9'*5000
+  for args in ((f'x:{huge}',),('--warn-days',huge,'x')):
+   code,out,err=self.invoke(list(args)); self.assertEqual(code,2); self.assertEqual(out,''); self.assertNotIn('internal execution failure',err); self.assertNotIn('Traceback',err)
  def test_decoder_before_network(self):
   with mock.patch.object(c,'find_decoder',side_effect=c.CertWatchError("required decoder 'openssl' is not available")),mock.patch.object(c,'observe_leaf') as observe:
    code,out,err=self.invoke(['example.com']); self.assertEqual(code,3); observe.assert_not_called(); self.assertEqual(out,'')
