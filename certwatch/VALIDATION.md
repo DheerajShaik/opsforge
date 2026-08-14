@@ -17,7 +17,7 @@ Validation recorded at **2026-08-14T10:44:30Z**.
 
 `python3 -m py_compile certwatch/certwatch.py` passed. The initial `python3 -m unittest discover -s certwatch/tests -v` run passed (45 tests) in this environment. Tests exercise target grammar, temporal boundaries, sanitization, deterministic decoder parsing/fingerprinting, resolver ordering, TCP fallback, no TLS fallback, SNI selection, peer-address evidence, cleanup, size limits, and stable CLI failures without public networking.
 
-The PR review follow-up added regression coverage for bounded decoder stdin/stdout/stderr handling, decoder timeout and overflow paths, critical SAN parsing, empty subject rendering, and extremely large numeric CLI inputs. GitHub Actions is the authoritative automated result for the updated branch.
+The PR review follow-up added regression coverage for bounded decoder stdin/stdout/stderr handling, decoder timeout and overflow paths, critical SAN parsing, empty subject rendering, and extremely large numeric CLI inputs. On the updated PR head, GitHub Actions ran with Python 3.14.7 and passed compilation plus **53 CertWatch tests**.
 
 ## Controlled local validation
 
