@@ -107,6 +107,23 @@ def display_excerpt(value: str) -> str:
   return display_safe(prefix) + suffix
 
 
+def stream_safe(value: object, stream: object) -> str:
+  """Escape characters the destination text stream cannot encode."""
+  text = str(value)
+  encoding = getattr(stream, "encoding", None)
+  if not encoding:
+    return text
+  try:
+    return text.encode(encoding, errors="backslashreplace").decode(encoding)
+  except (LookupError, UnicodeError):
+    return text.encode("ascii", errors="backslashreplace").decode("ascii")
+
+
+def print_safe(value: object, *, file: object) -> None:
+  """Print without leaking UnicodeEncodeError for a restrictive text stream."""
+  print(stream_safe(value, file), file=file)
+
+
 def normalize_message(message: str) -> str:
   """Remove only a valid timezone-qualified RFC 3339 prefix and spaces."""
   match = TIMESTAMP_PREFIX.match(message)
@@ -117,10 +134,11 @@ def normalize_message(message: str) -> str:
     if zone == "Z":
       zone_info = timezone.utc
     else:
-      offset = timedelta(
-        hours=int(match.group("zone_hour")),
-        minutes=int(match.group("zone_minute")),
-      )
+      zone_hour = int(match.group("zone_hour"))
+      zone_minute = int(match.group("zone_minute"))
+      if zone_hour > 23 or zone_minute > 59:
+        return message
+      offset = timedelta(hours=zone_hour, minutes=zone_minute)
       if match.group("sign") == "-":
         offset = -offset
       zone_info = timezone(offset)
@@ -178,8 +196,10 @@ def _record_pattern(
   record: bytes,
   physical_line: int,
   patterns: dict[str, list[int]],
+  *,
+  terminated_by_lf: bool,
 ) -> bool:
-  if record.endswith(b"\r"):
+  if terminated_by_lf and record.endswith(b"\r"):
     record = record[:-1]
   if len(record) > MAX_LINE_BYTES:
     raise ObservationError(f"logical line {physical_line} exceeds {MAX_LINE_BYTES} bytes")
@@ -229,15 +249,20 @@ def observe_descriptor(descriptor: int, target: str, boundary: int) -> AnalysisR
     if b"\x00" in chunk:
       raise ObservationError("NUL byte found in observed input")
     buffer.extend(chunk)
+    record_start = 0
     while True:
-      separator = buffer.find(b"\n")
+      separator = buffer.find(b"\n", record_start)
       if separator < 0:
         break
-      record = bytes(buffer[:separator])
-      del buffer[:separator + 1]
+      record = bytes(buffer[record_start:separator])
+      record_start = separator + 1
       physical_lines += 1
-      if _record_pattern(record, physical_lines, patterns):
+      if _record_pattern(
+        record, physical_lines, patterns, terminated_by_lf=True
+      ):
         analyzable_lines += 1
+    if record_start:
+      del buffer[:record_start]
     if len(buffer) > MAX_LINE_BYTES + 1 or (
       len(buffer) == MAX_LINE_BYTES + 1 and not buffer.endswith(b"\r")
     ):
@@ -247,7 +272,9 @@ def observe_descriptor(descriptor: int, target: str, boundary: int) -> AnalysisR
 
   if warning is None and buffer:
     physical_lines += 1
-    if _record_pattern(bytes(buffer), physical_lines, patterns):
+    if _record_pattern(
+      bytes(buffer), physical_lines, patterns, terminated_by_lf=False
+    ):
       analyzable_lines += 1
   elif warning is not None:
     buffer.clear()
@@ -344,20 +371,20 @@ def main(argv: Sequence[str] | None = None) -> int:
   try:
     output, warning, exit_code = inspect(arguments.path)
   except InvalidTargetError as error:
-    print(f"loghound: {display_safe(error)}", file=sys.stderr)
+    print_safe(f"loghound: {display_safe(error)}", file=sys.stderr)
     return 2
   except ObservationError as error:
-    print(f"loghound: {display_safe(error)}", file=sys.stderr)
+    print_safe(f"loghound: {display_safe(error)}", file=sys.stderr)
     return 3
   except KeyboardInterrupt:
-    print("loghound: interrupted", file=sys.stderr)
+    print_safe("loghound: interrupted", file=sys.stderr)
     return 130
   except Exception:
-    print("loghound: internal execution failure", file=sys.stderr)
+    print_safe("loghound: internal execution failure", file=sys.stderr)
     return 3
-  print(output)
+  print_safe(output, file=sys.stdout)
   if warning is not None:
-    print(warning, file=sys.stderr)
+    print_safe(warning, file=sys.stderr)
   return exit_code
 
 

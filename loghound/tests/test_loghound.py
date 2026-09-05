@@ -19,6 +19,16 @@ sys.modules[SPEC.name] = loghound
 SPEC.loader.exec_module(loghound)
 
 
+class StrictAsciiStream(io.StringIO):
+  @property
+  def encoding(self):
+    return "ascii"
+
+  def write(self, value):
+    value.encode("ascii", errors="strict")
+    return super().write(value)
+
+
 class CliTests(unittest.TestCase):
   def run_main(self, arguments):
     stdout = io.StringIO()
@@ -62,6 +72,17 @@ class CliTests(unittest.TestCase):
       )
     with mock.patch.object(loghound, "inspect", side_effect=KeyboardInterrupt):
       self.assertEqual(self.run_main(["x"]), (130, "", "loghound: interrupted\n"))
+
+  def test_ascii_stdout_escapes_unencodable_unicode(self):
+    stdout = StrictAsciiStream()
+    stderr = io.StringIO()
+    with mock.patch.object(loghound.sys, "stdout", stdout), \
+         mock.patch.object(loghound.sys, "stderr", stderr), \
+         mock.patch.object(loghound, "inspect", return_value=("recurring é", None, 0)):
+      code = loghound.main(["x"])
+    self.assertEqual(code, 0)
+    self.assertEqual(stderr.getvalue(), "")
+    self.assertIn("recurring \\xe9", stdout.getvalue())
 
 
 class TargetTests(unittest.TestCase):
@@ -161,6 +182,9 @@ class NormalizationTests(unittest.TestCase):
       "[2026-09-05T12:34:56Z] message", " 2026-09-05T12:34:56Z message",
       "prefix 2026-09-05T12:34:56Z message", "Sep  5 12:34:56 message",
       "2026-09-05T12:34:56Z\tmessage",
+      "2026-09-05T12:34:56+05:60 message",
+      "2026-09-05T12:34:56-00:99 message",
+      "2026-09-05T12:34:56+24:00 message",
     )
     for value in values:
       with self.subTest(value=value):
@@ -196,6 +220,11 @@ class ObservationTests(unittest.TestCase):
     recurring = {item.key: item.count for item in result.patterns}
     self.assertEqual(recurring, {"same": 2, "inside\rvalue": 2})
 
+  def test_unterminated_trailing_cr_is_content(self):
+    result = self.analyze_bytes(b"a\r\na\r")
+    evidence = {item.key: item.count for item in result.patterns}
+    self.assertEqual(evidence, {"a": 1, "a\r": 1})
+
   def test_blank_and_timestamp_only_lines_are_not_analyzable(self):
     result = self.analyze_bytes(b" \n\t\n2026-01-01T00:00:00Z   \nmessage\n")
     self.assertEqual((result.physical_lines, result.analyzable_lines), (4, 1))
@@ -224,8 +253,11 @@ class ObservationTests(unittest.TestCase):
     self.assertEqual(
       self.analyze_bytes(b"a" * loghound.MAX_LINE_BYTES + b"\r\n").analyzable_lines, 1
     )
-    for data in (b"a" * (loghound.MAX_LINE_BYTES + 1),
-                 b"valid\n" + b"a" * (loghound.MAX_LINE_BYTES + 1)):
+    for data in (
+      b"a" * (loghound.MAX_LINE_BYTES + 1),
+      b"valid\n" + b"a" * (loghound.MAX_LINE_BYTES + 1),
+      b"a" * loghound.MAX_LINE_BYTES + b"\r",
+    ):
       with self.assertRaises(loghound.ObservationError):
         self.analyze_bytes(data)
 
@@ -234,12 +266,20 @@ class ObservationTests(unittest.TestCase):
     result = self.analyze_bytes(data)
     self.assertEqual((result.physical_lines, result.analyzable_lines), (2, 2))
 
+  def test_many_short_lines_in_one_chunk(self):
+    count = 20000
+    result = self.analyze_bytes(b"x\n" * count)
+    self.assertEqual((result.physical_lines, result.analyzable_lines), (count, count))
+    self.assertEqual(result.patterns[0].count, count)
+
   def test_read_never_exceeds_boundary_and_append_is_excluded(self):
     reads = []
     chunks = [b"same\nsame\n", b"appended\n"]
+
     def fake_read(descriptor, size):
       reads.append(size)
       return chunks.pop(0)[:size]
+
     with mock.patch.object(loghound.os, "read", side_effect=fake_read):
       result = loghound.observe_descriptor(9, "/log", 10)
     self.assertEqual(result.consumed_bytes, 10)
@@ -307,9 +347,14 @@ class RankingAndRenderingTests(unittest.TestCase):
     self.assertIn("No normalized pattern occurred at least twice", loghound.render_result(empty))
 
   def test_terminal_safe_display_and_excerpt_boundaries(self):
-    unsafe = "a\\b\n\t\r\b\x1b‮  " + "\udcff"
+    bidi = chr(0x202E)
+    line_separator = chr(0x2028)
+    paragraph_separator = chr(0x2029)
+    unsafe = "a\\b\n\t\r\b\x1b" + bidi + line_separator + paragraph_separator + "\udcff"
     rendered = loghound.display_safe(unsafe)
-    for character in ("\n", "\t", "\r", "\b", "\x1b", "", "‮", " ", " ", "\udcff"):
+    for character in (
+      "\n", "\t", "\r", "\b", "\x1b", bidi, line_separator, paragraph_separator, "\udcff"
+    ):
       self.assertNotIn(character, rendered)
     self.assertIn("a\\\\b", rendered)
     self.assertIn("\\xff", rendered)
