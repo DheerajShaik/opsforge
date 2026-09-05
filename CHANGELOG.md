@@ -4,6 +4,8 @@ Notable changes to OpsForge will be recorded here.
 
 ## Unreleased
 
+- Added experimental Incident Snapshot V1 for bounded, low-sensitivity Linux incident context from an explicit source allowlist, with reduced platform, runtime, memory, and root-capacity evidence, useful partial-section semantics, deterministic tests, documentation, and dedicated CI.
+
 - Added experimental HealthCtl V1 for evaluating a bounded JSON-configured set of filesystem free-space and TCP connection criteria, with strict configuration handling, conservative observation semantics, deterministic tests, documentation, and CI.
 
 - Added experimental NetDoctor V1 for one-target OS resolver and TCP connection-establishment diagnostics, with bounded candidate handling, transport-only interpretation limits, deterministic tests, local loopback validation, documentation, and CI.
