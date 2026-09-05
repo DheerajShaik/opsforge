@@ -4,6 +4,8 @@ Notable changes to OpsForge will be recorded here.
 
 ## Unreleased
 
+- Added experimental ConfigDiff V1 for bounded exact byte-content comparison of one local regular file against an explicit baseline, with conservative mutable-file checks, content-safe reporting, deterministic tests, documentation, and CI.
+
 - Added experimental ProcWatch V1 for two-sample observation of one local Linux process, with bounded procfs reads, CPU and memory delta evidence, conservative identity handling, deterministic tests, documentation, and CI.
 
 - Added experimental LogHound V1 for bounded recurrence analysis of one local regular log file, with conservative timestamp normalization, terminal-safe output, deterministic tests, documentation, and CI.
