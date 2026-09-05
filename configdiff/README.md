@@ -31,6 +31,8 @@ Each file may be at most 16 MiB (16,777,216 bytes) in V1. The size captured imme
 
 Both files are opened before either is read. Path replacement after open does not redirect an already opened descriptor. ConfigDiff does not lock, copy, freeze, or atomically snapshot either file, so it cannot eliminate every possible concurrent-change race. Its result applies to the opened objects and bytes that passed the documented consistency checks.
 
+V1 retains the two bounded byte strings in memory long enough to make the exact equality decision and calculate their digests. At the 16 MiB-per-file limit, payload buffers can therefore approach 32 MiB in addition to Python and hashing overhead. The returned comparison result does not retain the raw file contents.
+
 ## Drift definition
 
 V1 defines drift strictly as byte inequality:
