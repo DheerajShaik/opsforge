@@ -4,7 +4,7 @@ OpsForge is an evolving open-source collection of practical Linux, DevOps, and S
 
 The project begins with focused utilities. Useful tools may mature over time through implementation improvements, automated testing, failure-path coverage, real-world usage, community feedback, compatibility validation, security analysis, documentation, and relevant integrations.
 
-OpsForge has completed its repository foundation and now includes experimental implementations of PortLens, DiskHound, CertWatch, SvcDoctor, LogHound, ProcWatch, ConfigDiff, NetDoctor, and HealthCtl.
+OpsForge has completed its repository foundation and now includes experimental implementations of PortLens, DiskHound, CertWatch, SvcDoctor, LogHound, ProcWatch, ConfigDiff, NetDoctor, HealthCtl, and Incident Snapshot.
 
 ## Why OpsForge
 
@@ -50,13 +50,14 @@ OpsForge is in its early utility implementation stage.
 - ConfigDiff has an experimental first implementation in Phase 7.
 - NetDoctor has an experimental first implementation in Phase 8.
 - HealthCtl has an experimental first implementation in Phase 9.
+- Incident Snapshot has an experimental first implementation in Phase 10.
 - The roadmap may evolve as the project learns from implementation and usage.
 - Interfaces may evolve as utilities mature.
 - Nothing in the repository currently represents a production-ready utility.
 
 ## Planned utilities
 
-The following utilities are part of the initial roadmap. PortLens, DiskHound, CertWatch, SvcDoctor, LogHound, ProcWatch, ConfigDiff, NetDoctor, and HealthCtl are experimental; the remaining utility is planned and not currently implemented.
+All ten utilities in the initial roadmap now have experimental implementations. They remain early-stage and may evolve as implementation and usage provide more evidence.
 
 | Utility | Status | Purpose |
 | --- | --- | --- |
@@ -69,7 +70,7 @@ The following utilities are part of the initial roadmap. PortLens, DiskHound, Ce
 | [ConfigDiff](configdiff/README.md) | Experimental | Compare one local regular file with an explicit baseline for exact byte-content drift without interpreting configuration semantics. |
 | [NetDoctor](netdoctor/README.md) | Experimental | Report OS resolver candidates and TCP connection-establishment evidence for one explicit remote endpoint without declaring application or service health. |
 | [HealthCtl](healthctl/README.md) | Experimental | Evaluate a bounded JSON-configured set of filesystem free-space and TCP connection criteria without claiming overall host or service health. |
-| Incident Snapshot | Planned | Collect useful local Linux diagnostic information during incidents with strong security and privacy considerations. |
+| [Incident Snapshot](incidentsnapshot/README.md) | Experimental | Capture bounded, low-sensitivity local Linux platform, runtime, memory, and root-filesystem context during one sequential incident observation. |
 
 ## Initial roadmap phases
 
