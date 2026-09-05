@@ -4,6 +4,8 @@ Notable changes to OpsForge will be recorded here.
 
 ## Unreleased
 
+- Added experimental HealthCtl V1 for evaluating a bounded JSON-configured set of filesystem free-space and TCP connection criteria, with strict configuration handling, conservative observation semantics, deterministic tests, documentation, and CI.
+
 - Added experimental NetDoctor V1 for one-target OS resolver and TCP connection-establishment diagnostics, with bounded candidate handling, transport-only interpretation limits, deterministic tests, local loopback validation, documentation, and CI.
 
 - Added experimental ConfigDiff V1 for bounded exact byte-content comparison of one local regular file against an explicit baseline, with conservative mutable-file checks, content-safe reporting, deterministic tests, documentation, and CI.
