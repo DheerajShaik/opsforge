@@ -131,7 +131,7 @@ def open_regular_file(path: str, label: str) -> tuple[int, os.stat_result]:
         f"{label} file exceeds the {MAX_FILE_BYTES}-byte V1 limit"
       )
     return descriptor, metadata
-  except Exception:
+  except BaseException:
     os.close(descriptor)
     raise
 
