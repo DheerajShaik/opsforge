@@ -128,6 +128,22 @@ class FileAccessTests(unittest.TestCase):
     self.assertEqual(opened.call_args.args[0], "target")
     closed.assert_not_called()
 
+  def test_descriptor_is_closed_if_validation_is_interrupted(self):
+    with mock.patch.object(configdiff.os, "open", return_value=9), \
+         mock.patch.object(configdiff.os, "fstat", side_effect=KeyboardInterrupt), \
+         mock.patch.object(configdiff.os, "close") as closed:
+      with self.assertRaises(KeyboardInterrupt):
+        configdiff.open_regular_file("target", "baseline")
+    closed.assert_called_once_with(9)
+
+  def test_fstat_failure_is_observation_error_and_closes_descriptor(self):
+    with mock.patch.object(configdiff.os, "open", return_value=9), \
+         mock.patch.object(configdiff.os, "fstat", side_effect=OSError("stat failed")), \
+         mock.patch.object(configdiff.os, "close") as closed:
+      with self.assertRaises(configdiff.ObservationError):
+        configdiff.open_regular_file("target", "baseline")
+    closed.assert_called_once_with(9)
+
   def test_non_regular_file_is_rejected_and_closed(self):
     info = metadata(mode=stat.S_IFDIR | 0o755)
     with mock.patch.object(configdiff.os, "open", return_value=9), \
