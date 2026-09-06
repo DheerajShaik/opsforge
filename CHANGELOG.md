@@ -4,6 +4,8 @@ Notable changes to OpsForge will be recorded here.
 
 ## Unreleased
 
+- Prepared bounded CertWatch SAN-heading compatibility hardening for post-merge real-world revalidation, added deterministic regression coverage for captured OpenSSL 3.0.13 decoder formatting, clarified CertWatch compatibility and validation status, and refreshed the project security and contribution guidance.
+
 - Added experimental Incident Snapshot V1 for bounded, low-sensitivity Linux incident context from an explicit source allowlist, with reduced platform, runtime, memory, and root-capacity evidence, useful partial-section semantics, deterministic tests, documentation, and dedicated CI.
 
 - Added experimental HealthCtl V1 for evaluating a bounded JSON-configured set of filesystem free-space and TCP connection criteria, with strict configuration handling, conservative observation semantics, deterministic tests, documentation, and CI.

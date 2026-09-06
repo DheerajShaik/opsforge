@@ -2,31 +2,37 @@
 
 Thank you for your interest in contributing to OpsForge.
 
-OpsForge is an early-stage open-source project for practical Linux, DevOps, and SRE utilities. The repository is currently in the foundation stage, and no utilities have been implemented yet. The initial roadmap is expected to evolve as real requirements, implementation experience, testing, and community feedback shape the project.
+OpsForge is an early-stage open-source project with ten experimental Linux, DevOps, and SRE utilities. The initial roadmap has been implemented, and the project continues to evolve as real requirements, implementation experience, testing, compatibility evidence, and community feedback shape it.
 
 ## Philosophy
 
 OpsForge utilities should be:
 
+- Practical over theoretical.
+- Small useful scope over premature complexity.
 - Independent by default.
 - Composable when useful.
 - Shared when justified.
+- Diagnostic before destructive.
+- Safe by default.
+- Automation-friendly.
+- Tests and documentation must accompany behavioral changes.
 
 Contributions should favor practical, focused improvements over premature generalization. Utilities should start with small useful scopes and grow when operational needs justify the added complexity.
 
 ## Contribution types
 
-Useful contributions may eventually include:
+Useful contributions include:
 
 - bug fixes
-- tests
-- documentation improvements
-- utility features
+- regression tests
+- compatibility improvements
+- documentation corrections
+- security and privacy hardening
 - portability improvements
-- security improvements
-- new utility proposals
-
-During Phase 0, contributions should remain focused on repository foundation documentation and conventions.
+- performance improvements justified by evidence
+- focused utility enhancements
+- new utility proposals with clear operational justification
 
 ## Utility boundaries
 
@@ -97,4 +103,4 @@ Avoid hidden telemetry and unexpected outbound communication. Diagnostic tools s
 
 Pull requests should be scoped and explain the reason for the change. When applicable, include documentation updates and tests with behavior changes.
 
-Do not rely on project checks or templates that do not exist yet. As the repository matures, contribution expectations may become more specific where that provides practical value.
+GitHub Actions workflows compile and run the `unittest` suite for each utility. Before opening a pull request, run the relevant utility's documented compile and test commands where practical, and ensure the focused workflow remains representative of the change.

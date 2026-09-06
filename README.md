@@ -98,7 +98,7 @@ These are possible future environments, not current integrations or requirements
 
 OpsForge utilities should favor least privilege where practical, diagnostic-first behavior, safe defaults, deliberate handling of sensitive information, and clear communication about limitations.
 
-Locally executed utilities must not include hidden telemetry or unexpected outbound communication. Any future feature that communicates with an external system must be explicit, documented, deliberately invoked or configured by the user, and limited to what the feature requires.
+Locally executed utilities must not include hidden telemetry or unexpected outbound communication. Utilities with an explicit network diagnostic purpose must keep that communication documented, deliberately invoked or configured by the user, bounded, and limited to what the feature requires.
 
 Production readiness must be demonstrated through evidence rather than assumed. See [SECURITY.md](SECURITY.md) for the current security and privacy posture.
 
