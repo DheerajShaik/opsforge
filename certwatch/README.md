@@ -6,8 +6,8 @@ CertWatch answers one question: **what leaf TLS certificate is one remote endpoi
 
 ## Requirements and use
 
-- Python 3 with its standard library (validated with Python 3.14.4).
-- The system `openssl` executable with `openssl x509 -ext subjectAltName -nameopt RFC2253` (validated with OpenSSL 3.0.13 only).
+- Python 3 with its standard library. Exercised versions are recorded in [VALIDATION.md](VALIDATION.md).
+- The system `openssl` executable with `openssl x509 -ext subjectAltName -nameopt RFC2253`.
 
 ```console
 python3 certwatch/certwatch.py example.com
@@ -22,7 +22,7 @@ The default port is 443 and the default warning threshold is 30 days. `--warn-da
 
 CertWatch locates its mandatory decoder before networking. It resolves once with the OS resolver, whose duration is not bounded by the socket timeout. Resolver order and duplicates are retained. Each TCP candidate gets up to five seconds; TCP failures permit the next candidate. The first TCP success permanently ends fallback. TLS then receives a separate five-second timeout. A hostname is sent as SNI, which can influence the presented certificate; raw IP targets send no SNI. Python observes TLS using its runtime default TLS policy with verification disabled and retrieves the exact DER leaf. The DER limit is 1 MiB.
 
-The DER stays in memory. Python computes its SHA-256 fingerprint. A fixed, shell-free OpenSSL command decodes names in RFC2253 rendering, serial, validity timestamps, and SAN. Decoder execution has a separate five-second limit and independent 64 KiB stdout/stderr limits. Supported SAN values are DNS, IP (normalized), URI, and email; malformed or unsupported output fails rather than being guessed. Names are decoder-rendered certificate data, not validated identities.
+The DER stays in memory. Python computes its SHA-256 fingerprint. A fixed, shell-free OpenSSL command decodes names in RFC2253 rendering, serial, validity timestamps, and SAN. Decoder execution has a separate five-second limit and independent 64 KiB stdout/stderr limits. OpenSSL's text rendering is an external compatibility boundary: real-world validation exposed a legitimate SAN-heading horizontal-whitespace variant that required bounded parser hardening. Supported SAN values are DNS, IP (normalized), URI, and email; malformed or unsupported output fails rather than being guessed. Names are decoder-rendered certificate data, not validated identities.
 
 The report contains the requested endpoint, actual peer IP from `getpeername()`, subject, issuer, serial, SHA-256 fingerprint, UTC `notBefore`/`notAfter`, supported SANs, and validity assessment. `-` is the sole unavailable marker. External text is escaped for terminal-safe display.
 
@@ -48,7 +48,7 @@ Complete successful/attention reports go only to stdout. Invocation and operatio
 
 DNS, TCP, and TLS communication exposes connection metadata to resolver infrastructure, intervening networks, and the selected endpoint. Certificate output can disclose internal names or organizational metadata and should be handled accordingly. CertWatch uses no credentials, persistence, telemetry, privilege elevation, update checks, scanning, or remediation.
 
-It supports only direct TLS to one endpoint. It does not implement trust/hostname verification, chain analysis, OCSP/CRL/CT, protocol or cipher grading, HTTP, STARTTLS, client certificates, local files, configuration, JSON, multiple targets, monitoring, notification, renewal, or legacy TLS fallback. Compatibility evidence is limited to the versions in [VALIDATION.md](VALIDATION.md); no universal OpenSSL, LibreSSL, or BoringSSL compatibility is claimed.
+It supports only direct TLS to one endpoint. It does not implement trust/hostname verification, chain analysis, OCSP/CRL/CT, protocol or cipher grading, HTTP, STARTTLS, client certificates, local files, configuration, JSON, multiple targets, monitoring, notification, renewal, or legacy TLS fallback. Compatibility is claimed only for the versions and decoder output shapes actually exercised in [VALIDATION.md](VALIDATION.md). Universal OpenSSL compatibility is not claimed, and LibreSSL or BoringSSL compatibility has not been tested or claimed.
 
 ## Tests
 

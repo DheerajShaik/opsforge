@@ -31,4 +31,14 @@ Live local servers for expired, future-dated, SNI-dependent alternate-certificat
 
 ## Controlled external validation
 
-No public endpoint was contacted. External endpoint behavior and external IPv6 connectivity are therefore not claimed. Compatibility evidence remains limited to the environments explicitly recorded above.
+During the 2026-08-14 validation recorded above, no public endpoint was contacted. External endpoint behavior and external IPv6 connectivity were therefore not claimed for that validation. Its compatibility evidence remains limited to the environments explicitly recorded in its sections.
+
+## 2026-09-05 real-world WSL finding and implementation follow-up
+
+A separate real-world validation used Ubuntu 24.04.1 LTS under WSL2 with Python 3.12.3 and OpenSSL 3.0.13. Native OpenSSL retrieved and decoded the public `example.com:443` leaf certificate successfully, including its two DNS SAN values. CertWatch retrieved the leaf but reported `certificate decoder returned malformed output` and exited `3`.
+
+The captured decoder output contained `X509v3 Subject Alternative Name: ` with one trailing ASCII space before the newline. The parser required the heading to end immediately after the colon or the optional ` critical` marker, so it rejected this legitimate formatting variant. The same behavior was independently reproduced with another OpenSSL version; it was an implementation compatibility defect rather than a version-specific anomaly.
+
+This update makes the SAN-heading compatibility boundary accept only trailing ASCII horizontal whitespace while preserving strict rejection of unsupported suffixes and malformed decoder output. Deterministic offline regression coverage includes the ordinary and critical headings with and without trailing space, explicit tab cases, strict negative cases, and a compact decoder-output fixture captured from the public `example.com` leaf observation.
+
+**Status:** Implementation correction completed and regression coverage added. Post-merge WSL real-world revalidation is pending; this record does not claim that the corrected live path has passed that separate validation cycle.

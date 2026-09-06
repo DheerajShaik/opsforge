@@ -2,9 +2,9 @@
 
 ## Current security posture
 
-OpsForge is currently early-stage and in the repository foundation phase. No utilities currently exist, no stable interfaces have been defined, and no production-readiness claim is made.
+OpsForge currently contains experimental implementations of PortLens, DiskHound, CertWatch, SvcDoctor, LogHound, ProcWatch, ConfigDiff, NetDoctor, HealthCtl, and Incident Snapshot. All remain experimental. There is no project-wide production-readiness claim.
 
-Security practices will evolve alongside implementation maturity, testing, compatibility validation, documentation, and community review.
+Security validation and compatibility work remain ongoing. The repository does not claim a formal security audit, certification, penetration test, production hardening, or vulnerability-free status.
 
 ## Reporting vulnerabilities
 
@@ -16,7 +16,7 @@ Please do not publish sensitive vulnerability details in public issues. A dedica
 
 OpsForge utilities must not secretly transmit operational information to repository owners, maintainers, contributors, analytics systems, telemetry providers, or unrelated third parties.
 
-External communication may be introduced only when:
+External communication is acceptable only when:
 
 - it is required by an explicit feature
 - the behavior is documented
@@ -25,9 +25,17 @@ External communication may be introduced only when:
 
 Hidden telemetry and unexpected outbound communication are not acceptable project behavior.
 
+Some utilities intentionally perform network activity because it is their explicit diagnostic purpose:
+
+- CertWatch connects to a caller-selected DNS/TCP/TLS endpoint.
+- NetDoctor resolves and connects to a caller-selected TCP target.
+- HealthCtl performs caller-configured TCP checks.
+
+This activity must remain deliberate, bounded, and documented. These utilities are not offline tools, and their network behavior must not expand silently.
+
 ## Sensitive information
 
-Future utilities may encounter sensitive operational information, including:
+Utilities may encounter sensitive operational information, including:
 
 - hostnames
 - usernames
@@ -43,7 +51,7 @@ Future utilities may encounter sensitive operational information, including:
 - tokens
 - incident information
 
-Utilities should minimize unnecessary collection, display, storage, and transmission of sensitive information.
+Utilities should minimize unnecessary collection, display, storage, and transmission of sensitive information. Diagnostic output can contain operational metadata and should be stored, shared, and published with appropriate care.
 
 ## Least privilege
 
@@ -53,6 +61,6 @@ OpsForge utilities must not silently escalate privileges.
 
 ## Security evolution
 
-Future project maturity may justify static analysis, dependency scanning, secret scanning, security testing, threat modeling, release verification, and community security review.
+Project maturity may justify static analysis, dependency scanning, secret scanning, security testing, threat modeling, release verification, and community security review.
 
 These mechanisms are not yet established and should be introduced when they provide concrete value.

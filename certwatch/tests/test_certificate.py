@@ -20,6 +20,19 @@ notBefore=Jan  1 00:00:00 2026 GMT
 notAfter=Feb  1 00:00:00 2026 GMT
 """
 
+# Public example.com leaf decoder output captured during the 2026-09-05
+# Ubuntu 24.04.1 WSL2 validation with OpenSSL 3.0.13. The adjacent byte
+# literals make the significant trailing space on the SAN heading visible.
+OPENSSL_3_0_13_EXAMPLE_COM = (
+    b"subject=CN=example.com\n"
+    b"issuer=CN=Cloudflare TLS Issuing ECC CA 3,O=SSL Corporation,C=US\n"
+    b"serial=0624D0AB311558780B7D5213B9631831\n"
+    b"notBefore=Jul 29 22:10:08 2026 GMT\n"
+    b"notAfter=Oct 27 22:17:21 2026 GMT\n"
+    b"X509v3 Subject Alternative Name:" b" \n"
+    b"    DNS:example.com, DNS:*.example.com\n"
+)
+
 
 class CertificateTests(unittest.TestCase):
     def fake_decoder(self, body: str) -> str:
@@ -47,6 +60,48 @@ class CertificateTests(unittest.TestCase):
         result = c.parse_certificate_output(raw, b"x")
         self.assertEqual(result.subject, "")
         self.assertEqual(result.sans, (("DNS", "example.com"),))
+
+    def test_san_heading_horizontal_ascii_whitespace_variants(self):
+        headings = (
+            b"X509v3 Subject Alternative Name:",
+            b"X509v3 Subject Alternative Name: ",
+            b"X509v3 Subject Alternative Name: critical",
+            b"X509v3 Subject Alternative Name: critical ",
+            b"X509v3 Subject Alternative Name:\t",
+            b"X509v3 Subject Alternative Name: critical\t",
+        )
+        for heading in headings:
+            with self.subTest(heading=heading):
+                raw = BASE + heading + b"\n    DNS:example.com, DNS:www.example.com\n"
+                result = c.parse_certificate_output(raw, b"x")
+                self.assertEqual(
+                    result.sans,
+                    (("DNS", "example.com"), ("DNS", "www.example.com")),
+                )
+
+    def test_captured_openssl_3_0_13_san_heading(self):
+        self.assertIn(
+            b"X509v3 Subject Alternative Name: \n", OPENSSL_3_0_13_EXAMPLE_COM
+        )
+        result = c.parse_certificate_output(
+            OPENSSL_3_0_13_EXAMPLE_COM, b"public-example-leaf"
+        )
+        self.assertEqual(
+            result.sans,
+            (("DNS", "*.example.com"), ("DNS", "example.com")),
+        )
+
+    def test_san_heading_rejects_unsupported_suffix_and_unicode_whitespace(self):
+        headings = (
+            b"X509v3 Subject Alternative Name: critical extra",
+            b"X509v3 Subject Alternative Name:\v",
+            "X509v3 Subject Alternative Name:\N{NO-BREAK SPACE}".encode("utf-8"),
+        )
+        for heading in headings:
+            with self.subTest(heading=heading), self.assertRaisesRegex(
+                c.CertWatchError, "malformed"
+            ):
+                c.parse_certificate_output(BASE + heading + b"\n    DNS:example.com\n", b"x")
 
     def test_all_sans_order_and_dedupe(self):
         raw = BASE + (

@@ -478,7 +478,8 @@ def parse_certificate_output(raw: bytes, der: bytes) -> CertificateInfo:
                 if key in fields:
                     raise ValueError
                 fields[key] = line[len(prefix) :]
-            elif re.fullmatch(r"X509v3 Subject Alternative Name:(?: critical)?", line):
+            # OpenSSL may append ASCII horizontal whitespace to this heading.
+            elif re.fullmatch(r"X509v3 Subject Alternative Name:(?: critical)?[ \t]*", line):
                 if san_text is not None or index + 1 >= len(lines):
                     raise ValueError
                 index += 1
