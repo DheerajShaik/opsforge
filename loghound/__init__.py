@@ -1,0 +1,1 @@
+"""LogHound command package."""

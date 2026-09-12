@@ -2,7 +2,7 @@
 
 Thank you for your interest in contributing to OpsForge.
 
-OpsForge is an early-stage open-source project with ten experimental Linux, DevOps, and SRE utilities. The initial roadmap has been implemented, and the project continues to evolve as real requirements, implementation experience, testing, compatibility evidence, and community feedback shape it.
+OpsForge is a Beta open-source project with ten focused Linux, DevOps, and SRE utilities. The initial roadmap is implemented, and the project continues to evolve through real requirements, release hardening, compatibility evidence, and community feedback. Beta does not imply production readiness or stable interfaces.
 
 ## Philosophy
 
@@ -103,4 +103,6 @@ Avoid hidden telemetry and unexpected outbound communication. Diagnostic tools s
 
 Pull requests should be scoped and explain the reason for the change. When applicable, include documentation updates and tests with behavior changes.
 
-GitHub Actions workflows compile and run the `unittest` suite for each utility. Before opening a pull request, run the relevant utility's documented compile and test commands where practical, and ensure the focused workflow remains representative of the change.
+GitHub Actions workflows compile and run the `unittest` suite for each utility. The repository-wide release workflow also exercises the full suite across the supported Python range and validates packaging in a clean environment. Before opening a pull request, run the relevant utility's documented compile and test commands where practical, and ensure the focused workflow remains representative of the change.
+
+Packaging or release changes should additionally build the wheel and source distribution, install the wheel into a clean environment, exercise every installed command, and run `git diff --check`. Do not add runtime dependencies, install hooks, platform claims, or version declarations without explicit evidence and review.

@@ -1,6 +1,6 @@
 # SvcDoctor
 
-SvcDoctor is an experimental Linux diagnostic utility that reports the current systemd state and direct execution evidence for one local system service. It reports systemd evidence; it does not determine application root cause, desired state, health, readiness, or remediation.
+SvcDoctor is a Beta Linux diagnostic utility that reports the current systemd state and direct execution evidence for one local system service. It reports systemd evidence; it does not determine application root cause, desired state, health, readiness, or remediation.
 
 ## Scope and semantics
 
@@ -27,24 +27,26 @@ SvcDoctor classifies a service as currently failed only when `ActiveState` is ex
 ## Requirements
 
 - Linux
-- Python 3
+- CPython 3.10 through 3.14
 - a local `systemctl` and systemd system manager
 
 Compatibility has so far been empirically validated only on Ubuntu with systemd 255.4. Broader distribution and systemd-version support is not yet claimed.
 
+The project-level supported and validated environment boundaries are documented in the [root README](../README.md#compatibility-and-support-boundaries).
+
 ## Usage
 
 ```console
-python3 svcdoctor/svcdoctor.py SERVICE
-python3 svcdoctor/svcdoctor.py --help
+svcdoctor SERVICE
+svcdoctor --help
 ```
 
 Examples:
 
 ```console
-python3 svcdoctor/svcdoctor.py nginx
-python3 svcdoctor/svcdoctor.py nginx.service
-python3 svcdoctor/svcdoctor.py worker@3.service
+svcdoctor nginx
+svcdoctor nginx.service
+svcdoctor worker@3.service
 ```
 
 ## Output

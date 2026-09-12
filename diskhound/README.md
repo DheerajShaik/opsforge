@@ -1,6 +1,6 @@
 # DiskHound
 
-DiskHound is an experimental Linux diagnostic utility that reports capacity context for one explicitly selected directory's filesystem and ranks eligible immediate entries by recursively observed allocated space. It helps an operator choose the next branch to inspect without modifying the filesystem.
+DiskHound is a Beta Linux diagnostic utility that reports capacity context for one explicitly selected directory's filesystem and ranks eligible immediate entries by recursively observed allocated space. It helps an operator choose the next branch to inspect without modifying the filesystem.
 
 ## Scope and semantics
 
@@ -18,9 +18,11 @@ The accepted target's `st_dev` defines the scan device. Entries on another devic
 
 ## Usage
 
+Requirements are Linux and CPython 3.10 through 3.14 with no third-party packages or external commands. The project-level supported and validated environment boundaries are documented in the [root README](../README.md#compatibility-and-support-boundaries).
+
 ```console
-python3 diskhound/diskhound.py PATH
-python3 diskhound/diskhound.py --help
+diskhound PATH
+diskhound --help
 ```
 
 There is no default target. Absolute paths, relative paths, `.`, explicit `/`, and trailing slashes are accepted when they identify an inspectable directory. The displayed target is absolute and lexically normalized, not claimed to be a canonical physical path.
@@ -83,4 +85,4 @@ python3 -m unittest discover -s diskhound/tests -v
 
 ## Current limitations
 
-DiskHound is experimental and not production-ready. Its observations are permission-dependent and non-atomic. `st_blocks` does not establish unique physical allocation on every filesystem, same-device bind mounts are not detected, full mount topology is not interpreted, and results are not promised to equal `df` or `du`.
+DiskHound is Beta and not production-ready. Its observations are permission-dependent and non-atomic. `st_blocks` does not establish unique physical allocation on every filesystem, same-device bind mounts are not detected, full mount topology is not interpreted, and results are not promised to equal `df` or `du`.

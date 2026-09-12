@@ -1,0 +1,14 @@
+include CHANGELOG.md
+include CONTRIBUTING.md
+include SECURITY.md
+include VALIDATION.md
+recursive-include certwatch README.md VALIDATION.md
+recursive-include configdiff README.md
+recursive-include diskhound README.md VALIDATION.md
+recursive-include healthctl README.md
+recursive-include incidentsnapshot README.md
+recursive-include loghound README.md
+recursive-include netdoctor README.md
+recursive-include portlens README.md
+recursive-include procwatch README.md
+recursive-include svcdoctor README.md

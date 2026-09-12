@@ -41,4 +41,10 @@ The captured decoder output contained `X509v3 Subject Alternative Name: ` with o
 
 This update makes the SAN-heading compatibility boundary accept only trailing ASCII horizontal whitespace while preserving strict rejection of unsupported suffixes and malformed decoder output. Deterministic offline regression coverage includes the ordinary and critical headings with and without trailing space, explicit tab cases, strict negative cases, and a compact decoder-output fixture captured from the public `example.com` leaf observation.
 
-**Status:** Implementation correction completed and regression coverage added. Post-merge WSL real-world revalidation is pending; this record does not claim that the corrected live path has passed that separate validation cycle.
+## 2026-09-12 post-fix real-world revalidation
+
+At **2026-09-12T12:45:00Z**, the corrected merged implementation was revalidated from Ubuntu 24.04.1 LTS under WSL2 with Python 3.12.3, Python/OpenSSL 3.0.13, and external OpenSSL 3.0.13.
+
+CertWatch connected to the public `example.com:443` endpoint selected by the caller, retrieved and decoded the presented leaf certificate, accepted the OpenSSL SAN heading with trailing ASCII space, reported both DNS SAN values, produced a complete report on stdout with empty stderr, classified the certificate as within its encoded validity interval and outside the 30-day warning window, and exited `0`. CA trust and hostname identity were not assessed, consistent with the utility's scope.
+
+**Status:** The implementation correction, deterministic regression coverage, and the previously pending WSL real-world revalidation are complete for the recorded environment. This does not broaden compatibility beyond the versions and output shape documented here.

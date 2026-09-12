@@ -1,20 +1,22 @@
 # LogHound
 
-LogHound is an experimental Linux diagnostic utility that summarizes recurring normalized messages in one explicitly selected local regular log file. It answers: within the bounded bytes observed from that file, which normalized nonblank messages occur at least twice, how often do they occur, and where do they occur in physical file order?
+LogHound is a Beta Linux diagnostic utility that summarizes recurring normalized messages in one explicitly selected local regular log file. It answers: within the bounded bytes observed from that file, which normalized nonblank messages occur at least twice, how often do they occur, and where do they occur in physical file order?
 
 Recurrence is textual evidence only. LogHound is not an anomaly, severity, incident, health, security, or root-cause detector. Frequent messages do not establish failure, and an absence of recurring or error-looking messages does not establish health.
 
 ## Requirements
 
 - Linux
-- Python 3
+- CPython 3.10 through 3.14
 - no external commands or third-party packages
+
+The project-level supported and validated environment boundaries are documented in the [root README](../README.md#compatibility-and-support-boundaries).
 
 ## Usage
 
 ```console
-python3 loghound/loghound.py PATH
-python3 loghound/loghound.py --help
+loghound PATH
+loghound --help
 ```
 
 Exactly one path is required. Relative and absolute paths are accepted. There is no default, stdin mode, configuration file, or other V1 option. The displayed target is absolute and lexically normalized; it is not claimed to be a canonical physical path.

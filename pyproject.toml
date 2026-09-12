@@ -1,0 +1,59 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "opsforge"
+version = "0.1.0b1"
+description = "Focused, diagnostic-first Linux utilities for DevOps and SRE workflows"
+readme = "README.md"
+requires-python = ">=3.10,<3.15"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+keywords = ["devops", "diagnostics", "linux", "sre"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Environment :: Console",
+  "Intended Audience :: System Administrators",
+  "Operating System :: POSIX :: Linux",
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
+  "Topic :: System :: Systems Administration",
+]
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/DheerajShaik/opsforge"
+Changelog = "https://github.com/DheerajShaik/opsforge/blob/main/CHANGELOG.md"
+Issues = "https://github.com/DheerajShaik/opsforge/issues"
+Repository = "https://github.com/DheerajShaik/opsforge.git"
+
+[project.scripts]
+portlens = "portlens.portlens:main"
+diskhound = "diskhound.diskhound:main"
+certwatch = "certwatch.certwatch:main"
+svcdoctor = "svcdoctor.svcdoctor:main"
+loghound = "loghound.loghound:main"
+procwatch = "procwatch.procwatch:main"
+configdiff = "configdiff.configdiff:main"
+netdoctor = "netdoctor.netdoctor:main"
+healthctl = "healthctl.healthctl:main"
+incident-snapshot = "incidentsnapshot.incidentsnapshot:main"
+
+[tool.setuptools]
+packages = [
+  "certwatch",
+  "configdiff",
+  "diskhound",
+  "healthctl",
+  "incidentsnapshot",
+  "loghound",
+  "netdoctor",
+  "portlens",
+  "procwatch",
+  "svcdoctor",
+]
