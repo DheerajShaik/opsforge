@@ -1,20 +1,22 @@
 # HealthCtl
 
-HealthCtl is an experimental Linux/Unix-style utility that evaluates a bounded set of explicitly configured host and service criteria and reports `PASS`, `FAIL`, or `ERROR` for each one. V1 supports two built-in check types: filesystem free-space percentage and TCP connection establishment.
+HealthCtl is a Beta Linux utility that evaluates a bounded set of explicitly configured host and service criteria and reports `PASS`, `FAIL`, or `ERROR` for each one. V1 supports two built-in check types: filesystem free-space percentage and TCP connection establishment.
 
 HealthCtl does not infer universal health thresholds. The caller chooses every target and threshold in the configuration. A `PASS` means only that one configured criterion was satisfied during this invocation; it does not prove overall host, application, service, network, or storage health. A `FAIL` does not identify root cause.
 
 ## Requirements
 
-- Python 3
+- CPython 3.10 through 3.14
 - standard library only
 - no external commands or third-party packages
+
+The project-level supported and validated environment boundaries are documented in the [root README](../README.md#compatibility-and-support-boundaries).
 
 ## Usage
 
 ```console
-python3 healthctl/healthctl.py CONFIG.json
-python3 healthctl/healthctl.py --help
+healthctl CONFIG.json
+healthctl --help
 ```
 
 Exactly one explicit JSON configuration file is required. HealthCtl has no default configuration path, environment-variable configuration, include mechanism, directory discovery, stdin mode, remote configuration, or implicit check discovery in V1.

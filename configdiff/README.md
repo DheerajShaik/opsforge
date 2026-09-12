@@ -1,20 +1,22 @@
 # ConfigDiff
 
-ConfigDiff is an experimental Linux diagnostic utility that compares one explicitly selected local regular file with one explicitly selected baseline regular file and reports whether their observed byte content is exactly identical. It answers one narrow question: did the current file's observed bytes drift from the baseline file's observed bytes?
+ConfigDiff is a Beta Linux diagnostic utility that compares one explicitly selected local regular file with one explicitly selected baseline regular file and reports whether their observed byte content is exactly identical. It answers one narrow question: did the current file's observed bytes drift from the baseline file's observed bytes?
 
 ConfigDiff does not parse configuration syntax, decide whether either file is valid, determine whether a changed setting is effective, classify severity, identify who or what caused a change, or recommend remediation. Exact byte equality is content evidence only; it is not proof that a service is correctly configured or healthy.
 
 ## Requirements
 
 - Linux
-- Python 3
+- CPython 3.10 through 3.14
 - no external commands or third-party packages
+
+The project-level supported and validated environment boundaries are documented in the [root README](../README.md#compatibility-and-support-boundaries).
 
 ## Usage
 
 ```console
-python3 configdiff/configdiff.py BASELINE CURRENT
-python3 configdiff/configdiff.py --help
+configdiff BASELINE CURRENT
+configdiff --help
 ```
 
 Exactly two paths are required. `BASELINE` is the expected reference file and `CURRENT` is the file being checked. Relative and absolute paths are accepted. ConfigDiff has no default paths, discovery, stdin mode, configuration file, or environment-variable input in V1.

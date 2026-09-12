@@ -1,19 +1,21 @@
-# CertWatch v0.1
+# CertWatch
 
-> **Experimental:** CertWatch is not production-ready.
+> **Beta:** CertWatch is ready for broader evaluation but is not production-ready.
 
 CertWatch answers one question: **what leaf TLS certificate is one remote endpoint presenting, and what does its encoded validity interval say about expiration?** It is a read-only, one-target diagnostic. It does not validate CA trust, match hostnames, inspect the chain, send HTTP/application data, or remediate anything.
 
 ## Requirements and use
 
-- Python 3 with its standard library. Exercised versions are recorded in [VALIDATION.md](VALIDATION.md).
+- CPython 3.10 through 3.14 with its standard library. Exercised versions are recorded in [VALIDATION.md](VALIDATION.md).
 - The system `openssl` executable with `openssl x509 -ext subjectAltName -nameopt RFC2253`.
 
+The project-level Linux support boundary is documented in the [root README](../README.md#compatibility-and-support-boundaries).
+
 ```console
-python3 certwatch/certwatch.py example.com
-python3 certwatch/certwatch.py example.com:8443
-python3 certwatch/certwatch.py --warn-days 14 example.com
-python3 certwatch/certwatch.py '[2001:db8::1]:443'
+certwatch example.com
+certwatch example.com:8443
+certwatch --warn-days 14 example.com
+certwatch '[2001:db8::1]:443'
 ```
 
 The default port is 443 and the default warning threshold is 30 days. `--warn-days` is a non-negative ASCII decimal integer. A target is a strict ASCII DNS-style hostname (a final root dot and single-label names are accepted), IPv4 literal, bare IPv6 literal with default port, `HOST_OR_IPV4:PORT`, or `[IPv6]:PORT`. Explicit IPv6 ports require brackets. Unicode/IDNA names, URI syntax, underscores, whitespace, zones, malformed labels, and ports outside 1–65535 are rejected.

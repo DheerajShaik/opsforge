@@ -1,20 +1,22 @@
 # NetDoctor
 
-NetDoctor is an experimental Linux/Unix-style network diagnostic utility that reports OS resolver evidence and TCP connection-establishment evidence for one explicitly selected remote endpoint. It answers one narrow question: for this host and TCP port, what address candidates did the local resolver provide, and did a TCP handshake complete to one of them during this invocation?
+NetDoctor is a Beta Linux network diagnostic utility that reports OS resolver evidence and TCP connection-establishment evidence for one explicitly selected remote endpoint. It answers one narrow question: for this host and TCP port, what address candidates did the local resolver provide, and did a TCP handshake complete to one of them during this invocation?
 
 NetDoctor does not decide whether an application, service, website, API, TLS endpoint, host, or network is healthy. A TCP handshake is transport evidence only. A failed handshake does not identify root cause by itself.
 
 ## Requirements
 
-- Python 3
+- CPython 3.10 through 3.14
 - standard-library networking only
 - no external commands or third-party packages
+
+The project-level supported and validated environment boundaries are documented in the [root README](../README.md#compatibility-and-support-boundaries).
 
 ## Usage
 
 ```console
-python3 netdoctor/netdoctor.py HOST PORT
-python3 netdoctor/netdoctor.py --help
+netdoctor HOST PORT
+netdoctor --help
 ```
 
 `HOST` is either a strict ASCII DNS-style hostname, an IPv4 literal, or an unbracketed IPv6 literal. Single-label hostnames and a final DNS root dot are accepted. Unicode/IDNA input, underscores, whitespace, control/presentation characters, bracketed IPv6, and scoped IPv6 zone identifiers are rejected in V1. IPv6 needs no brackets because `PORT` is a separate positional argument.

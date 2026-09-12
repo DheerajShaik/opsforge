@@ -1,6 +1,6 @@
 # PortLens
 
-PortLens is an experimental Linux diagnostic utility that reports TCP listening sockets matching one local port and adds associated process metadata where that information is available. It is the first working OpsForge utility; its interface and behavior may evolve.
+PortLens is a Beta Linux diagnostic utility that reports TCP listening sockets matching one local port and adds associated process metadata where that information is available. Its interface may still evolve before a stable release.
 
 ## Scope and semantics
 
@@ -16,16 +16,17 @@ It does not scan networks, inspect UDP or connected TCP sockets, traverse networ
 
 ## Requirements
 
-- Linux
-- Python 3
+- Linux with procfs available
+- CPython 3.10 through 3.14
 - `ss`, commonly provided by iproute2
 
+The project-level supported and validated environment boundaries are documented in the [root README](../README.md#compatibility-and-support-boundaries).
 
 ## Usage
 
 ```console
-python3 portlens/portlens.py <port>
-python3 portlens/portlens.py --help
+portlens <port>
+portlens --help
 ```
 
 The port must be a decimal integer from 1 through 65535. Leading zeros are accepted as decimal. Missing, extra, unsupported, non-numeric, out-of-range, negative, and whitespace-containing argument values are rejected.
@@ -83,6 +84,6 @@ python3 -m unittest discover -s portlens/tests -v
 
 ## Current limitations and future direction
 
-PortLens is an early implementation, not a stable or production-ready release. Current limitations include text parsing at the external `ss` boundary, permission-dependent process metadata, current-network-namespace visibility, mutable observations, and unvalidated cross-version `ss` behavior.
+PortLens is Beta, not a stable or production-ready release. Current limitations include text parsing at the external `ss` boundary, permission-dependent process metadata, current-network-namespace visibility, mutable observations, and unvalidated cross-version `ss` behavior.
 
 Future work may be considered only after the initial behavior is validated through real use. Possible areas include broader compatibility testing, structured output, UDP semantics, or namespace-aware inspection; none are implemented here.

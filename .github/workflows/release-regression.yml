@@ -1,0 +1,110 @@
+name: Release regression
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  full-suite:
+    name: Python ${{ matrix.python-version }} full suite
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12", "3.13", "3.14"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Compile all utility modules
+        run: >-
+          python -m py_compile
+          portlens/portlens.py
+          diskhound/diskhound.py
+          certwatch/certwatch.py
+          svcdoctor/svcdoctor.py
+          loghound/loghound.py
+          procwatch/procwatch.py
+          configdiff/configdiff.py
+          netdoctor/netdoctor.py
+          healthctl/healthctl.py
+          incidentsnapshot/incidentsnapshot.py
+      - name: Run all utility test suites
+        shell: bash
+        run: |
+          set -euo pipefail
+          for utility in portlens diskhound certwatch svcdoctor loghound procwatch configdiff netdoctor healthctl incidentsnapshot; do
+            python -m unittest discover -s "$utility/tests" -v
+          done
+
+  package:
+    name: Build and clean-install package
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Build wheel and source distribution
+        run: |
+          python -m pip install --upgrade build
+          python -m build
+      - name: Install wheel into a clean environment
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m venv /tmp/opsforge-release-venv
+          /tmp/opsforge-release-venv/bin/python -m pip install --no-deps dist/*.whl
+      - name: Verify installed metadata, imports, and commands
+        shell: bash
+        run: |
+          set -euo pipefail
+          python_bin=/tmp/opsforge-release-venv/bin/python
+          bin_dir=/tmp/opsforge-release-venv/bin
+          cd /tmp
+          "$python_bin" - <<'PY'
+          import importlib
+          import importlib.metadata
+
+          modules = (
+              "portlens.portlens",
+              "diskhound.diskhound",
+              "certwatch.certwatch",
+              "svcdoctor.svcdoctor",
+              "loghound.loghound",
+              "procwatch.procwatch",
+              "configdiff.configdiff",
+              "netdoctor.netdoctor",
+              "healthctl.healthctl",
+              "incidentsnapshot.incidentsnapshot",
+          )
+          assert importlib.metadata.version("opsforge") == "0.1.0b1"
+          for name in modules:
+              assert callable(importlib.import_module(name).main)
+          PY
+          for command in portlens diskhound certwatch svcdoctor loghound procwatch configdiff netdoctor healthctl incident-snapshot; do
+            test -x "$bin_dir/$command"
+            "$bin_dir/$command" --help >/dev/null
+          done
+      - name: Exercise safe installed invocations
+        shell: bash
+        run: |
+          set -euo pipefail
+          bin_dir=/tmp/opsforge-release-venv/bin
+          temp_dir="$(mktemp -d)"
+          trap 'rm -rf "$temp_dir"' EXIT
+          printf 'repeated\nrepeated\n' > "$temp_dir/sample.log"
+          cp "$temp_dir/sample.log" "$temp_dir/baseline.conf"
+          cp "$temp_dir/baseline.conf" "$temp_dir/current.conf"
+          printf '{"version":1,"checks":[{"name":"root-space","type":"disk_free_percent","path":"/","minimum_free_percent":0}]}' > "$temp_dir/health.json"
+          "$bin_dir/diskhound" "$temp_dir" >/dev/null
+          "$bin_dir/loghound" "$temp_dir/sample.log" >/dev/null
+          "$bin_dir/configdiff" "$temp_dir/baseline.conf" "$temp_dir/current.conf" >/dev/null
+          "$bin_dir/healthctl" "$temp_dir/health.json" >/dev/null
+          "$bin_dir/procwatch" "$PPID" --interval 0.1 >/dev/null
+          "$bin_dir/incident-snapshot" >/dev/null
+      - name: Uninstall cleanly
+        run: |
+          /tmp/opsforge-release-venv/bin/python -m pip uninstall --yes opsforge
+          test ! -e /tmp/opsforge-release-venv/bin/portlens

@@ -4,7 +4,17 @@ Notable changes to OpsForge will be recorded here.
 
 ## Unreleased
 
-- Prepared bounded CertWatch SAN-heading compatibility hardening for post-merge real-world revalidation, added deterministic regression coverage for captured OpenSSL 3.0.13 decoder formatting, clarified CertWatch compatibility and validation status, and refreshed the project security and contribution guidance.
+No changes yet.
+
+## 0.1.0-beta.1 - 2026-09-12
+
+- Transitioned OpsForge from Experimental to Beta after completion of the initial ten-utility roadmap, while retaining explicit non-production-readiness and compatibility limits.
+- Added standard Python packaging with ten independent console commands and isolated local installation through `pipx install .`.
+- Added a repository-wide CPython 3.10–3.14 Linux regression gate covering compilation, all utility suites, distribution builds, clean wheel installation, installed entry points, safe smoke checks, and uninstallation.
+- Reconciled project, security, contribution, compatibility, and utility documentation with completed implementation and recorded validation evidence.
+- Completed post-fix CertWatch real-world revalidation against `example.com:443` on Ubuntu 24.04.1 WSL2 with Python 3.12.3 and OpenSSL 3.0.13.
+
+- Hardened CertWatch SAN-heading compatibility for bounded OpenSSL horizontal-whitespace variants, added deterministic regression coverage for captured OpenSSL 3.0.13 decoder formatting, clarified compatibility and validation status, and refreshed project security and contribution guidance.
 
 - Added experimental Incident Snapshot V1 for bounded, low-sensitivity Linux incident context from an explicit source allowlist, with reduced platform, runtime, memory, and root-capacity evidence, useful partial-section semantics, deterministic tests, documentation, and dedicated CI.
 

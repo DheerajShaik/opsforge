@@ -1,21 +1,23 @@
 # Incident Snapshot
 
-Incident Snapshot is an experimental Linux diagnostic utility that captures a small, bounded set of low-sensitivity local host context during one read-only sequential pass. It answers: what observation timing, reduced platform metadata, uptime/load, aggregate memory capacity, and root-filesystem capacity were observable near the beginning of an incident?
+Incident Snapshot is a Beta Linux diagnostic utility that captures a small, bounded set of low-sensitivity local host context during one read-only sequential pass. It answers: what observation timing, reduced platform metadata, uptime/load, aggregate memory capacity, and root-filesystem capacity were observable near the beginning of an incident?
 
 It is context preservation, not a forensic collector, support bundle, monitor, health controller, or root-cause engine. Its output does not determine incident severity or prove that a host is healthy or unhealthy.
 
 ## Requirements
 
 - Linux with procfs mounted at `/proc`
-- Python 3
+- CPython 3.10 through 3.14
 - standard library only
 - no external commands or third-party packages
+
+The project-level supported and validated environment boundaries are documented in the [root README](../README.md#compatibility-and-support-boundaries).
 
 ## Usage
 
 ```console
-python3 incidentsnapshot/incidentsnapshot.py
-python3 incidentsnapshot/incidentsnapshot.py --help
+incident-snapshot
+incident-snapshot --help
 ```
 
 V1 accepts no positional arguments or options other than standard `-h`/`--help`. It has no configuration, environment-variable input, collector selection, target, threshold, timeout, or alternate output format.
@@ -23,7 +25,7 @@ V1 accepts no positional arguments or options other than standard `-h`/`--help`.
 The report goes to stdout. To preserve it, the caller may explicitly redirect stdout:
 
 ```console
-python3 incidentsnapshot/incidentsnapshot.py > incident-snapshot.txt
+incident-snapshot > incident-snapshot.txt
 ```
 
 Incident Snapshot does not create that file. Redirected output becomes caller-controlled persistent operational metadata; review its contents, permissions, sharing, and retention accordingly.

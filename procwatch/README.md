@@ -1,21 +1,23 @@
 # ProcWatch
 
-ProcWatch is an experimental Linux diagnostic utility that samples one explicitly selected process twice and reports bounded CPU and memory evidence from Linux procfs. It answers: for this PID, did the same observed process remain available across the sampling interval, how much process CPU time accumulated, what one-logical-CPU utilization does that imply, and how did selected process state, thread, resident-memory, and virtual-memory values change?
+ProcWatch is a Beta Linux diagnostic utility that samples one explicitly selected process twice and reports bounded CPU and memory evidence from Linux procfs. It answers: for this PID, did the same observed process remain available across the sampling interval, how much process CPU time accumulated, what one-logical-CPU utilization does that imply, and how did selected process state, thread, resident-memory, and virtual-memory values change?
 
 ProcWatch does not decide whether a process is abnormal, healthy, unhealthy, leaking memory, overloaded, or responsible for an incident. A short sample without a workload baseline, cgroup or quota context, host pressure, and application semantics cannot support those conclusions reliably.
 
 ## Requirements
 
 - Linux with procfs mounted at `/proc`
-- Python 3
+- CPython 3.10 through 3.14
 - no external commands or third-party packages
+
+The project-level supported and validated environment boundaries are documented in the [root README](../README.md#compatibility-and-support-boundaries).
 
 ## Usage
 
 ```console
-python3 procwatch/procwatch.py PID
-python3 procwatch/procwatch.py PID --interval SECONDS
-python3 procwatch/procwatch.py --help
+procwatch PID
+procwatch PID --interval SECONDS
+procwatch --help
 ```
 
 `PID` must be a positive decimal integer. The sampling delay defaults to 1 second and may be set from 0.1 through 60 seconds inclusive. ProcWatch does not discover or rank processes in V1; the caller chooses exactly one PID.

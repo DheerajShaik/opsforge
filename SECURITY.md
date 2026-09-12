@@ -2,7 +2,7 @@
 
 ## Current security posture
 
-OpsForge currently contains experimental implementations of PortLens, DiskHound, CertWatch, SvcDoctor, LogHound, ProcWatch, ConfigDiff, NetDoctor, HealthCtl, and Incident Snapshot. All remain experimental. There is no project-wide production-readiness claim.
+OpsForge v0.1.0-beta.1 contains Beta implementations of PortLens, DiskHound, CertWatch, SvcDoctor, LogHound, ProcWatch, ConfigDiff, NetDoctor, HealthCtl, and Incident Snapshot. The initial roadmap is implemented and ready for broader evaluation, but Beta is not a production-readiness guarantee.
 
 Security validation and compatibility work remain ongoing. The repository does not claim a formal security audit, certification, penetration test, production hardening, or vulnerability-free status.
 
@@ -64,3 +64,9 @@ OpsForge utilities must not silently escalate privileges.
 Project maturity may justify static analysis, dependency scanning, secret scanning, security testing, threat modeling, release verification, and community security review.
 
 These mechanisms are not yet established and should be introduced when they provide concrete value.
+
+## Packaging and installation
+
+The Python package has no third-party runtime dependencies, install-time hooks, custom build commands, or executable setup script. Building and installing the package imports no utility module and performs no network request, telemetry, upload, system inspection, persistence, privilege escalation, or shell command.
+
+The documented `pipx install .` workflow may contact the Python package index to obtain ordinary build tooling in pipx's isolated build environment. That package-management traffic belongs to pip/pipx, not to OpsForge runtime behavior. Install only from a trusted checkout or reviewed distribution artifact.
