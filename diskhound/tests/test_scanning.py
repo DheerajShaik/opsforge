@@ -87,6 +87,7 @@ class RealFilesystemScanningTests(unittest.TestCase):
       result = diskhound.scan(directory)
       self.assertEqual(len(result.branches), 1)
       self.assertFalse(result.incomplete)
+      self.assertGreater(result.depth_limited_directories, 0)
     finally:
       for path in reversed(created):
         path.rmdir()
