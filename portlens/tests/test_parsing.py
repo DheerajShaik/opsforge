@@ -33,7 +33,15 @@ class SsParsingTests(unittest.TestCase):
     observation = portlens.parse_ss_row(self.IPV4, "ipv4")
     self.assertEqual((observation.protocol, observation.state, observation.family), ("tcp", "LISTEN", "ipv4"))
     self.assertEqual((observation.local_address, observation.local_port), ("127.0.0.1", 8080))
-    self.assertEqual(observation.processes, (portlens.ProcessReference(1234, "python3"),))
+    self.assertEqual(observation.processes, (portlens.ProcessReference(1234, "python3", 3),))
+
+  def test_udp_row(self):
+    observation = portlens.parse_ss_row(
+      'UNCONN 0 0 0.0.0.0:53 0.0.0.0:* users:(("dns",pid=2,fd=4))'.replace("0.0.0.0", "0.0.0.0", 1),
+      "ipv4",
+      "udp",
+    )
+    self.assertEqual((observation.protocol, observation.state, observation.local_port), ("udp", "UNCONN", 53))
 
   def test_process_metadata_absent(self):
     observation = portlens.parse_ss_row("LISTEN 0 128 0.0.0.0:8080 0.0.0.0:*", "ipv4")

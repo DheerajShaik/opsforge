@@ -1,5 +1,6 @@
 import contextlib
 import io
+import json
 from pathlib import Path
 import subprocess
 import sys
@@ -27,18 +28,36 @@ class CliTests(unittest.TestCase):
         self.assertEqual(context.exception.code, 0)
         self.assertIn("TCP LISTEN", stdout.getvalue())
 
-  @mock.patch.object(portlens, "inspect", return_value=("matched output", 0))
+  @mock.patch.object(portlens, "inspect_selection", return_value=("matched output", [
+    portlens.DisplayObservation("tcp", "LISTEN", "ipv4", "127.0.0.1", 8080, "1", "u", "p")
+  ], 0))
   def test_match_path(self, inspect):
     code, stdout, stderr = self.run_main(["8080"])
     self.assertEqual((code, stderr), (0, ""))
-    self.assertEqual(stdout, "matched output\n")
-    inspect.assert_called_once_with(8080)
+    self.assertIn("matched output\nConclusion: [FOUND]", stdout)
 
-  @mock.patch.object(portlens, "inspect", return_value=("no match output", 1))
+  @mock.patch.object(portlens, "inspect_selection", return_value=("no match output", [], 1))
   def test_no_match_path(self, inspect):
     code, stdout, stderr = self.run_main(["8080"])
     self.assertEqual((code, stderr), (1, ""))
-    self.assertEqual(stdout, "no match output\n")
+    self.assertIn("no match output\nConclusion: [NOT_FOUND]", stdout)
+
+  @mock.patch.object(portlens, "inspect_selection", return_value=("detail", [], 1))
+  def test_json_is_json_only(self, inspect):
+    code, stdout, stderr = self.run_main(["--json", "8080"])
+    self.assertEqual((code, stderr), (1, ""))
+    payload = json.loads(stdout)
+    self.assertEqual(payload["tool"], "portlens")
+    self.assertEqual(payload["status"], "NOT_FOUND")
+
+  @mock.patch.object(portlens, "inspect_selection", return_value=("detail", [], 1))
+  def test_brief_and_quiet(self, inspect):
+    code, stdout, _ = self.run_main(["--brief", "8080"])
+    self.assertEqual(code, 1)
+    self.assertNotIn("detail", stdout)
+    self.assertIn("Conclusion:", stdout)
+    code, stdout, _ = self.run_main(["--quiet", "8080"])
+    self.assertEqual((code, stdout), (1, ""))
 
   def test_invalid_input_uses_stderr_and_exit_two(self):
     with self.assertRaises(SystemExit) as context:
@@ -75,6 +94,16 @@ class CliTests(unittest.TestCase):
       ("/usr/bin/ss", ("-H", "-4", "-ltnp")),
       ("/usr/bin/ss", ("-H", "-6", "-ltnp")),
     ])
+
+  def test_udp_query_is_protocol_specific(self):
+    calls = []
+    portlens.discover_sockets(
+      "/usr/bin/ss",
+      lambda executable, arguments: calls.append(tuple(arguments)) or "",
+      protocol="udp",
+      families=("ipv4",),
+    )
+    self.assertEqual(calls, [("-H", "-4", "-lunp")])
 
   @mock.patch.object(portlens, "find_ss", return_value="/usr/bin/ss")
   @mock.patch.object(portlens, "discover_sockets")
