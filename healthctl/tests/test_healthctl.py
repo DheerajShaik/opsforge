@@ -119,8 +119,34 @@ class HealthCtlTests(unittest.TestCase):
 
   def test_rejects_unknown_check_type(self):
     document = self.valid_document()
-    document["checks"][0]["type"] = "http"
+    document["checks"][0] = {"name": "shell", "type": "command", "command": "true"}
     with self.assertRaisesRegex(healthctl.ConfigError, "unsupported in V1"):
+      healthctl.parse_config_document(document, path="x")
+
+  def test_parses_extended_checks_and_common_fields(self):
+    document = {
+      "version": 1,
+      "max_workers": 2,
+      "checks": [
+        {"name": "web", "type": "https", "url": "https://example.com/health", "severity": "WARN", "retries": 2},
+        {"name": "hash", "type": "config_hash", "path": "/etc/hosts", "sha256": "0" * 64, "depends_on": ["web"]},
+      ],
+    }
+    config = healthctl.parse_config_document(document, path="health.json")
+    self.assertEqual(config.max_workers, 2)
+    self.assertEqual(config.checks[0].severity, "WARN")
+    self.assertEqual(config.checks[0].retries, 2)
+    self.assertEqual(config.checks[1].depends_on, ("web",))
+
+  def test_rejects_dependency_cycle(self):
+    document = {
+      "version": 1,
+      "checks": [
+        {"name": "a", "type": "file_exists", "path": "/a", "depends_on": ["b"]},
+        {"name": "b", "type": "file_exists", "path": "/b", "depends_on": ["a"]},
+      ],
+    }
+    with self.assertRaisesRegex(healthctl.ConfigError, "cycle"):
       healthctl.parse_config_document(document, path="x")
 
   def test_rejects_unknown_check_field(self):
@@ -329,6 +355,28 @@ class HealthCtlTests(unittest.TestCase):
       executor=lambda check: healthctl.CheckResult(check.name, check.type, "PASS", "/", "ok"),
     )
     self.assertEqual([result.name for result in results], ["a", "b"])
+
+  def test_failed_dependency_skips_dependent_check(self):
+    checks = (
+      healthctl.GenericCheck("a", "file_exists", "/a"),
+      healthctl.GenericCheck("b", "file_exists", "/b", depends_on=("a",)),
+    )
+    calls = []
+    def executor(check):
+      calls.append(check.name)
+      return healthctl.CheckResult(check.name, check.type, "FAIL", check.target, "no", check.severity)
+    results = healthctl.evaluate_config(healthctl.HealthConfig("/tmp/x", checks), executor=executor)
+    self.assertEqual(calls, ["a"])
+    self.assertIn("dependency did not pass", results[1].evidence)
+
+  def test_config_hash_check_matches_regular_file(self):
+    import hashlib
+    with tempfile.TemporaryDirectory() as tempdir:
+      path = Path(tempdir) / "config"
+      path.write_bytes(b"safe\n")
+      digest = hashlib.sha256(b"safe\n").hexdigest()
+      check = healthctl.GenericCheck("hash", "config_hash", str(path), options=(("sha256", digest),))
+      self.assertEqual(healthctl.run_generic_check(check).status, "PASS")
 
   def test_render_report_escapes_external_text(self):
     config = healthctl.HealthConfig("/tmp/x", (healthctl.DiskFreeCheck("disk", "/", 1),))

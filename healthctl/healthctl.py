@@ -4,19 +4,37 @@
 from __future__ import annotations
 
 import argparse
-from dataclasses import dataclass
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass, replace
+from datetime import datetime, timezone
 import errno
 import ipaddress
 import json
+import hashlib
 import math
 import os
 import re
 import shutil
 import socket
+import ssl
 import stat
+import subprocess
 import sys
+import time
 import unicodedata
+import urllib.error
+import urllib.parse
+import urllib.request
 from typing import Callable, Mapping, Sequence
+
+from opsforge_common import (
+  OutputError,
+  OutputRecord,
+  add_output_arguments,
+  emit_output,
+  make_conclusion,
+  validate_output_arguments,
+)
 
 
 CONFIG_MAX_BYTES = 64 * 1024
@@ -25,6 +43,10 @@ MAX_RESOLVER_CANDIDATES = 16
 DEFAULT_TCP_TIMEOUT_SECONDS = 1.0
 MIN_TCP_TIMEOUT_SECONDS = 0.1
 MAX_TCP_TIMEOUT_SECONDS = 5.0
+MAX_RETRIES = 3
+MAX_WORKERS = 8
+MAX_HTTP_REDIRECTS = 3
+MAX_HASH_BYTES = 64 * 1024 * 1024
 CHECK_NAME_RE = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9._-]{0,63})\Z", re.ASCII)
 HOST_LABEL_RE = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\Z", re.ASCII)
 
@@ -43,6 +65,11 @@ class DiskFreeCheck:
   path: str
   minimum_free_percent: float
   type: str = "disk_free_percent"
+  severity: str = "CRITICAL"
+  group: str = "default"
+  profile: str = "default"
+  depends_on: tuple[str, ...] = ()
+  retries: int = 0
 
 
 @dataclass(frozen=True)
@@ -53,15 +80,35 @@ class TcpConnectCheck:
   port: int
   timeout_seconds: float
   type: str = "tcp_connect"
+  severity: str = "CRITICAL"
+  group: str = "default"
+  profile: str = "default"
+  depends_on: tuple[str, ...] = ()
+  retries: int = 0
 
 
-HealthCheck = DiskFreeCheck | TcpConnectCheck
+@dataclass(frozen=True)
+class GenericCheck:
+  name: str
+  type: str
+  target: str
+  timeout_seconds: float = DEFAULT_TCP_TIMEOUT_SECONDS
+  severity: str = "CRITICAL"
+  group: str = "default"
+  profile: str = "default"
+  depends_on: tuple[str, ...] = ()
+  retries: int = 0
+  options: tuple[tuple[str, object], ...] = ()
+
+
+HealthCheck = DiskFreeCheck | TcpConnectCheck | GenericCheck
 
 
 @dataclass(frozen=True)
 class HealthConfig:
   path: str
   checks: tuple[HealthCheck, ...]
+  max_workers: int = 4
 
 
 @dataclass(frozen=True)
@@ -71,6 +118,9 @@ class CheckResult:
   status: str
   target: str
   evidence: str
+  severity: str = "OK"
+  elapsed_seconds: float = 0.0
+  attempts: int = 1
 
 
 @dataclass(frozen=True)
@@ -250,6 +300,35 @@ def _parse_port(value: object, context: str) -> int:
   return value
 
 
+def _parse_nonnegative_int(value: object, context: str, maximum: int) -> int:
+  if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= maximum:
+    raise ConfigError(f"{context} must be a JSON integer from 0 through {maximum}")
+  return value
+
+
+COMMON_CHECK_FIELDS = {"severity", "group", "profile", "depends_on", "retries"}
+
+
+def _common_check_fields(check: Mapping[str, object], context: str) -> dict[str, object]:
+  severity = check.get("severity", "CRITICAL")
+  if severity not in {"WARN", "CRITICAL"}:
+    raise ConfigError(f"{context}.severity must be WARN or CRITICAL")
+  group_value = check.get("group", "default")
+  profile_value = check.get("profile", "default")
+  if not isinstance(group_value, str) or not isinstance(profile_value, str):
+    raise ConfigError(f"{context}.group and profile must be strings")
+  group = _parse_check_name(group_value, f"{context}.group")
+  profile = _parse_check_name(profile_value, f"{context}.profile")
+  raw_dependencies = check.get("depends_on", [])
+  if not isinstance(raw_dependencies, list) or len(raw_dependencies) > MAX_CHECKS:
+    raise ConfigError(f"{context}.depends_on must be a bounded JSON array")
+  dependencies = tuple(_parse_check_name(value, f"{context}.depends_on") for value in raw_dependencies if isinstance(value, str))
+  if len(dependencies) != len(raw_dependencies) or len(set(dependencies)) != len(dependencies):
+    raise ConfigError(f"{context}.depends_on must contain unique check names")
+  retries = _parse_nonnegative_int(check.get("retries", 0), f"{context}.retries", MAX_RETRIES)
+  return {"severity": severity, "group": group, "profile": profile, "depends_on": dependencies, "retries": retries}
+
+
 def parse_host(value: str, context: str) -> tuple[str, str]:
   if not value:
     raise ConfigError(f"{context} must not be empty")
@@ -288,7 +367,7 @@ def parse_host(value: str, context: str) -> tuple[str, str]:
 
 def parse_config_document(document: object, *, path: str) -> HealthConfig:
   root = _expect_mapping(document, "configuration")
-  _reject_unknown_keys(root, {"version", "checks"}, "configuration")
+  _reject_unknown_keys(root, {"version", "checks", "max_workers"}, "configuration")
   if root.get("version") != 1 or isinstance(root.get("version"), bool):
     raise ConfigError("configuration.version must be the JSON integer 1")
   checks_value = root.get("checks")
@@ -299,6 +378,9 @@ def parse_config_document(document: object, *, path: str) -> HealthConfig:
   if len(checks_value) > MAX_CHECKS:
     raise ConfigError(f"configuration.checks exceeds the {MAX_CHECKS}-check V1 limit")
 
+  max_workers = _parse_nonnegative_int(root.get("max_workers", 4), "configuration.max_workers", MAX_WORKERS)
+  if max_workers < 1:
+    raise ConfigError("configuration.max_workers must be at least 1")
   checks = []
   names = set()
   for index, raw_check in enumerate(checks_value, 1):
@@ -309,29 +391,111 @@ def parse_config_document(document: object, *, path: str) -> HealthConfig:
       raise ConfigError(f"configuration contains duplicate check name: {name}")
     names.add(name)
     check_type = _require_string(check, "type", context)
+    common = _common_check_fields(check, context)
 
     if check_type == "disk_free_percent":
-      _reject_unknown_keys(check, {"name", "type", "path", "minimum_free_percent"}, context)
+      _reject_unknown_keys(check, {"name", "type", "path", "minimum_free_percent"} | COMMON_CHECK_FIELDS, context)
       check_path = _require_string(check, "path", context)
       if not check_path:
         raise ConfigError(f"{context}.path must not be empty")
       if "\x00" in check_path:
         raise ConfigError(f"{context}.path must not contain NUL")
       minimum = _parse_percent(check.get("minimum_free_percent"), f"{context}.minimum_free_percent")
-      checks.append(DiskFreeCheck(name, check_path, minimum))
+      checks.append(DiskFreeCheck(name, check_path, minimum, **common))
     elif check_type == "tcp_connect":
-      _reject_unknown_keys(check, {"name", "type", "host", "port", "timeout_seconds"}, context)
+      _reject_unknown_keys(check, {"name", "type", "host", "port", "timeout_seconds"} | COMMON_CHECK_FIELDS, context)
       host, host_kind = parse_host(_require_string(check, "host", context), f"{context}.host")
       port = _parse_port(check.get("port"), f"{context}.port")
       timeout = _parse_timeout(
         check.get("timeout_seconds", DEFAULT_TCP_TIMEOUT_SECONDS),
         f"{context}.timeout_seconds",
       )
-      checks.append(TcpConnectCheck(name, host, host_kind, port, timeout))
+      checks.append(TcpConnectCheck(name, host, host_kind, port, timeout, **common))
+    elif check_type in {"http", "https"}:
+      _reject_unknown_keys(check, {"name", "type", "url", "timeout_seconds", "expected_status"} | COMMON_CHECK_FIELDS, context)
+      url = _require_string(check, "url", context)
+      parsed = urllib.parse.urlsplit(url)
+      if parsed.scheme != check_type or not parsed.hostname or parsed.username or parsed.password or parsed.fragment:
+        raise ConfigError(f"{context}.url must be a credential-free {check_type} URL without a fragment")
+      timeout = _parse_timeout(check.get("timeout_seconds", DEFAULT_TCP_TIMEOUT_SECONDS), f"{context}.timeout_seconds")
+      expected = _parse_nonnegative_int(check.get("expected_status", 200), f"{context}.expected_status", 599)
+      if expected < 100:
+        raise ConfigError(f"{context}.expected_status must be from 100 through 599")
+      checks.append(GenericCheck(name, check_type, url, timeout, options=(("expected_status", expected),), **common))
+    elif check_type == "dns":
+      _reject_unknown_keys(check, {"name", "type", "host", "timeout_seconds"} | COMMON_CHECK_FIELDS, context)
+      host, _ = parse_host(_require_string(check, "host", context), f"{context}.host")
+      timeout = _parse_timeout(check.get("timeout_seconds", DEFAULT_TCP_TIMEOUT_SECONDS), f"{context}.timeout_seconds")
+      checks.append(GenericCheck(name, check_type, host, timeout, **common))
+    elif check_type == "certificate_expiry":
+      _reject_unknown_keys(check, {"name", "type", "host", "port", "timeout_seconds", "warn_days", "critical_days"} | COMMON_CHECK_FIELDS, context)
+      host, _ = parse_host(_require_string(check, "host", context), f"{context}.host")
+      port = _parse_port(check.get("port", 443), f"{context}.port")
+      timeout = _parse_timeout(check.get("timeout_seconds", DEFAULT_TCP_TIMEOUT_SECONDS), f"{context}.timeout_seconds")
+      warn = _parse_nonnegative_int(check.get("warn_days", 30), f"{context}.warn_days", 36500)
+      critical = _parse_nonnegative_int(check.get("critical_days", 7), f"{context}.critical_days", 36500)
+      if critical > warn:
+        raise ConfigError(f"{context}.critical_days must not exceed warn_days")
+      checks.append(GenericCheck(name, check_type, f"{host}:{port}", timeout, options=(("host", host), ("port", port), ("warn_days", warn), ("critical_days", critical)), **common))
+    elif check_type == "process":
+      _reject_unknown_keys(check, {"name", "type", "pid"} | COMMON_CHECK_FIELDS, context)
+      pid = _parse_nonnegative_int(check.get("pid"), f"{context}.pid", 2_147_483_647)
+      if pid < 1:
+        raise ConfigError(f"{context}.pid must be positive")
+      checks.append(GenericCheck(name, check_type, str(pid), options=(("pid", pid),), **common))
+    elif check_type == "systemd_service":
+      _reject_unknown_keys(check, {"name", "type", "service", "timeout_seconds"} | COMMON_CHECK_FIELDS, context)
+      service = _require_string(check, "service", context)
+      if not service or service.startswith("-") or "/" in service or any(value.isspace() for value in service):
+        raise ConfigError(f"{context}.service is invalid")
+      service = service if service.endswith(".service") else service + ".service"
+      timeout = _parse_timeout(check.get("timeout_seconds", DEFAULT_TCP_TIMEOUT_SECONDS), f"{context}.timeout_seconds")
+      checks.append(GenericCheck(name, check_type, service, timeout, **common))
+    elif check_type in {"file_exists", "file_metadata", "config_hash"}:
+      allowed = {"name", "type", "path", "minimum_bytes", "maximum_bytes", "sha256"} | COMMON_CHECK_FIELDS
+      _reject_unknown_keys(check, allowed, context)
+      check_path = _require_string(check, "path", context)
+      if not check_path or "\x00" in check_path:
+        raise ConfigError(f"{context}.path is invalid")
+      options = []
+      if check_type == "file_metadata":
+        options.extend((
+          ("minimum_bytes", _parse_nonnegative_int(check.get("minimum_bytes", 0), f"{context}.minimum_bytes", (1 << 63) - 1)),
+          ("maximum_bytes", _parse_nonnegative_int(check.get("maximum_bytes", (1 << 63) - 1), f"{context}.maximum_bytes", (1 << 63) - 1)),
+        ))
+        if options[0][1] > options[1][1]:
+          raise ConfigError(f"{context}.minimum_bytes must not exceed maximum_bytes")
+      if check_type == "config_hash":
+        digest = _require_string(check, "sha256", context).lower()
+        if re.fullmatch(r"[0-9a-f]{64}", digest) is None:
+          raise ConfigError(f"{context}.sha256 must be 64 hexadecimal digits")
+        options.append(("sha256", digest))
+      checks.append(GenericCheck(name, check_type, check_path, options=tuple(options), **common))
     else:
       raise ConfigError(f"{context}.type is unsupported in V1: {display_safe(check_type)}")
 
-  return HealthConfig(os.path.abspath(path), tuple(checks))
+  for check in checks:
+    for dependency in check.depends_on:
+      if dependency not in names or dependency == check.name:
+        raise ConfigError(f"check {check.name} has an invalid dependency: {dependency}")
+  dependency_map = {check.name: check.depends_on for check in checks}
+  visiting: set[str] = set()
+  visited: set[str] = set()
+
+  def visit(check_name: str) -> None:
+    if check_name in visiting:
+      raise ConfigError("check dependency graph contains a cycle")
+    if check_name in visited:
+      return
+    visiting.add(check_name)
+    for dependency in dependency_map[check_name]:
+      visit(dependency)
+    visiting.remove(check_name)
+    visited.add(check_name)
+
+  for check_name in dependency_map:
+    visit(check_name)
+  return HealthConfig(os.path.abspath(path), tuple(checks), max_workers)
 
 
 def _strict_json_object(pairs: Sequence[tuple[str, object]]) -> dict[str, object]:
@@ -562,12 +726,162 @@ def run_tcp_check(
   )
 
 
+class LimitedRedirectHandler(urllib.request.HTTPRedirectHandler):
+  def __init__(self):
+    self.redirects = 0
+
+  def redirect_request(self, req, fp, code, msg, headers, newurl):
+    self.redirects += 1
+    if self.redirects > MAX_HTTP_REDIRECTS:
+      raise urllib.error.HTTPError(req.full_url, code, "redirect limit exceeded", headers, fp)
+    return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def _options(check: GenericCheck) -> dict[str, object]:
+  return dict(check.options)
+
+
+def hash_regular_file(path: str, expected_metadata: os.stat_result) -> str:
+  flags = os.O_RDONLY
+  for flag_name in ("O_CLOEXEC", "O_NOFOLLOW", "O_NONBLOCK"):
+    flags |= getattr(os, flag_name, 0)
+  try:
+    descriptor = os.open(path, flags)
+  except OSError as error:
+    raise ObservationError("file could not be opened safely for hashing") from error
+  try:
+    before = os.fstat(descriptor)
+    if not stat.S_ISREG(before.st_mode) or _metadata_identity(before) != _metadata_identity(expected_metadata):
+      raise ObservationError("file identity changed before hashing")
+    if before.st_size > MAX_HASH_BYTES:
+      raise ObservationError(f"file exceeds {MAX_HASH_BYTES}-byte hash limit")
+    digest = hashlib.sha256()
+    remaining = before.st_size
+    while remaining:
+      chunk = os.read(descriptor, min(remaining, 64 * 1024))
+      if not chunk:
+        raise ObservationError("file changed during hashing")
+      digest.update(chunk)
+      remaining -= len(chunk)
+    if os.read(descriptor, 1):
+      raise ObservationError("file changed during hashing")
+    after = os.fstat(descriptor)
+    if _metadata_identity(before) != _metadata_identity(after):
+      raise ObservationError("file changed during hashing")
+    return digest.hexdigest()
+  except OSError as error:
+    raise ObservationError("file could not be hashed") from error
+  finally:
+    os.close(descriptor)
+
+
+def run_generic_check(check: GenericCheck) -> CheckResult:
+  options = _options(check)
+  if check.type in {"http", "https"}:
+    request = urllib.request.Request(check.target, method="HEAD", headers={"User-Agent": "OpsForge-HealthCtl/0.2"})
+    opener = urllib.request.build_opener(LimitedRedirectHandler())
+    try:
+      with opener.open(request, timeout=check.timeout_seconds) as response:
+        status_code = response.status
+    except urllib.error.HTTPError as error:
+      status_code = error.code
+    except (OSError, urllib.error.URLError, TimeoutError) as error:
+      return CheckResult(check.name, check.type, "FAIL", check.target, f"HTTP layer failed: {type(error).__name__}", check.severity)
+    expected = int(options["expected_status"])
+    status = "PASS" if status_code == expected else "FAIL"
+    return CheckResult(check.name, check.type, status, check.target, f"HTTP status {status_code}; required {expected}", "OK" if status == "PASS" else check.severity)
+  if check.type == "dns":
+    try:
+      records = socket.getaddrinfo(check.target, None, socket.AF_UNSPEC, socket.SOCK_STREAM)
+    except socket.gaierror:
+      return CheckResult(check.name, check.type, "FAIL", check.target, "OS resolution returned no usable address", check.severity)
+    addresses = sorted({str(ipaddress.ip_address(record[4][0].split("%", 1)[0])) for record in records})[:MAX_RESOLVER_CANDIDATES]
+    status = "PASS" if addresses else "FAIL"
+    return CheckResult(check.name, check.type, status, check.target, f"resolved addresses: {', '.join(addresses) or 'none'}", "OK" if status == "PASS" else check.severity)
+  if check.type == "certificate_expiry":
+    host, port = str(options["host"]), int(options["port"])
+    try:
+      context = ssl.create_default_context()
+      with socket.create_connection((host, port), timeout=check.timeout_seconds) as tcp:
+        with context.wrap_socket(tcp, server_hostname=host) as tls:
+          certificate = tls.getpeercert()
+      not_after = certificate.get("notAfter")
+      if not isinstance(not_after, str):
+        raise ValueError
+      remaining = ssl.cert_time_to_seconds(not_after) - time.time()
+    except (OSError, ssl.SSLError, ValueError):
+      return CheckResult(check.name, check.type, "ERROR", check.target, "trusted TLS certificate observation failed", "CRITICAL")
+    days = remaining / 86400
+    critical, warn = int(options["critical_days"]), int(options["warn_days"])
+    if days < critical:
+      status, severity = "FAIL", "CRITICAL"
+    elif days < warn:
+      status, severity = "FAIL", "WARN"
+    else:
+      status, severity = "PASS", "OK"
+    return CheckResult(check.name, check.type, status, check.target, f"trusted certificate expires in {days:.2f} days; revocation not checked", severity)
+  if check.type == "process":
+    pid = int(options["pid"])
+    try:
+      metadata = os.stat(f"/proc/{pid}", follow_symlinks=False)
+      exists = stat.S_ISDIR(metadata.st_mode)
+    except OSError:
+      exists = False
+    return CheckResult(check.name, check.type, "PASS" if exists else "FAIL", check.target, "process directory exists" if exists else "process directory was not observed", "OK" if exists else check.severity)
+  if check.type == "systemd_service":
+    try:
+      completed = subprocess.run(
+        ["systemctl", "is-active", "--system", "--quiet", "--", check.target],
+        check=False, capture_output=True, timeout=check.timeout_seconds,
+        env={**os.environ, "LC_ALL": "C", "SYSTEMD_PAGER": "", "SYSTEMD_COLORS": "0"},
+      )
+    except (OSError, subprocess.SubprocessError):
+      return CheckResult(check.name, check.type, "ERROR", check.target, "systemd state could not be observed", "CRITICAL")
+    active = completed.returncode == 0
+    return CheckResult(check.name, check.type, "PASS" if active else "FAIL", check.target, "service is active" if active else f"service is not active (status {completed.returncode})", "OK" if active else check.severity)
+  if check.type in {"file_exists", "file_metadata", "config_hash"}:
+    path = os.path.abspath(check.target)
+    try:
+      metadata = os.lstat(path)
+    except OSError:
+      return CheckResult(check.name, check.type, "FAIL", path, "path was not observed", check.severity)
+    if stat.S_ISLNK(metadata.st_mode):
+      return CheckResult(check.name, check.type, "ERROR", path, "final-component symlinks are not followed", "CRITICAL")
+    if check.type == "file_exists":
+      return CheckResult(check.name, check.type, "PASS", path, "path exists", "OK")
+    if not stat.S_ISREG(metadata.st_mode):
+      return CheckResult(check.name, check.type, "FAIL", path, "path is not a regular file", check.severity)
+    if check.type == "file_metadata":
+      minimum, maximum = int(options["minimum_bytes"]), int(options["maximum_bytes"])
+      passed = minimum <= metadata.st_size <= maximum
+      return CheckResult(check.name, check.type, "PASS" if passed else "FAIL", path, f"size {metadata.st_size} bytes; required {minimum}-{maximum}", "OK" if passed else check.severity)
+    try:
+      observed_digest = hash_regular_file(path, metadata)
+    except ObservationError as error:
+      return CheckResult(check.name, check.type, "ERROR", path, str(error), "CRITICAL")
+    passed = observed_digest == options["sha256"]
+    return CheckResult(check.name, check.type, "PASS" if passed else "FAIL", path, f"SHA-256 {'matched' if passed else 'did not match'}", "OK" if passed else check.severity)
+  raise ObservationError("configuration produced an unsupported generic check type")
+
+
 def run_check(check: HealthCheck) -> CheckResult:
-  if isinstance(check, DiskFreeCheck):
-    return run_disk_check(check)
-  if isinstance(check, TcpConnectCheck):
-    return run_tcp_check(check)
-  raise ObservationError("configuration produced an unsupported check type")
+  started = time.monotonic()
+  result = None
+  attempts = 0
+  for attempts in range(1, check.retries + 2):
+    if isinstance(check, DiskFreeCheck):
+      result = run_disk_check(check)
+    elif isinstance(check, TcpConnectCheck):
+      result = run_tcp_check(check)
+    elif isinstance(check, GenericCheck):
+      result = run_generic_check(check)
+    else:
+      raise ObservationError("configuration produced an unsupported check type")
+    if result.status == "PASS":
+      break
+  assert result is not None
+  severity = "OK" if result.status == "PASS" else result.severity if result.severity in {"WARN", "CRITICAL"} else check.severity
+  return replace(result, severity=severity, elapsed_seconds=time.monotonic() - started, attempts=attempts)
 
 
 def evaluate_config(
@@ -575,18 +889,40 @@ def evaluate_config(
   *,
   executor: Callable[[HealthCheck], CheckResult] = run_check,
 ) -> tuple[CheckResult, ...]:
-  results = []
-  for check in config.checks:
-    try:
-      result = executor(check)
-    except ObservationError as error:
-      result = CheckResult(check.name, check.type, "ERROR", _check_target(check), str(error))
-    except OSError:
-      result = CheckResult(check.name, check.type, "ERROR", _check_target(check), "operating-system observation failed")
-    if result.name != check.name or result.type != check.type or result.status not in {"PASS", "FAIL", "ERROR"}:
-      raise ObservationError("check executor returned an invalid result")
-    results.append(result)
-  return tuple(results)
+  pending = {check.name: check for check in config.checks}
+  completed: dict[str, CheckResult] = {}
+  order = {check.name: index for index, check in enumerate(config.checks)}
+  while pending:
+    ready = [check for check in pending.values() if all(name in completed for name in check.depends_on)]
+    if not ready:
+      raise ObservationError("check dependency graph contains a cycle")
+    runnable = []
+    for check in ready:
+      failed_dependencies = [name for name in check.depends_on if completed[name].status != "PASS"]
+      if failed_dependencies:
+        completed[check.name] = CheckResult(
+          check.name, check.type, "FAIL", _check_target(check),
+          f"dependency did not pass: {', '.join(failed_dependencies)}", check.severity,
+        )
+      else:
+        runnable.append(check)
+    if runnable:
+      with ThreadPoolExecutor(max_workers=min(config.max_workers, len(runnable))) as pool:
+        futures = {pool.submit(executor, check): check for check in runnable}
+        for future in as_completed(futures):
+          check = futures[future]
+          try:
+            result = future.result()
+          except ObservationError as error:
+            result = CheckResult(check.name, check.type, "ERROR", _check_target(check), str(error), "CRITICAL")
+          except OSError:
+            result = CheckResult(check.name, check.type, "ERROR", _check_target(check), "operating-system observation failed", "CRITICAL")
+          if result.name != check.name or result.type != check.type or result.status not in {"PASS", "FAIL", "ERROR"}:
+            raise ObservationError("check executor returned an invalid result")
+          completed[check.name] = result
+    for check in ready:
+      pending.pop(check.name)
+  return tuple(sorted(completed.values(), key=lambda result: order[result.name]))
 
 
 def _check_target(check: HealthCheck) -> str:
@@ -594,6 +930,8 @@ def _check_target(check: HealthCheck) -> str:
     return os.path.abspath(check.path)
   if isinstance(check, TcpConnectCheck):
     return f"[{check.host}]:{check.port}" if check.host_kind == "ipv6" else f"{check.host}:{check.port}"
+  if isinstance(check, GenericCheck):
+    return os.path.abspath(check.target) if check.type.startswith("file_") or check.type == "config_hash" else check.target
   return "unknown"
 
 
@@ -613,9 +951,12 @@ def render_report(config: HealthConfig, results: Sequence[CheckResult]) -> str:
   for index, result in enumerate(results, 1):
     lines.extend((
       f"  {index}. [{result.status}] {display_safe(result.name)}",
+      f"     Severity: {result.severity}",
       f"     Type: {result.type}",
       f"     Target: {display_safe(result.target)}",
       f"     Evidence: {display_safe(result.evidence)}",
+      f"     Attempts: {result.attempts}",
+      f"     Elapsed: {result.elapsed_seconds:.6f} s",
     ))
   lines.extend((
     "",
@@ -647,14 +988,37 @@ def build_argument_parser() -> argparse.ArgumentParser:
     description="Evaluate bounded host and TCP service criteria from one explicit JSON configuration file.",
   )
   parser.add_argument("config", help="path to a HealthCtl V1 JSON configuration file")
+  parser.add_argument("--profile", metavar="NAME", help="run only a named profile")
+  parser.add_argument("--group", metavar="NAME", help="run only a named check group")
+  parser.add_argument("--workers", type=lambda value: _cli_workers(value), metavar="N", help="override bounded parallel workers (1-8)")
+  add_output_arguments(parser)
   return parser
+
+
+def _cli_workers(value: str) -> int:
+  if not value.isascii() or not value.isdecimal() or not 1 <= int(value, 10) <= MAX_WORKERS:
+    raise argparse.ArgumentTypeError(f"workers must be from 1 through {MAX_WORKERS}")
+  return int(value, 10)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
   parser = build_argument_parser()
   args = parser.parse_args(argv)
+  validate_output_arguments(parser, args)
+  started = time.monotonic()
   try:
     config = load_config(args.config)
+    selected = tuple(
+      check for check in config.checks
+      if (args.profile is None or check.profile == args.profile)
+      and (args.group is None or check.group == args.group)
+    )
+    if not selected:
+      raise ConfigError("selected profile/group contains no checks")
+    selected_names = {check.name for check in selected}
+    if any(any(dependency not in selected_names for dependency in check.depends_on) for check in selected):
+      raise ConfigError("selected profile/group omits a required check dependency")
+    config = HealthConfig(config.path, selected, args.workers or config.max_workers)
     results = evaluate_config(config)
     report = render_report(config, results)
   except ConfigError as error:
@@ -669,8 +1033,39 @@ def main(argv: Sequence[str] | None = None) -> int:
   except Exception:
     print_safe("healthctl: internal error: unexpected failure", file=sys.stderr)
     return 3
-  print_safe(report, file=sys.stdout)
-  return result_exit_code(results)
+  exit_code = result_exit_code(results)
+  errors = sum(result.status == "ERROR" for result in results)
+  critical = sum(result.status != "PASS" and result.severity == "CRITICAL" for result in results)
+  warnings = sum(result.status != "PASS" and result.severity == "WARN" for result in results)
+  status = "CRITICAL" if errors or critical else "WARN" if warnings else "OK"
+  finding = f"{sum(result.status == 'PASS' for result in results)} of {len(results)} checks passed; {warnings} warning and {critical + errors} critical/error results"
+  next_action = "review failed checks in dependency order" if exit_code else "all selected criteria passed during this invocation"
+  conclusion = make_conclusion(status, config.path, finding, next_action)
+  record = OutputRecord(
+    tool="healthctl", status=status, target=config.path,
+    observations={
+      "checks": results,
+      "summary": {"ok": sum(result.status == "PASS" for result in results), "warn": warnings, "critical": critical, "error": errors},
+      "profile": args.profile, "group": args.group, "max_workers": config.max_workers,
+    },
+    conclusion=conclusion, next_action=next_action + ".", warnings=(),
+    elapsed_seconds=time.monotonic() - started,
+  )
+  brief = "\n".join([
+    f"Configuration: {display_safe(config.path)}",
+    f"Checks: {len(results)}",
+    f"OK/WARN/CRITICAL: {sum(result.status == 'PASS' for result in results)}/{warnings}/{critical + errors}",
+  ])
+  try:
+    emit_output(
+      record, detailed=report, brief=brief, json_mode=args.json,
+      brief_mode=args.brief, quiet=args.quiet,
+      output_path=args.output, force=args.force, stdout=sys.stdout,
+    )
+  except OutputError as error:
+    print_safe(f"healthctl: output error: {display_safe(error)}", file=sys.stderr)
+    return 3
+  return exit_code
 
 
 if __name__ == "__main__":
