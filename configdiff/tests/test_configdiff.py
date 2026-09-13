@@ -337,6 +337,7 @@ class ComparisonTests(unittest.TestCase):
       )
       self.assertTrue(whitespace.drift_detected)
       self.assertLessEqual(len(whitespace.diff_lines), 2)
+      self.assertTrue(whitespace.diff_truncated)
 
   def test_bounded_directory_comparison_and_symlink_target(self):
     with tempfile.TemporaryDirectory() as directory:

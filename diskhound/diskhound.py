@@ -359,6 +359,7 @@ def _scan_branch(
     if identity in branch_inodes:
       continue
     branch_inodes.add(identity)
+    allocation = 0
     try:
       allocation = allocated_bytes(metadata)
     except ValueError as error:
@@ -373,7 +374,7 @@ def _scan_branch(
     if not isinstance(logical_size, int) or logical_size < 0:
       logical_size = 0
     if accumulator is not None and stat.S_ISREG(metadata.st_mode):
-      file_allocation = allocation if "allocation" not in {item.category for item in failures[-1:]} else 0
+      file_allocation = allocation
       modified = getattr(metadata, "st_mtime", time.time())
       age_days = max(0, int((time.time() - modified) // 86400)) if isinstance(modified, (int, float)) else 0
       sparse = logical_size > file_allocation

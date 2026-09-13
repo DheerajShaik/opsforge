@@ -8,6 +8,7 @@ import socket
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 
 MODULE_PATH = Path(__file__).resolve().parents[1] / "healthctl.py"
@@ -377,6 +378,17 @@ class HealthCtlTests(unittest.TestCase):
       digest = hashlib.sha256(b"safe\n").hexdigest()
       check = healthctl.GenericCheck("hash", "config_hash", str(path), options=(("sha256", digest),))
       self.assertEqual(healthctl.run_generic_check(check).status, "PASS")
+
+  def test_dns_check_rejects_excess_resolver_addresses(self):
+    check = healthctl.GenericCheck("dns", "dns", "example.test")
+    records = [
+      (socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, "", (f"10.0.0.{index}", 0))
+      for index in range(1, 18)
+    ]
+    with mock.patch.object(healthctl.socket, "getaddrinfo", return_value=records):
+      result = healthctl.run_generic_check(check)
+    self.assertEqual(result.status, "ERROR")
+    self.assertIn("16-address", result.evidence)
 
   def test_render_report_escapes_external_text(self):
     config = healthctl.HealthConfig("/tmp/x", (healthctl.DiskFreeCheck("disk", "/", 1),))

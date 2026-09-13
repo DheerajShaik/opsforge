@@ -59,6 +59,7 @@ class ComparisonResult:
   mode: str = "exact"
   metadata_drift: tuple[str, ...] = ()
   diff_lines: tuple[str, ...] = ()
+  diff_truncated: bool = False
 
 
 @dataclass(frozen=True)
@@ -381,6 +382,7 @@ def compare_files_mode(
     metadata_drift.append("ownership")
   drift = left != right or bool(metadata_drift)
   diff_lines = ()
+  diff_truncated = False
   if unified:
     try:
       baseline_text = baseline_data.decode("utf-8", "strict").splitlines()
@@ -390,8 +392,16 @@ def compare_files_mode(
     generated = difflib.unified_diff(
       baseline_text, current_text, fromfile=baseline.path, tofile=current.path, lineterm="",
     )
-    diff_lines = tuple(next_line for _, next_line in zip(range(max_diff_lines), generated))
-  return ComparisonResult(baseline, current, drift, mode, tuple(metadata_drift), diff_lines)
+    collected = []
+    for index, next_line in enumerate(generated):
+      if index >= max_diff_lines:
+        diff_truncated = True
+        break
+      collected.append(next_line)
+    diff_lines = tuple(collected)
+  return ComparisonResult(
+    baseline, current, drift, mode, tuple(metadata_drift), diff_lines, diff_truncated,
+  )
 
 
 def collect_directory(path: str, *, max_files: int, max_depth: int, symlinks: bool) -> tuple[str, tuple[DirectoryEntry, ...]]:
@@ -408,7 +418,12 @@ def collect_directory(path: str, *, max_files: int, max_depth: int, symlinks: bo
     directory, depth = pending.pop()
     try:
       with os.scandir(directory) as iterator:
-        children = sorted(iterator, key=lambda item: os.fsencode(item.name))
+        children = []
+        for child in iterator:
+          if len(entries) + len(children) >= max_files:
+            raise ObservationError(f"directory comparison exceeded the {max_files}-entry limit")
+          children.append(child)
+        children.sort(key=lambda item: os.fsencode(item.name))
     except OSError as error:
       raise ObservationError(f"cannot enumerate directory {display_safe(directory)}: {display_safe(error)}") from error
     for child in children:
@@ -506,7 +521,7 @@ def render_report(result: ComparisonResult) -> str:
       f"  Metadata differences: {', '.join(result.metadata_drift) or 'none selected/observed'}",
       *( ["", "Unified diff (explicit content rendering; sensitive values may be present):", *[
         f"  {display_safe(line)}" for line in result.diff_lines
-      ]] if result.diff_lines else [] ),
+      ], *( ["  ... diff truncated at the configured line limit"] if result.diff_truncated else [] )] if result.diff_lines else [] ),
       "",
       "Interpretation limits",
       "  Exact byte equality does not prove that a configuration is valid, effective, or healthy.",
@@ -586,6 +601,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "metadata_drift": result.metadata_drift,
         "selected_keys": selected_keys,
         "unified_diff_lines": len(result.diff_lines),
+        "unified_diff_truncated": result.diff_truncated,
       }
       target = f"{result.baseline.path} -> {result.current.path}"
     exit_code = 1 if drift else 0

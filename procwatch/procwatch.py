@@ -105,12 +105,11 @@ class ExtendedResult:
 
 
 def parse_pid(value: str) -> int:
-  try:
-    pid = int(value, 10)
-  except ValueError as error:
-    raise argparse.ArgumentTypeError("PID must be a positive decimal integer") from error
-  if pid <= 0:
+  if not value.isascii() or not value.isdecimal():
     raise argparse.ArgumentTypeError("PID must be a positive decimal integer")
+  pid = int(value, 10)
+  if not 1 <= pid <= 2_147_483_647:
+    raise argparse.ArgumentTypeError("PID must be a positive decimal integer in the supported range")
   return pid
 
 
@@ -422,6 +421,16 @@ def _open_proc_subdirectory(directory_fd: int, name: str) -> int:
   return os.open(name, flags, dir_fd=directory_fd)
 
 
+def _bounded_directory_names(directory_fd: int, limit: int) -> list[str] | None:
+  names = []
+  with os.scandir(directory_fd) as entries:
+    for entry in entries:
+      if len(names) >= limit:
+        return None
+      names.append(entry.name)
+  return names
+
+
 def capture_auxiliary(directory_fd: int, pid: int) -> AuxiliarySample:
   try:
     io_values = _parse_proc_mapping(read_bounded_proc_file(directory_fd, "io", MAX_STAT_BYTES))
@@ -436,15 +445,16 @@ def capture_auxiliary(directory_fd: int, pid: int) -> AuxiliarySample:
   try:
     fd_directory = _open_proc_subdirectory(directory_fd, "fd")
     try:
-      names = os.listdir(fd_directory)[:MAX_AUX_ENTRIES]
-      fd_count = len(names)
-      socket_count = 0
-      for name in names:
-        try:
-          if os.readlink(name, dir_fd=fd_directory).startswith("socket:["):
-            socket_count += 1
-        except OSError:
-          continue
+      names = _bounded_directory_names(fd_directory, MAX_AUX_ENTRIES)
+      if names is not None:
+        fd_count = len(names)
+        socket_count = 0
+        for name in names:
+          try:
+            if os.readlink(name, dir_fd=fd_directory).startswith("socket:["):
+              socket_count += 1
+          except OSError:
+            continue
     finally:
       os.close(fd_directory)
   except OSError:
@@ -459,8 +469,8 @@ def capture_auxiliary(directory_fd: int, pid: int) -> AuxiliarySample:
   try:
     task_directory = _open_proc_subdirectory(directory_fd, "task")
     try:
-      tids = sorted((name for name in os.listdir(task_directory) if name.isdecimal()), key=int)[:256]
-      for name in tids:
+      names = _bounded_directory_names(task_directory, 256)
+      for name in sorted((name for name in (names or ()) if name.isdecimal()), key=int):
         thread_directory = None
         try:
           thread_directory = _open_proc_subdirectory(task_directory, name)
@@ -495,7 +505,7 @@ def collect_cgroup_context(directory_fd: int) -> tuple[str | None, str | None, s
     try:
       with open(os.path.join(root, name), "rb") as handle:
         value = handle.read(257)
-    except OSError:
+    except (OSError, UnicodeDecodeError):
       return None
     if len(value) > 256:
       return None

@@ -227,18 +227,54 @@ def run_simple_command(arguments: Sequence[str], label: str, timeout: float = TI
   environment = os.environ.copy()
   environment.update({"LC_ALL": "C", "SYSTEMD_PAGER": "", "SYSTEMD_COLORS": "0"})
   try:
-    result = subprocess.run(
-      list(arguments), capture_output=True, check=False, timeout=timeout, env=environment,
+    process = subprocess.Popen(
+      list(arguments), stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=environment,
     )
   except FileNotFoundError as error:
     raise SvcDoctorError(f"{label} is not available") from error
-  except subprocess.TimeoutExpired as error:
-    raise SvcDoctorError(f"{label} query timed out") from error
   except OSError as error:
     raise SvcDoctorError(f"could not execute {label}") from error
-  if len(result.stdout) > MAX_STREAM_BYTES or len(result.stderr) > MAX_STREAM_BYTES:
-    raise ResponseTooLargeError(f"{label} returned oversized output")
-  return CommandResult(result.returncode, result.stdout, result.stderr)
+  if process.stdout is None or process.stderr is None:
+    _stop_process(process)
+    raise SvcDoctorError(f"could not execute {label}")
+  streams = {process.stdout: bytearray(), process.stderr: bytearray()}
+  selector = selectors.DefaultSelector()
+  selector.register(process.stdout, selectors.EVENT_READ)
+  selector.register(process.stderr, selectors.EVENT_READ)
+  deadline = time.monotonic() + timeout
+  try:
+    while selector.get_map():
+      remaining = deadline - time.monotonic()
+      if remaining <= 0:
+        _stop_process(process)
+        raise SvcDoctorError(f"{label} query timed out")
+      events = selector.select(remaining)
+      if not events:
+        _stop_process(process)
+        raise SvcDoctorError(f"{label} query timed out")
+      for key, _ in events:
+        chunk = os.read(key.fileobj.fileno(), 8192)
+        if not chunk:
+          selector.unregister(key.fileobj)
+          continue
+        streams[key.fileobj].extend(chunk)
+        if len(streams[key.fileobj]) > MAX_STREAM_BYTES:
+          _stop_process(process)
+          raise ResponseTooLargeError(f"{label} returned oversized output")
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+      _stop_process(process)
+      raise SvcDoctorError(f"{label} query timed out")
+    try:
+      returncode = process.wait(timeout=remaining)
+    except subprocess.TimeoutExpired as error:
+      _stop_process(process)
+      raise SvcDoctorError(f"{label} query timed out") from error
+  finally:
+    selector.close()
+    process.stdout.close()
+    process.stderr.close()
+  return CommandResult(returncode, bytes(streams[process.stdout]), bytes(streams[process.stderr]))
 
 
 def collect_journal(target: str, lines: int) -> tuple[tuple[str, ...], str | None]:

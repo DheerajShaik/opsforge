@@ -489,6 +489,19 @@ class SubprocessTests(unittest.TestCase):
           svcdoctor.run_systemctl("x.service")
         self.assertLess(time.monotonic() - started, 2)
 
+  def test_auxiliary_command_output_and_timeout_are_bounded(self):
+    with self.assertRaisesRegex(svcdoctor.ResponseTooLargeError, "oversized"):
+      svcdoctor.run_simple_command(
+        (sys.executable, "-c", f"import sys; sys.stdout.write('x' * {svcdoctor.MAX_STREAM_BYTES + 1})"),
+        "helper",
+      )
+    started = time.monotonic()
+    with self.assertRaisesRegex(svcdoctor.SvcDoctorError, "timed out"):
+      svcdoctor.run_simple_command(
+        (sys.executable, "-c", "import time; time.sleep(30)"), "helper", timeout=0.05,
+      )
+    self.assertLess(time.monotonic() - started, 2)
+
 
 if __name__ == "__main__":
   unittest.main()

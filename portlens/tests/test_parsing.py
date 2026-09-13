@@ -82,7 +82,7 @@ class SsParsingTests(unittest.TestCase):
     stat.return_value.st_uid = 1000
     getpwuid.return_value.pw_name = "appuser"
     reference = portlens.ProcessReference(1234, "ss-name")
-    with mock.patch("builtins.open", mock.mock_open(read_data="listener\n")):
+    with mock.patch("builtins.open", mock.mock_open(read_data=b"listener\n")):
       self.assertEqual(portlens.enrich_process(reference), ("appuser", "listener"))
 
   @mock.patch.object(portlens.pwd, "getpwuid", side_effect=KeyError)
@@ -90,7 +90,7 @@ class SsParsingTests(unittest.TestCase):
   def test_numeric_uid_is_preserved_when_username_lookup_fails(self, stat, getpwuid):
     stat.return_value.st_uid = 4242
     reference = portlens.ProcessReference(1234, "ss-name")
-    with mock.patch("builtins.open", mock.mock_open(read_data="listener\n")):
+    with mock.patch("builtins.open", mock.mock_open(read_data=b"listener\n")):
       self.assertEqual(portlens.enrich_process(reference)[0], "4242")
 
   def test_deterministic_sorting_and_no_deduplication(self):

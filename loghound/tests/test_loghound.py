@@ -260,6 +260,15 @@ class ObservationTests(unittest.TestCase):
     repeated = next(item for item in result.patterns if item.key == "repeated")
     self.assertEqual((repeated.count, repeated.first_line, repeated.last_line), (2, 2, 4))
 
+  def test_bounded_stack_group_and_period_evidence(self):
+    result = self.analyze_bytes(
+      b"2026-01-01T00:00:00Z Traceback (most recent call last):\n"
+      b"  File \"app.py\", line 7, in run\n"
+      b"2026-01-01T00:10:00Z ERROR failed\n"
+    )
+    self.assertEqual((result.stack_trace_groups, result.stack_trace_lines), (1, 2))
+    self.assertEqual((result.earlier_period_messages, result.later_period_messages), (1, 1))
+
   def test_invalid_utf8_is_lossless_and_distinct(self):
     result = self.analyze_bytes(b"bad\x80\nbad\x80\nbad\x81\nbad\x81\n")
     self.assertEqual(len(result.patterns), 2)

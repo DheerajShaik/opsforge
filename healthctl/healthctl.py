@@ -423,10 +423,9 @@ def parse_config_document(document: object, *, path: str) -> HealthConfig:
         raise ConfigError(f"{context}.expected_status must be from 100 through 599")
       checks.append(GenericCheck(name, check_type, url, timeout, options=(("expected_status", expected),), **common))
     elif check_type == "dns":
-      _reject_unknown_keys(check, {"name", "type", "host", "timeout_seconds"} | COMMON_CHECK_FIELDS, context)
+      _reject_unknown_keys(check, {"name", "type", "host"} | COMMON_CHECK_FIELDS, context)
       host, _ = parse_host(_require_string(check, "host", context), f"{context}.host")
-      timeout = _parse_timeout(check.get("timeout_seconds", DEFAULT_TCP_TIMEOUT_SECONDS), f"{context}.timeout_seconds")
-      checks.append(GenericCheck(name, check_type, host, timeout, **common))
+      checks.append(GenericCheck(name, check_type, host, **common))
     elif check_type == "certificate_expiry":
       _reject_unknown_keys(check, {"name", "type", "host", "port", "timeout_seconds", "warn_days", "critical_days"} | COMMON_CHECK_FIELDS, context)
       host, _ = parse_host(_require_string(check, "host", context), f"{context}.host")
@@ -785,8 +784,19 @@ def run_generic_check(check: GenericCheck) -> CheckResult:
         status_code = response.status
     except urllib.error.HTTPError as error:
       status_code = error.code
-    except (OSError, urllib.error.URLError, TimeoutError) as error:
-      return CheckResult(check.name, check.type, "FAIL", check.target, f"HTTP layer failed: {type(error).__name__}", check.severity)
+    except urllib.error.URLError as error:
+      reason = error.reason
+      if isinstance(reason, ssl.SSLError):
+        layer = "TLS"
+      elif isinstance(reason, socket.gaierror):
+        layer = "resolution"
+      elif isinstance(reason, (ConnectionError, TimeoutError, socket.timeout, OSError)):
+        layer = "TCP"
+      else:
+        layer = "HTTP"
+      return CheckResult(check.name, check.type, "FAIL", check.target, f"{layer} layer failed: {type(reason).__name__}", check.severity)
+    except (OSError, TimeoutError) as error:
+      return CheckResult(check.name, check.type, "FAIL", check.target, f"TCP layer failed: {type(error).__name__}", check.severity)
     expected = int(options["expected_status"])
     status = "PASS" if status_code == expected else "FAIL"
     return CheckResult(check.name, check.type, status, check.target, f"HTTP status {status_code}; required {expected}", "OK" if status == "PASS" else check.severity)
@@ -795,7 +805,15 @@ def run_generic_check(check: GenericCheck) -> CheckResult:
       records = socket.getaddrinfo(check.target, None, socket.AF_UNSPEC, socket.SOCK_STREAM)
     except socket.gaierror:
       return CheckResult(check.name, check.type, "FAIL", check.target, "OS resolution returned no usable address", check.severity)
-    addresses = sorted({str(ipaddress.ip_address(record[4][0].split("%", 1)[0])) for record in records})[:MAX_RESOLVER_CANDIDATES]
+    addresses = set()
+    try:
+      for record in records:
+        addresses.add(str(ipaddress.ip_address(record[4][0].split("%", 1)[0])))
+        if len(addresses) > MAX_RESOLVER_CANDIDATES:
+          return CheckResult(check.name, check.type, "ERROR", check.target, "OS resolution exceeded the 16-address limit", "CRITICAL")
+    except (IndexError, TypeError, ValueError):
+      return CheckResult(check.name, check.type, "ERROR", check.target, "OS resolution returned malformed address evidence", "CRITICAL")
+    addresses = sorted(addresses)
     status = "PASS" if addresses else "FAIL"
     return CheckResult(check.name, check.type, status, check.target, f"resolved addresses: {', '.join(addresses) or 'none'}", "OK" if status == "PASS" else check.severity)
   if check.type == "certificate_expiry":
@@ -832,7 +850,8 @@ def run_generic_check(check: GenericCheck) -> CheckResult:
     try:
       completed = subprocess.run(
         ["systemctl", "is-active", "--system", "--quiet", "--", check.target],
-        check=False, capture_output=True, timeout=check.timeout_seconds,
+        check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        timeout=check.timeout_seconds,
         env={**os.environ, "LC_ALL": "C", "SYSTEMD_PAGER": "", "SYSTEMD_COLORS": "0"},
       )
     except (OSError, subprocess.SubprocessError):

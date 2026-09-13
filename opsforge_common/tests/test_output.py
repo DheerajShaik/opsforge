@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from decimal import Decimal
 import io
 import json
+import os
 from pathlib import Path
 import tempfile
 import unittest
@@ -67,6 +68,22 @@ class OutputTests(unittest.TestCase):
       self.assertEqual(destination.read_text(encoding="utf-8"), "original")
       emit_output(self.record(), detailed="new", brief="brief", output_path=str(destination), force=True)
       self.assertIn("new", destination.read_text(encoding="utf-8"))
+      self.assertEqual(destination.stat().st_mode & 0o777, 0o600)
+
+  @unittest.skipUnless(hasattr(os, "symlink"), "requires symlink support")
+  def test_force_does_not_follow_symlink_or_replace_hardlink(self):
+    with tempfile.TemporaryDirectory() as directory:
+      original = Path(directory, "original")
+      original.write_text("secret", encoding="utf-8")
+      symlink = Path(directory, "symlink")
+      symlink.symlink_to(original)
+      with self.assertRaises(OutputError):
+        emit_output(self.record(), detailed="new", brief="brief", output_path=str(symlink), force=True)
+      hardlink = Path(directory, "hardlink")
+      os.link(original, hardlink)
+      with self.assertRaisesRegex(OutputError, "multiply-linked"):
+        emit_output(self.record(), detailed="new", brief="brief", output_path=str(hardlink), force=True)
+      self.assertEqual(original.read_text(encoding="utf-8"), "secret")
 
   def test_conclusion_sanitizes_controls(self):
     result = make_conclusion("pass\n", "x\x1b", "ok\r", "none\t")

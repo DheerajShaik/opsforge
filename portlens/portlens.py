@@ -8,6 +8,7 @@ from dataclasses import dataclass
 import os
 import pwd
 import re
+import selectors
 import shutil
 import subprocess
 import sys
@@ -31,6 +32,9 @@ PROCESS_REFERENCE = re.compile(r'\("((?:\\.|[^"\\])*)",pid=(\d+)(?:,fd=(\d+))?')
 MAX_WATCH_COUNT = 100
 MAX_WATCH_INTERVAL = 60.0
 MAX_PROC_FIELD_BYTES = 4096
+MAX_PROC_ENTRIES = 100_000
+MAX_SS_STREAM_BYTES = 8 * 1024 * 1024
+SS_TIMEOUT_SECONDS = 30.0
 
 
 class PortLensError(Exception):
@@ -252,20 +256,64 @@ def find_ss() -> str:
 
 def run_ss_query(executable: str, arguments: Sequence[str]) -> str:
   try:
-    result = subprocess.run(
+    process = subprocess.Popen(
       [executable, *arguments],
-      check=False,
-      capture_output=True,
-      text=True,
-      timeout=30,
+      stdout=subprocess.PIPE,
+      stderr=subprocess.PIPE,
     )
-  except (OSError, subprocess.SubprocessError) as error:
+  except OSError as error:
     raise PortLensError(f"could not execute 'ss': {error}") from error
-  if result.returncode != 0:
-    detail = sanitize_display(result.stderr.strip())[:200]
+  if process.stdout is None or process.stderr is None:
+    process.kill()
+    process.wait()
+    raise PortLensError("could not execute 'ss'")
+  streams = {process.stdout: bytearray(), process.stderr: bytearray()}
+  selector = selectors.DefaultSelector()
+  selector.register(process.stdout, selectors.EVENT_READ)
+  selector.register(process.stderr, selectors.EVENT_READ)
+  deadline = time.monotonic() + SS_TIMEOUT_SECONDS
+  try:
+    while selector.get_map():
+      remaining = deadline - time.monotonic()
+      if remaining <= 0:
+        raise PortLensError("'ss' timed out")
+      events = selector.select(remaining)
+      if not events:
+        raise PortLensError("'ss' timed out")
+      for key, _ in events:
+        chunk = os.read(key.fileobj.fileno(), 64 * 1024)
+        if not chunk:
+          selector.unregister(key.fileobj)
+          continue
+        streams[key.fileobj].extend(chunk)
+        if len(streams[key.fileobj]) > MAX_SS_STREAM_BYTES:
+          raise PortLensError("'ss' output exceeded the 8 MiB limit")
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+      raise PortLensError("'ss' timed out")
+    try:
+      returncode = process.wait(timeout=remaining)
+    except subprocess.TimeoutExpired as error:
+      raise PortLensError("'ss' timed out") from error
+  except PortLensError:
+    if process.poll() is None:
+      process.kill()
+    process.wait()
+    raise
+  finally:
+    selector.close()
+    process.stdout.close()
+    process.stderr.close()
+  try:
+    stdout = bytes(streams[process.stdout]).decode("utf-8", "strict")
+    stderr = bytes(streams[process.stderr]).decode("utf-8", "replace")
+  except UnicodeDecodeError as error:
+    raise PortLensError("'ss' returned non-UTF-8 output") from error
+  if returncode != 0:
+    detail = sanitize_display(stderr.strip())[:200]
     suffix = f": {detail}" if detail else ""
-    raise PortLensError(f"'ss' exited with status {result.returncode}{suffix}")
-  return result.stdout
+    raise PortLensError(f"'ss' exited with status {returncode}{suffix}")
+  return stdout
 
 
 def discover_sockets(
@@ -296,10 +344,8 @@ def enrich_process(reference: ProcessReference) -> tuple[str, str]:
     except KeyError:
       user = str(uid)
 
-  try:
-    with open(f"{proc_path}/comm", encoding="utf-8", errors="replace") as handle:
-      process = handle.read().rstrip("\n")
-  except OSError:
+  process = _read_proc_text(f"{proc_path}/comm")
+  if process == UNAVAILABLE:
     process = reference.ss_name or UNAVAILABLE
   if not process:
     process = reference.ss_name or UNAVAILABLE
@@ -330,8 +376,13 @@ def process_details(reference: ProcessReference) -> tuple[str, str, str, str, st
   except OSError:
     executable = UNAVAILABLE
   try:
-    fd_count = str(len(os.listdir(f"{proc_path}/fd")))
-  except OSError:
+    with os.scandir(f"{proc_path}/fd") as entries:
+      count = 0
+      for count, _ in enumerate(entries, 1):
+        if count > MAX_PROC_ENTRIES:
+          raise OverflowError
+    fd_count = str(count)
+  except (OSError, OverflowError):
     fd_count = UNAVAILABLE
   cgroup_text = _read_proc_text(f"{proc_path}/cgroup")
   if cgroup_text != UNAVAILABLE:
@@ -437,7 +488,21 @@ def render_result(port: int | str, observations: Sequence[DisplayObservation], *
   widths = [max(len(row[index]) for row in rows) for index in range(len(headings))]
   for row in rows:
     lines.append("  ".join(value.ljust(widths[index]) for index, value in enumerate(row)).rstrip())
+  shared = likely_shared_bind_count(observations)
+  lines.extend((
+    "",
+    f"Likely shared/reused bind groups: {shared}",
+    "Multiple rows on one protocol/family/address/port can reflect socket reuse or multiple owners; it does not by itself prove a conflict.",
+  ))
   return "\n".join(lines)
+
+
+def likely_shared_bind_count(observations: Sequence[DisplayObservation]) -> int:
+  counts: dict[tuple[str, str, str, int], int] = {}
+  for item in observations:
+    key = (item.protocol, item.family, item.local_address, item.local_port)
+    counts[key] = counts.get(key, 0) + 1
+  return sum(count > 1 for count in counts.values())
 
 
 def inspect(port: int) -> tuple[str, int]:
@@ -531,7 +596,9 @@ def main(argv: Sequence[str] | None = None) -> int:
   target = "all local ports" if arguments.all else f"local port {arguments.port.label()}"
   if displayed:
     status = "FOUND"
-    finding = f"{len(displayed)} matching {protocol.upper()} socket{'s were' if len(displayed) != 1 else ' was'} observed."
+    shared = likely_shared_bind_count(displayed)
+    finding = f"{len(displayed)} matching {protocol.upper()} socket{'s were' if len(displayed) != 1 else ' was'} observed"
+    finding += f" with {shared} likely shared/reused bind group(s)." if shared else "."
     next_action = "review bind exposure and owning-process evidence"
   else:
     status = "NOT_FOUND"
@@ -547,6 +614,7 @@ def main(argv: Sequence[str] | None = None) -> int:
       "protocol": protocol,
       "families": list(families),
       "watch_count": watch_count,
+      "likely_shared_bind_groups": likely_shared_bind_count(displayed),
       "snapshots": snapshots,
     },
     conclusion=conclusion,

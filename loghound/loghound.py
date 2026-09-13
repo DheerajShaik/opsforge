@@ -33,6 +33,7 @@ EXCERPT_CODEPOINTS = 160
 MAX_TOP = 100
 MAX_ROTATED = 3
 MAX_FILTERS = 16
+MAX_STACK_LINES_PER_GROUP = 256
 COMPRESSED_SIGNATURES = (
   (b"\x1f\x8b", "gzip"),
   (b"BZh", "bzip2"),
@@ -54,6 +55,10 @@ IPV4_TOKEN = re.compile(r"(?<![0-9.])(?:[0-9]{1,3}\.){3}[0-9]{1,3}(?![0-9.])")
 PID_TOKEN = re.compile(r"(?i)\b(pid|process_id)([=: ]+)[0-9]{1,10}\b")
 IDENTIFIER_TOKEN = re.compile(r"(?i)\b(request[_-]?id|trace[_-]?id|user[_-]?id|job[_-]?id)([=: ]+)[A-Za-z0-9._-]{1,128}")
 SEVERITIES = ("critical", "error", "warning", "info", "debug")
+STACK_LINE = re.compile(
+  r'^(?:Traceback \(most recent call last\):|\s+File ".{0,512}", line [0-9]+|'
+  r'\s+at [A-Za-z0-9_.$<>-]+\(.{0,512}\)|\s*Caused by:|\s*During handling of the above exception)'
+)
 
 
 class InvalidTargetError(Exception):
@@ -87,6 +92,10 @@ class AnalysisResult:
   duration_seconds: float | None = None
   peak_messages_per_minute: int | None = None
   sources: tuple[str, ...] = ()
+  stack_trace_groups: int = 0
+  stack_trace_lines: int = 0
+  earlier_period_messages: int | None = None
+  later_period_messages: int | None = None
 
   @property
   def incomplete(self) -> bool:
@@ -108,6 +117,10 @@ class LineMetrics:
   first_timestamp: datetime | None = None
   last_timestamp: datetime | None = None
   minute_counts: dict[int, int] = field(default_factory=dict)
+  stack_groups: int = 0
+  stack_lines: int = 0
+  last_stack_line: int | None = None
+  current_stack_lines: int = 0
 
 
 def build_argument_parser() -> argparse.ArgumentParser:
@@ -326,6 +339,17 @@ def _record_pattern(
       bucket = int(timestamp.timestamp()) // 60
       if bucket in metrics.minute_counts or len(metrics.minute_counts) < 10_000:
         metrics.minute_counts[bucket] = metrics.minute_counts.get(bucket, 0) + 1
+    if STACK_LINE.match(content):
+      continues = (
+        metrics.last_stack_line == physical_line - 1
+        and metrics.current_stack_lines < MAX_STACK_LINES_PER_GROUP
+      )
+      if not continues:
+        metrics.stack_groups += 1
+        metrics.current_stack_lines = 0
+      metrics.stack_lines += 1
+      metrics.current_stack_lines += 1
+      metrics.last_stack_line = physical_line
   return True
 
 
@@ -409,6 +433,13 @@ def observe_descriptor(
     PatternEvidence(key, values[0], values[1], values[2])
     for key, values in patterns.items()
   )
+  earlier = later = None
+  if metrics.minute_counts:
+    first_bucket = min(metrics.minute_counts)
+    last_bucket = max(metrics.minute_counts)
+    midpoint = (first_bucket + last_bucket) / 2
+    earlier = sum(count for bucket, count in metrics.minute_counts.items() if bucket <= midpoint)
+    later = sum(count for bucket, count in metrics.minute_counts.items() if bucket > midpoint)
   return AnalysisResult(
     target=target,
     boundary_bytes=boundary,
@@ -424,6 +455,10 @@ def observe_descriptor(
       if metrics.first_timestamp is not None and metrics.last_timestamp is not None else None,
     peak_messages_per_minute=max(metrics.minute_counts.values(), default=None),
     sources=(target,),
+    stack_trace_groups=metrics.stack_groups,
+    stack_trace_lines=metrics.stack_lines,
+    earlier_period_messages=earlier,
+    later_period_messages=later,
   )
 
 
@@ -475,6 +510,10 @@ def analyze_sources(path: str, options: AnalysisOptions, rotated: int) -> Analys
     duration_seconds=sum(durations) if durations else None,
     peak_messages_per_minute=max(peaks, default=None),
     sources=tuple(item.target for item in results),
+    stack_trace_groups=sum(item.stack_trace_groups for item in results),
+    stack_trace_lines=sum(item.stack_trace_lines for item in results),
+    earlier_period_messages=(sum(item.earlier_period_messages or 0 for item in results) if any(item.earlier_period_messages is not None for item in results) else None),
+    later_period_messages=(sum(item.later_period_messages or 0 for item in results) if any(item.later_period_messages is not None for item in results) else None),
   )
 
 
@@ -510,6 +549,8 @@ def render_result(result: AnalysisResult, *, top: int = RESULT_LIMIT) -> str:
     f"  Timestamped analyzed lines: {result.timestamped_lines}",
     f"  Observed timestamp span: {result.duration_seconds if result.duration_seconds is not None else 'unavailable'} seconds",
     f"  Peak messages in one timestamp minute: {result.peak_messages_per_minute if result.peak_messages_per_minute is not None else 'unavailable'}",
+    f"  Bounded stack-trace groups: {result.stack_trace_groups} ({result.stack_trace_lines} recognized lines)",
+    f"  Earlier/later timestamp-period messages: {result.earlier_period_messages if result.earlier_period_messages is not None else 'unavailable'} / {result.later_period_messages if result.later_period_messages is not None else 'unavailable'}",
     "Severity classification",
     *[f"  {name}: {count}" for name, count in result.severity_counts],
     "Recurring patterns",
@@ -602,6 +643,10 @@ def main(argv: Sequence[str] | None = None) -> int:
       "message_rate_per_second": rate,
       "peak_messages_per_minute": result.peak_messages_per_minute,
       "timestamp_span_seconds": result.duration_seconds,
+      "stack_trace_groups": result.stack_trace_groups,
+      "stack_trace_lines": result.stack_trace_lines,
+      "earlier_period_messages": result.earlier_period_messages,
+      "later_period_messages": result.later_period_messages,
     },
     conclusion=conclusion,
     next_action=next_action + ".",

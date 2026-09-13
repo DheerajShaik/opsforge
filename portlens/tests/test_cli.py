@@ -1,9 +1,11 @@
 import contextlib
 import io
 import json
+import os
 from pathlib import Path
-import subprocess
+import stat
 import sys
+import tempfile
 import unittest
 from unittest import mock
 
@@ -115,15 +117,35 @@ class CliTests(unittest.TestCase):
     output, code = portlens.inspect(8080)
     self.assertEqual(code, 0)
     self.assertIn("Found 2 matching sockets.", output)
+    self.assertIn("Likely shared/reused bind groups: 1", output)
     self.assertNotIn("18080", output)
 
-  @mock.patch.object(portlens.subprocess, "run")
-  def test_subprocess_uses_argument_array_without_shell(self, run):
-    run.return_value = subprocess.CompletedProcess([], 0, stdout="", stderr="")
+  @mock.patch.object(portlens.subprocess, "Popen")
+  def test_subprocess_uses_argument_array_without_shell(self, popen):
+    stdout_read, stdout_write = os.pipe()
+    stderr_read, stderr_write = os.pipe()
+    os.close(stdout_write)
+    os.close(stderr_write)
+    process = popen.return_value
+    process.stdout = os.fdopen(stdout_read, "rb")
+    process.stderr = os.fdopen(stderr_read, "rb")
+    process.poll.return_value = 0
+    process.wait.return_value = 0
     portlens.run_ss_query("/usr/bin/ss", ("-H", "-4", "-ltnp"))
-    positional, keyword = run.call_args
+    positional, keyword = popen.call_args
     self.assertEqual(positional[0], ["/usr/bin/ss", "-H", "-4", "-ltnp"])
     self.assertNotIn("shell", keyword)
+
+  def test_ss_output_limit_is_enforced(self):
+    with tempfile.TemporaryDirectory() as directory:
+      executable = Path(directory, "fake-ss")
+      executable.write_text(
+        f"#!{sys.executable}\nimport sys\nsys.stdout.buffer.write(b'x' * {portlens.MAX_SS_STREAM_BYTES + 1})\n",
+        encoding="utf-8",
+      )
+      executable.chmod(executable.stat().st_mode | stat.S_IXUSR)
+      with self.assertRaisesRegex(portlens.PortLensError, "8 MiB"):
+        portlens.run_ss_query(str(executable), ())
 
 
 if __name__ == "__main__":

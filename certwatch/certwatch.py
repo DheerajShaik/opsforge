@@ -247,10 +247,10 @@ def resolve_candidates(target: Target, resolver=socket.getaddrinfo) -> list[Conn
         key = (candidate.family, candidate.socket_type, candidate.protocol, candidate.sockaddr)
         if key in seen:
             continue
+        if len(candidates) >= MAX_RESOLVER_CANDIDATES:
+            raise CertWatchError("name resolution exceeded the 16-candidate limit")
         seen.add(key)
         candidates.append(candidate)
-        if len(candidates) >= MAX_RESOLVER_CANDIDATES:
-            break
     if not candidates:
         raise CertWatchError("name resolution returned no TCP candidates")
     return candidates

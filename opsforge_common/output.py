@@ -10,6 +10,7 @@ from enum import Enum
 import json
 import os
 from pathlib import Path
+import stat
 import sys
 from typing import Any, Mapping, Sequence, TextIO
 
@@ -144,22 +145,39 @@ def _write_new_or_replace(path: str, text: str, *, force: bool) -> None:
   encoded = (text.rstrip("\n") + "\n").encode("utf-8")
   if len(encoded) > MAX_OUTPUT_BYTES:
     raise OutputError("rendered output exceeds the 16 MiB safety limit")
-  flags = os.O_WRONLY | os.O_CREAT
-  flags |= os.O_TRUNC if force else os.O_EXCL
+  flags = os.O_WRONLY
   if hasattr(os, "O_CLOEXEC"):
     flags |= os.O_CLOEXEC
   if hasattr(os, "O_NOFOLLOW"):
     flags |= os.O_NOFOLLOW
+  if hasattr(os, "O_NONBLOCK"):
+    flags |= os.O_NONBLOCK
   try:
-    descriptor = os.open(path, flags, 0o600)
+    if force:
+      try:
+        descriptor = os.open(path, flags)
+      except FileNotFoundError:
+        descriptor = os.open(path, flags | os.O_CREAT | os.O_EXCL, 0o600)
+    else:
+      descriptor = os.open(path, flags | os.O_CREAT | os.O_EXCL, 0o600)
   except FileExistsError as error:
     raise OutputError(f"output file already exists: {_single_line(path)}; use --force to replace it") from error
   except OSError as error:
     raise OutputError(f"could not open output file {_single_line(path)}: {_single_line(error)}") from error
   try:
+    metadata = os.fstat(descriptor)
+    if not stat.S_ISREG(metadata.st_mode):
+      raise OutputError(f"output target is not a regular file: {_single_line(path)}")
+    if force and metadata.st_nlink != 1:
+      raise OutputError(f"refusing to replace multiply-linked output file: {_single_line(path)}")
+    if force:
+      os.ftruncate(descriptor, 0)
+      os.fchmod(descriptor, 0o600)
     with os.fdopen(descriptor, "wb", closefd=True) as handle:
       descriptor = -1
       handle.write(encoded)
+  except OutputError:
+    raise
   except OSError as error:
     raise OutputError(f"could not write output file {_single_line(path)}: {_single_line(error)}") from error
   finally:

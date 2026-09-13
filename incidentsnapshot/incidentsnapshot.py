@@ -459,11 +459,14 @@ def _safe_interface_name(name: str) -> str:
 def collect_interfaces(reader: Callable[[str, int], bytes] = read_bounded_ascii) -> tuple[dict[str, object], ...]:
   try:
     with os.scandir("/sys/class/net") as entries:
-      names = sorted(entry.name for entry in entries)
+      names = []
+      for entry in entries:
+        if len(names) >= MAX_INTERFACES:
+          raise SectionUnavailable("interface count exceeds limit")
+        names.append(entry.name)
+      names.sort()
   except OSError as error:
     raise SectionUnavailable(_reason_for_os_error(error)) from error
-  if len(names) > MAX_INTERFACES:
-    raise SectionUnavailable("interface count exceeds limit")
   observations = []
   for raw_name in names:
     name = _safe_interface_name(raw_name)
@@ -565,11 +568,16 @@ def collect_listeners(reader: Callable[[str, int], bytes] = read_bounded_ascii) 
 def collect_process_rankings(top: int, reader: Callable[[str, int], bytes] = read_bounded_ascii) -> dict[str, object]:
   try:
     with os.scandir("/proc") as entries:
-      pids = sorted((entry.name for entry in entries if entry.name.isascii() and entry.name.isdecimal()), key=int)
+      pids = []
+      for entry in entries:
+        if not entry.name.isascii() or not entry.name.isdecimal():
+          continue
+        if len(pids) >= MAX_PROCESSES:
+          raise SectionUnavailable("process count exceeds limit")
+        pids.append(entry.name)
+      pids.sort(key=int)
   except OSError as error:
     raise SectionUnavailable(_reason_for_os_error(error)) from error
-  if len(pids) > MAX_PROCESSES:
-    raise SectionUnavailable("process count exceeds limit")
   page_size = os.sysconf("SC_PAGE_SIZE")
   if not isinstance(page_size, int) or page_size <= 0:
     raise SectionUnavailable("page size unavailable")

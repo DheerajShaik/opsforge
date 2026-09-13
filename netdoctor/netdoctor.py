@@ -696,6 +696,11 @@ def main(argv: Sequence[str] | None = None) -> int:
       stage = "resolution"
     elif arguments.tls and result.connected:
       stage = "TLS"
+    elif result.attempts and all(
+      attempt.outcome in {"network unreachable", "host unreachable"}
+      for attempt in result.attempts
+    ):
+      stage = "route"
     else:
       stage = "TCP"
     finding = f"the targeted connection did not complete at the {stage} stage"
