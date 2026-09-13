@@ -46,6 +46,7 @@ incident-snapshot = "incidentsnapshot.incidentsnapshot:main"
 
 [tool.setuptools]
 packages = [
+  "opsforge_common",
   "certwatch",
   "configdiff",
   "diskhound",
