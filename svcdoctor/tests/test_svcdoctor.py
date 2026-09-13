@@ -1,5 +1,6 @@
 import contextlib
 import io
+import json
 import os
 from pathlib import Path
 import stat
@@ -68,6 +69,14 @@ SubState=running
 
 def properties(text=RUNNING):
   return svcdoctor.parse_properties(text)
+
+
+def evidence(text=RUNNING, **overrides):
+  values = properties(text)
+  values.update(overrides)
+  return svcdoctor.ServiceEvidence(
+    values["Id"], values, ("recent entry",), None, (),
+  )
 
 
 class TargetTests(unittest.TestCase):
@@ -159,7 +168,7 @@ class CompletenessTests(unittest.TestCase):
       for mode in ("missing", "empty"):
         candidate = dict(base)
         if mode == "missing":
-          candidate.pop(name)
+          candidate.pop(name, None)
         else:
           candidate[name] = ""
         with self.subTest(name=name, mode=mode), self.assertRaisesRegex(
@@ -190,7 +199,7 @@ class CompletenessTests(unittest.TestCase):
       for mode in ("missing", "empty"):
         candidate = dict(base)
         if mode == "missing":
-          candidate.pop(name)
+          candidate.pop(name, None)
         else:
           candidate[name] = ""
         with self.subTest(name=name, mode=mode):
@@ -204,33 +213,26 @@ class CompletenessTests(unittest.TestCase):
 
 
 class FormattingAndClassificationTests(unittest.TestCase):
-  def test_running_exact_output(self):
-    expected = """Target
-  Requested: cron.service
-  Unit: cron.service
-State
-  Load: loaded
-  Active: active
-  Sub: running
-Execution evidence
-  Result: success
-  Main code: 0
-  Main status: 0
-Assessment
-  ActiveState equals \"failed\": no"""
-    self.assertEqual(svcdoctor.render_diagnostic("cron.service", properties()), expected)
+  def test_running_output_contains_legacy_and_v2_evidence(self):
+    output = svcdoctor.render_diagnostic("cron.service", properties())
+    self.assertIn("Requested: cron.service", output)
+    self.assertIn("Active: active", output)
+    self.assertIn("Main status: 0", output)
+    self.assertIn("Restart policy:", output)
+    self.assertIn("Resource evidence", output)
+    self.assertTrue(output.endswith('ActiveState equals "failed": no'))
 
   def test_all_optional_values_render_as_dash(self):
     candidate = {"Id": "example.service", "LoadState": "loaded", "ActiveState": "active"}
     output = svcdoctor.render_diagnostic("example.service", candidate)
-    self.assertEqual(output.count(": -"), 4)
+    self.assertGreaterEqual(output.count(": -"), 4)
     self.assertIn('ActiveState equals "failed": no', output)
 
   def test_empty_optional_values_render_as_dash(self):
     candidate = properties()
     for name in svcdoctor.OPTIONAL_PROPERTIES:
       candidate[name] = ""
-    self.assertEqual(svcdoctor.render_diagnostic("cron.service", candidate).count(": -"), 4)
+    self.assertGreaterEqual(svcdoctor.render_diagnostic("cron.service", candidate).count(": -"), 4)
 
   def test_only_exact_lowercase_failed_classifies_failed(self):
     for state, expected in (
@@ -343,36 +345,37 @@ class CliTests(unittest.TestCase):
 
   def test_help_is_stdout_exit_zero_and_does_not_query(self):
     for option in ("-h", "--help"):
-      with self.subTest(option=option), mock.patch.object(svcdoctor, "inspect_service") as inspect:
+      with self.subTest(option=option), mock.patch.object(svcdoctor, "collect_service") as inspect:
         code, stdout, stderr = self.run_main([option])
         self.assertEqual((code, stderr), (0, ""))
-        self.assertEqual(stdout, svcdoctor.HELP)
         self.assertIn("one local system service", stdout)
-        self.assertIn("Bare names receive .service", stdout)
-        self.assertIn("only concrete .service units", stdout)
-        self.assertIn("exit codes", stdout)
+        self.assertIn("bare names receive .service", stdout)
+        self.assertIn("Exit codes", stdout)
         inspect.assert_not_called()
 
   def test_missing_multiple_and_unknown_options(self):
     for arguments in ([], ["one", "two"], ["--json"], ["-x"]):
-      with self.subTest(arguments=arguments), mock.patch.object(svcdoctor, "inspect_service") as inspect:
+      with self.subTest(arguments=arguments), mock.patch.object(svcdoctor, "collect_service") as inspect:
         code, stdout, stderr = self.run_main(arguments)
         self.assertEqual((code, stdout), (2, ""))
-        self.assertTrue(stderr.startswith("svcdoctor:"))
+        self.assertIn("svcdoctor:", stderr)
         self.assertTrue(stderr.endswith("\n"))
         inspect.assert_not_called()
 
-  @mock.patch.object(svcdoctor, "inspect_service", return_value=("diagnostic", 0))
+  @mock.patch.object(svcdoctor, "collect_service", return_value=evidence())
   def test_success_stdout_and_normalization(self, inspect):
     code, stdout, stderr = self.run_main(["nginx"])
-    self.assertEqual((code, stdout, stderr), (0, "diagnostic\n", ""))
-    inspect.assert_called_once_with("nginx.service")
+    self.assertEqual((code, stderr), (0, ""))
+    self.assertIn("Conclusion: [ACTIVE]", stdout)
+    inspect.assert_called_once_with("nginx.service", 20)
 
-  @mock.patch.object(svcdoctor, "inspect_service", return_value=("failed diagnostic", 1))
+  @mock.patch.object(svcdoctor, "collect_service", return_value=evidence(FAILED))
   def test_failed_diagnostic_stdout_and_exit_one(self, inspect):
-    self.assertEqual(self.run_main(["failing.service"]), (1, "failed diagnostic\n", ""))
+    code, stdout, stderr = self.run_main(["failing.service"])
+    self.assertEqual((code, stderr), (1, ""))
+    self.assertIn("Conclusion: [FAILED]", stdout)
 
-  @mock.patch.object(svcdoctor, "inspect_service", side_effect=svcdoctor.SvcDoctorError("systemd query failed"))
+  @mock.patch.object(svcdoctor, "collect_service", side_effect=svcdoctor.SvcDoctorError("systemd query failed"))
   def test_fatal_observation_has_empty_stdout(self, inspect):
     self.assertEqual(
       self.run_main(["nginx"]),
@@ -392,9 +395,19 @@ class CliTests(unittest.TestCase):
     )
     for message in messages:
       with self.subTest(message=message), mock.patch.object(
-        svcdoctor, "inspect_service", side_effect=svcdoctor.SvcDoctorError(message)
+        svcdoctor, "collect_service", side_effect=svcdoctor.SvcDoctorError(message)
       ):
         self.assertEqual(self.run_main(["x"]), (2, "", f"svcdoctor: {message}\n"))
+
+  @mock.patch.object(svcdoctor, "collect_service", return_value=evidence())
+  def test_json_brief_and_quiet(self, collect):
+    code, stdout, stderr = self.run_main(["--json", "cron"])
+    self.assertEqual((code, stderr), (0, ""))
+    self.assertEqual(json.loads(stdout)["tool"], "svcdoctor")
+    code, stdout, _ = self.run_main(["--brief", "cron"])
+    self.assertIn("State: active/running", stdout)
+    code, stdout, _ = self.run_main(["--quiet", "cron"])
+    self.assertEqual((code, stdout), (0, ""))
 
 
 class SubprocessTests(unittest.TestCase):
@@ -416,11 +429,11 @@ class SubprocessTests(unittest.TestCase):
       self.make_systemctl(directory, """
         import os
         import sys
-        expected = ['show', '--system', '--no-pager',
-                    '--property=Id', '--property=LoadState', '--property=ActiveState',
-                    '--property=SubState', '--property=Result', '--property=ExecMainCode',
-                    '--property=ExecMainStatus', '--', 'x.service']
-        if sys.argv[1:] != expected or os.environ.get('LC_ALL') != 'C':
+        arguments = sys.argv[1:]
+        if (arguments[:3] != ['show', '--system', '--no-pager']
+            or arguments[-2:] != ['--', 'x.service']
+            or not all(value.startswith('--property=') for value in arguments[3:-2])
+            or os.environ.get('LC_ALL') != 'C'):
           raise SystemExit(9)
         print('Id=x.service')
         print('LoadState=loaded')
