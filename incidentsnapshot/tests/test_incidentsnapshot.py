@@ -1,6 +1,7 @@
 import errno
 import importlib.util
 import io
+import json
 import os
 from datetime import datetime, timezone
 from decimal import Decimal
@@ -291,6 +292,44 @@ class BoundedReaderTests(unittest.TestCase):
 
 
 class SnapshotAndRenderingTests(unittest.TestCase):
+  def test_network_profile_adds_bounded_sections(self):
+    with mock.patch.object(incident, "collect_interfaces", return_value=({"name": "lo"},)), \
+         mock.patch.object(incident, "collect_routes", return_value=()), \
+         mock.patch.object(incident, "collect_listeners", return_value=()):
+      result = incident.collect_snapshot(
+        profile="network", reader=reader, uname_provider=lambda: uname(),
+        statvfs_provider=lambda path: vfs(), monotonic_clock=iter((0, 10)).__next__,
+      )
+    self.assertEqual(result.profile, "network")
+    self.assertEqual([section.name for section in result.sections], [
+      "Network interfaces", "Default routes", "Listening ports",
+    ])
+
+  def test_route_and_listener_parsing_minimizes_addresses(self):
+    sources = {
+      incident.ROUTE_PATH: (
+        b"Iface Destination Gateway Flags RefCnt Use Metric Mask MTU Window IRTT\n"
+        b"eth0 00000000 0101A8C0 0003 0 0 100 00000000 0 0 0\n"
+      ),
+      incident.IPV6_ROUTE_PATH: b"",
+      "/proc/net/tcp": b"sl local_address rem_address st\n0: 0100007F:1F90 00000000:0000 0A\n",
+      "/proc/net/tcp6": b"sl local_address rem_address st\n",
+      "/proc/net/udp": b"sl local_address rem_address st\n0: 00000000:0035 00000000:0000 07\n",
+      "/proc/net/udp6": b"sl local_address rem_address st\n",
+    }
+    bounded = lambda path, limit: sources[path]
+    self.assertEqual(incident.collect_routes(bounded)[0]["gateway"], "192.168.1.1")
+    listeners = incident.collect_listeners(bounded)
+    self.assertEqual([(item["protocol"], item["port"], item["bind_scope"]) for item in listeners], [
+      ("TCP", 8080, "loopback"), ("UDP", 53, "wildcard"),
+    ])
+
+  def test_pressure_parsing(self):
+    data = b"some avg10=0.10 avg60=0.20 avg300=0.30 total=42\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0\n"
+    values = incident.collect_pressure(lambda path, limit: data)
+    self.assertEqual(values[0]["some"]["total"], 42)
+    self.assertEqual(len(values), 3)
+
   def test_collection_order_and_timing(self):
     calls = []
     def tracked_reader(path, limit):
@@ -387,6 +426,17 @@ class MainTests(unittest.TestCase):
   def test_complete_stream_contract(self):
     code, stdout, stderr = self.run_main(snapshot())
     self.assertEqual(code, 0); self.assertTrue(stdout.startswith("Incident Snapshot\n")); self.assertEqual(stderr, "")
+
+  def test_json_contract_and_quiet(self):
+    stdout, stderr = io.StringIO(), io.StringIO()
+    with mock.patch.object(incident, "collect_snapshot", return_value=snapshot()), \
+         mock.patch.object(incident.sys, "stdout", stdout), mock.patch.object(incident.sys, "stderr", stderr):
+      code = incident.main(["--json"])
+    document = json.loads(stdout.getvalue())
+    self.assertEqual(code, 0)
+    self.assertEqual(document["schema_version"], 1)
+    self.assertEqual(document["tool"], "incidentsnapshot")
+    self.assertTrue(document["conclusion"].startswith("Conclusion: [OK]"))
 
   def test_incomplete_stream_contract(self):
     code, stdout, stderr = self.run_main(snapshot(memory=incident.OptionalObservation(reason="source unavailable")))
