@@ -63,7 +63,7 @@ class TestCli(unittest.TestCase):
     observe.assert_not_called()
     self.assertEqual(stdout, "")
 
-  def successful(self, status, extra_arguments=()):
+  def successful(self, status, extra_arguments=(), verification=None):
     before = datetime(2026, 1, 1, tzinfo=timezone.utc)
     certificate = c.CertificateInfo(
       "CN=x", "CN=i", "01", (("DNS", "example.com"),),
@@ -75,11 +75,12 @@ class TestCli(unittest.TestCase):
       status is c.ValidityStatus.WARNING,
       0 if status is c.ValidityStatus.NORMAL else 1,
     )
+    verification = verification or c.VerificationEvidence(True, True, None, 2)
     with mock.patch.object(c, "find_decoder", return_value="/openssl"), \
          mock.patch.object(c, "observe_leaf", return_value=c.LeafObservation("1.2.3.4", b"x")), \
          mock.patch.object(c, "decode_certificate", return_value=certificate), \
          mock.patch.object(c, "assess_validity", return_value=assessment), \
-         mock.patch.object(c, "verify_endpoint", return_value=c.VerificationEvidence(True, True, None, 2)):
+         mock.patch.object(c, "verify_endpoint", return_value=verification):
       return self.invoke([*extra_arguments, "--warn-days", "030", "example.com"])
 
   def test_status_outputs(self):
@@ -101,6 +102,13 @@ class TestCli(unittest.TestCase):
     payload = json.loads(stdout)
     self.assertEqual(payload["tool"], "certwatch")
     self.assertEqual(payload["status"], "VALID")
+
+  def test_trust_or_identity_warning_exits_one(self):
+    verification = c.VerificationEvidence(False, False, "untrusted", None)
+    code, stdout, stderr = self.successful(c.ValidityStatus.NORMAL, verification=verification)
+    self.assertEqual(code, 1)
+    self.assertIn("Conclusion: [WARNING]", stdout)
+    self.assertIn("untrusted", stderr)
 
   def test_operational_failure(self):
     with mock.patch.object(c, "find_decoder", return_value="/openssl"), mock.patch.object(

@@ -399,6 +399,12 @@ class CliTests(unittest.TestCase):
       ):
         self.assertEqual(self.run_main(["x"]), (2, "", f"svcdoctor: {message}\n"))
 
+  def test_interrupt_and_internal_failure_are_sanitized(self):
+    with mock.patch.object(svcdoctor, "collect_service", side_effect=KeyboardInterrupt):
+      self.assertEqual(self.run_main(["x"]), (130, "", "svcdoctor: interrupted\n"))
+    with mock.patch.object(svcdoctor, "collect_service", side_effect=RuntimeError("secret")):
+      self.assertEqual(self.run_main(["x"]), (2, "", "svcdoctor: internal execution failure\n"))
+
   @mock.patch.object(svcdoctor, "collect_service", return_value=evidence())
   def test_json_brief_and_quiet(self, collect):
     code, stdout, stderr = self.run_main(["--json", "cron"])

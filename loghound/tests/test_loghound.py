@@ -45,7 +45,7 @@ class CliTests(unittest.TestCase):
         with contextlib.redirect_stdout(stdout), self.assertRaises(SystemExit) as caught:
           loghound.main([option])
         self.assertEqual(caught.exception.code, 0)
-        self.assertIn("one bounded local regular log file", stdout.getvalue())
+        self.assertIn("bounded local regular log files", stdout.getvalue())
         opened.assert_not_called()
 
   def test_invalid_invocations_exit_two(self):

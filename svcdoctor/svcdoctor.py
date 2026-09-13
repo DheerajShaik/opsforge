@@ -481,7 +481,7 @@ def build_argument_parser() -> argparse.ArgumentParser:
   parser = Parser(
     prog="svcdoctor",
     description="Report bounded, read-only systemd evidence for one local system service.",
-    epilog='Exit codes: 0 not failed; 1 ActiveState is "failed"; 2 invocation or observation failure.',
+    epilog='Exit codes: 0 not failed; 1 ActiveState is "failed"; 2 invocation or observation failure; 130 interrupted.',
   )
   parser.add_argument("service", help="concrete service unit; bare names receive .service")
   parser.add_argument("--journal-lines", type=parse_journal_lines, default=20, metavar="N")
@@ -502,6 +502,12 @@ def main(arguments: Sequence[str] | None = None) -> int:
     evidence = collect_service(target, args.journal_lines)
   except SvcDoctorError as error:
     print(f"svcdoctor: {error}", file=sys.stderr)
+    return 2
+  except KeyboardInterrupt:
+    print("svcdoctor: interrupted", file=sys.stderr)
+    return 130
+  except Exception:
+    print("svcdoctor: internal execution failure", file=sys.stderr)
     return 2
   failed = evidence.properties["ActiveState"] == "failed"
   exit_code = 1 if failed else 0

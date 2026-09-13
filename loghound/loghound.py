@@ -127,7 +127,7 @@ def build_argument_parser() -> argparse.ArgumentParser:
   parser = argparse.ArgumentParser(
     prog="loghound",
     description=(
-      "Summarize recurring normalized messages in one bounded local regular log file."
+      "Summarize recurring normalized messages in bounded local regular log files."
     ),
   )
   parser.add_argument("path", help="local regular log file to inspect")

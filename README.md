@@ -2,7 +2,7 @@
 
 OpsForge is an open-source collection of focused Linux diagnostics for practical DevOps and Site Reliability Engineering work. Each utility is independently invokable, diagnostic before destructive, safe by default, automation-friendly, and intentionally narrow.
 
-OpsForge is currently in **Beta**. The initial ten-utility roadmap is implemented and has substantial automated and recorded real-world validation. The project is now focused on broader real-world usage, compatibility feedback, and release hardening.
+OpsForge is currently in **Beta**. This branch is the `v0.2.0-beta.1` candidate: it expands all ten utilities and introduces one coherent output contract while retaining the v0.1 normal-invocation foundation.
 
 Beta is not a production-readiness guarantee. Interfaces may still evolve before a stable release, observations remain subject to each utility's documented limits, and the project has not undergone a formal security audit or broad distribution certification.
 
@@ -10,16 +10,16 @@ Beta is not a production-readiness guarantee. Interfaces may still evolve before
 
 | Utility | Command | Status | Purpose |
 | --- | --- | --- | --- |
-| [PortLens](portlens/README.md) | `portlens` | Beta | Inspect TCP listening sockets matching a local Linux port and report available process metadata. |
-| [DiskHound](diskhound/README.md) | `diskhound` | Beta | Rank a directory's eligible immediate entries by recursively observed allocated space with filesystem-capacity context. |
-| [CertWatch](certwatch/README.md) | `certwatch` | Beta | Observe one remote TLS leaf certificate and assess its encoded validity period. |
-| [SvcDoctor](svcdoctor/README.md) | `svcdoctor` | Beta | Report current systemd state and direct execution evidence for one local system service. |
-| [LogHound](loghound/README.md) | `loghound` | Beta | Summarize recurring normalized messages in one bounded local regular log file. |
-| [ProcWatch](procwatch/README.md) | `procwatch` | Beta | Sample one local Linux process for bounded CPU, memory, and process-state evidence. |
-| [ConfigDiff](configdiff/README.md) | `configdiff` | Beta | Compare one local regular file with an explicit baseline for exact byte-content drift. |
-| [NetDoctor](netdoctor/README.md) | `netdoctor` | Beta | Report OS resolver candidates and TCP connection-establishment evidence for one endpoint. |
-| [HealthCtl](healthctl/README.md) | `healthctl` | Beta | Evaluate a bounded JSON-configured set of filesystem free-space and TCP connection criteria. |
-| [Incident Snapshot](incidentsnapshot/README.md) | `incident-snapshot` | Beta | Capture bounded local Linux platform, runtime, memory, and root-filesystem context. |
+| [PortLens](portlens/README.md) | `portlens` | Beta | Inspect bounded TCP/UDP listener scopes, ownership, and likely shared binds. |
+| [DiskHound](diskhound/README.md) | `diskhound` | Beta | Analyze bounded filesystem allocation, capacity, inodes, and file concentration. |
+| [CertWatch](certwatch/README.md) | `certwatch` | Beta | Separate TLS certificate validity, identity, trust, chain-count, and fingerprint evidence. |
+| [SvcDoctor](svcdoctor/README.md) | `svcdoctor` | Beta | Report bounded systemd state, execution, dependency, resource, and journal evidence. |
+| [LogHound](loghound/README.md) | `loghound` | Beta | Analyze recurring log patterns, severity, rates, bursts, stack evidence, and rotations. |
+| [ProcWatch](procwatch/README.md) | `procwatch` | Beta | Sample CPU, memory, I/O, FD, socket, thread, tree, and cgroup evidence. |
+| [ConfigDiff](configdiff/README.md) | `configdiff` | Beta | Compare files or bounded trees using exact, normalized, JSON-semantic, or metadata modes. |
+| [NetDoctor](netdoctor/README.md) | `netdoctor` | Beta | Explain targeted resolver, route, address-family, TCP, and optional TLS stages. |
+| [HealthCtl](healthctl/README.md) | `healthctl` | Beta | Evaluate strict, dependency-aware groups of bounded local and network criteria. |
+| [Incident Snapshot](incidentsnapshot/README.md) | `incident-snapshot` | Beta | Collect privacy-conscious basic, network, process, or full incident context. |
 
 ## Installation
 
@@ -28,7 +28,7 @@ The supported Beta installation path is an isolated local install from a trusted
 ```console
 git clone https://github.com/DheerajShaik/opsforge.git
 cd opsforge
-git checkout v0.1.0-beta.1
+git checkout feat/opsforge-v0.2
 pipx install .
 ```
 
@@ -43,11 +43,13 @@ configdiff         netdoctor       healthctl
 incident-snapshot
 ```
 
-Run `<command> --help` for its frozen Beta invocation syntax, then consult the linked utility README for semantics, exit codes, permissions, external activity, and limitations. Source-tree invocation with `python3 utility/utility.py` remains available for contributors and behaves the same as the installed entry point.
+Run `<command> --help` for current syntax, then consult the linked utility README for semantics, exit codes, permissions, external activity, bounds, and limitations. Source-tree invocation with `PYTHONPATH=. python3 utility/utility.py` remains available for contributors.
+
+Every command supports `--brief`, `--json`, `--quiet`, and safe `--output FILE`. Human output ends with a deterministic `Conclusion:` line. JSON schema version `1` contains `tool`, `status`, `target`, `observations`, `conclusion`, `next_action`, `warnings`, and `elapsed_seconds`. Existing files are refused unless `--force` is explicit; symlinks, non-regular files, and multiply-linked overwrite targets are always refused.
 
 ## Compatibility and support boundaries
 
-### Supported for v0.1.0-beta.1
+### Supported for v0.2.0-beta.1
 
 - CPython 3.10 through 3.14 on Ubuntu 24.04 LTS Linux.
 - The standard-library-only runtime dependency model.
@@ -57,7 +59,7 @@ Python 3.10 is the minimum because the existing implementation uses syntax intro
 
 ### Validated environments
 
-- The complete pre-release suite and installed-command checks were run on Ubuntu 24.04.1 LTS under WSL2 with CPython 3.12.3.
+- The complete v0.2 pre-release suite and installed-command checks are recorded in [VALIDATION.md](VALIDATION.md).
 - Existing focused GitHub Actions run on Ubuntu Linux; the Beta release workflow adds explicit CPython 3.10–3.14 coverage.
 - [DiskHound's validation record](diskhound/VALIDATION.md) documents automated and live WSL2 filesystem scenarios.
 - [CertWatch's validation record](certwatch/VALIDATION.md) documents Ubuntu 24.04, CPython 3.12–3.14, OpenSSL 3.0.13/3.5.5, controlled loopback validation, and the completed post-fix public-endpoint revalidation.
@@ -76,8 +78,8 @@ Utility requirements remain distinct:
 - CertWatch deliberately connects to a caller-selected DNS/TCP/TLS endpoint and requires the system `openssl` executable with the documented `x509` options.
 - SvcDoctor requires a local systemd system manager and `systemctl`.
 - ProcWatch and Incident Snapshot require procfs mounted at `/proc`.
-- NetDoctor uses OS resolution and caller-selected TCP connections.
-- HealthCtl uses filesystem-capacity APIs and, only for configured TCP checks, OS resolution and caller-selected TCP connections.
+- NetDoctor uses OS resolution, local route/configuration reads, and caller-selected TCP/TLS connections.
+- HealthCtl uses local filesystem/procfs/systemd APIs and performs only explicitly configured DNS, TCP, HTTP(S), or certificate connections.
 
 ## Engineering philosophy
 

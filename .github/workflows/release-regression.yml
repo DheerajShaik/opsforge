@@ -80,7 +80,7 @@ jobs:
               "healthctl.healthctl",
               "incidentsnapshot.incidentsnapshot",
           )
-          assert importlib.metadata.version("opsforge") == "0.1.0b1"
+          assert importlib.metadata.version("opsforge") == "0.2.0b1"
           for name in modules:
               assert callable(importlib.import_module(name).main)
           PY
@@ -105,6 +105,11 @@ jobs:
           "$bin_dir/healthctl" "$temp_dir/health.json" >/dev/null
           "$bin_dir/procwatch" "$PPID" --interval 0.1 >/dev/null
           "$bin_dir/incident-snapshot" >/dev/null
+          "$bin_dir/diskhound" --json "$temp_dir" | python -c 'import json,sys; assert json.load(sys.stdin)["tool"] == "diskhound"'
+          "$bin_dir/loghound" --json "$temp_dir/sample.log" | python -c 'import json,sys; assert json.load(sys.stdin)["schema_version"] == 1'
+          "$bin_dir/configdiff" --json "$temp_dir/baseline.conf" "$temp_dir/current.conf" | python -c 'import json,sys; assert json.load(sys.stdin)["status"] == "UNCHANGED"'
+          "$bin_dir/healthctl" --json "$temp_dir/health.json" | python -c 'import json,sys; assert json.load(sys.stdin)["tool"] == "healthctl"'
+          "$bin_dir/incident-snapshot" --json | python -c 'import json,sys; assert json.load(sys.stdin)["tool"] == "incidentsnapshot"'
       - name: Uninstall cleanly
         run: |
           /tmp/opsforge-release-venv/bin/python -m pip uninstall --yes opsforge

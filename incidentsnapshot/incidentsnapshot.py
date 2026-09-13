@@ -150,7 +150,7 @@ class SnapshotResult:
 
 def build_argument_parser() -> argparse.ArgumentParser:
   parser = argparse.ArgumentParser(
-    prog="incidentsnapshot",
+    prog="incident-snapshot",
     description="Capture bounded, low-sensitivity local Linux incident context.",
   )
   parser.add_argument(

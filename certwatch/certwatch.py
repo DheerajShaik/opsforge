@@ -708,7 +708,7 @@ class Parser(argparse.ArgumentParser):
 def build_parser() -> argparse.ArgumentParser:
     parser = Parser(
         prog="certwatch",
-        description="Observe one remote TLS leaf certificate and assess its encoded validity period.",
+        description="Observe bounded remote TLS certificates and separate validity, identity, and trust evidence.",
     )
     parser.add_argument("target", nargs="+", help="one or more HOST, HOST:PORT, bare IPv6, or [IPv6]:PORT targets (maximum 32)")
     parser.add_argument(
@@ -786,6 +786,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 else:
                     status = "VALID"
                 exit_code = max(exit_code, assessment.exit_code)
+                if status != "VALID":
+                    exit_code = max(exit_code, 1)
                 if verification.verification_error:
                     warnings.append(f"{target.display_endpoint}: {verification.verification_error}")
                 report = render_report(target, observation, certificate, assessment, verification, baseline_changed)

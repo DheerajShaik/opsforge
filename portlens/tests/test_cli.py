@@ -28,7 +28,7 @@ class CliTests(unittest.TestCase):
         with contextlib.redirect_stdout(stdout), self.assertRaises(SystemExit) as context:
           portlens.main([option])
         self.assertEqual(context.exception.code, 0)
-        self.assertIn("TCP LISTEN", stdout.getvalue())
+        self.assertIn("TCP listeners or UDP sockets", stdout.getvalue())
 
   @mock.patch.object(portlens, "inspect_selection", return_value=("matched output", [
     portlens.DisplayObservation("tcp", "LISTEN", "ipv4", "127.0.0.1", 8080, "1", "u", "p")
@@ -71,6 +71,13 @@ class CliTests(unittest.TestCase):
     code, stdout, stderr = self.run_main(["8080"])
     self.assertEqual((code, stdout), (2, ""))
     self.assertIn("required command 'ss' was not found", stderr)
+
+  @mock.patch.object(portlens, "inspect_selection", side_effect=KeyboardInterrupt)
+  def test_interrupt_is_clean(self, inspect):
+    self.assertEqual(
+      self.run_main(["8080"]),
+      (130, "", "portlens: interrupted\n"),
+    )
 
   @mock.patch.object(portlens, "find_ss", return_value="/usr/bin/ss")
   @mock.patch.object(portlens, "discover_sockets", side_effect=portlens.PortLensError("'ss' exited with status 1"))

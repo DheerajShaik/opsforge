@@ -152,7 +152,7 @@ def build_argument_parser() -> argparse.ArgumentParser:
   parser = Parser(
     prog="portlens",
     description=(
-      "Inspect TCP LISTEN sockets matching a local port in the current network "
+      "Inspect TCP listeners or UDP sockets matching a local port in the current network "
       "namespace. A no-match result does not prove that the port is bindable."
     ),
   )
@@ -589,6 +589,9 @@ def main(argv: Sequence[str] | None = None) -> int:
   except PortLensError as error:
     print(f"portlens: {sanitize_display(error)}", file=sys.stderr)
     return 2
+  except KeyboardInterrupt:
+    print("portlens: interrupted", file=sys.stderr)
+    return 130
   except Exception:
     print("portlens: internal execution failure", file=sys.stderr)
     return 2

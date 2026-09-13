@@ -171,8 +171,8 @@ def _write_new_or_replace(path: str, text: str, *, force: bool) -> None:
     if force and metadata.st_nlink != 1:
       raise OutputError(f"refusing to replace multiply-linked output file: {_single_line(path)}")
     if force:
-      os.ftruncate(descriptor, 0)
       os.fchmod(descriptor, 0o600)
+      os.ftruncate(descriptor, 0)
     with os.fdopen(descriptor, "wb", closefd=True) as handle:
       descriptor = -1
       handle.write(encoded)

@@ -70,7 +70,7 @@ class CliTests(unittest.TestCase):
         with contextlib.redirect_stdout(stdout), self.assertRaises(SystemExit) as caught:
           configdiff.main([option])
         self.assertEqual(caught.exception.code, 0)
-        self.assertIn("exact byte-content drift", stdout.getvalue())
+        self.assertIn("bounded file or directory drift", stdout.getvalue())
         inspect.assert_not_called()
 
   def test_invalid_invocation_exits_two(self):

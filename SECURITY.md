@@ -2,7 +2,7 @@
 
 ## Current security posture
 
-OpsForge v0.1.0-beta.1 contains Beta implementations of PortLens, DiskHound, CertWatch, SvcDoctor, LogHound, ProcWatch, ConfigDiff, NetDoctor, HealthCtl, and Incident Snapshot. The initial roadmap is implemented and ready for broader evaluation, but Beta is not a production-readiness guarantee.
+OpsForge v0.2.0-beta.1 contains Beta implementations of PortLens, DiskHound, CertWatch, SvcDoctor, LogHound, ProcWatch, ConfigDiff, NetDoctor, HealthCtl, and Incident Snapshot. The expanded roadmap is implemented for independent review, but Beta is not a production-readiness guarantee.
 
 Security validation and compatibility work remain ongoing. The repository does not claim a formal security audit, certification, penetration test, production hardening, or vulnerability-free status.
 
@@ -29,7 +29,7 @@ Some utilities intentionally perform network activity because it is their explic
 
 - CertWatch connects to a caller-selected DNS/TCP/TLS endpoint.
 - NetDoctor resolves and connects to a caller-selected TCP target.
-- HealthCtl performs caller-configured TCP checks.
+- HealthCtl performs only caller-configured DNS, TCP, HTTP(S), and certificate checks.
 
 This activity must remain deliberate, bounded, and documented. These utilities are not offline tools, and their network behavior must not expand silently.
 
@@ -52,6 +52,8 @@ Utilities may encounter sensitive operational information, including:
 - incident information
 
 Utilities should minimize unnecessary collection, display, storage, and transmission of sensitive information. Diagnostic output can contain operational metadata and should be stored, shared, and published with appropriate care.
+
+The shared `--output` path creates private regular files and requires `--force` before replacing one. Even with `--force`, final-component symlinks, non-regular files, and multiply-linked files are rejected. Explicit ConfigDiff `--unified` output can reveal configuration values and prints a warning. Incident Snapshot never collects full command lines, environments, arbitrary logs, or home-directory content.
 
 ## Least privilege
 

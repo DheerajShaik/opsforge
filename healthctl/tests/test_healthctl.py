@@ -139,6 +139,16 @@ class HealthCtlTests(unittest.TestCase):
     self.assertEqual(config.checks[0].retries, 2)
     self.assertEqual(config.checks[1].depends_on, ("web",))
 
+  def test_http_url_rejects_credentials_queries_and_downgrade_redirects(self):
+    for url in ("https://user@example.com/", "https://example.com/?token=secret"):
+      document = {"version": 1, "checks": [{"name": "web", "type": "https", "url": url}]}
+      with self.subTest(url=url), self.assertRaises(healthctl.ConfigError):
+        healthctl.parse_config_document(document, path="x")
+    handler = healthctl.LimitedRedirectHandler()
+    request = healthctl.urllib.request.Request("https://example.com/start")
+    with self.assertRaises(healthctl.RedirectPolicyError):
+      handler.redirect_request(request, None, 302, "", {}, "http://example.com/next")
+
   def test_rejects_dependency_cycle(self):
     document = {
       "version": 1,

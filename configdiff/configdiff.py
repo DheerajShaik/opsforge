@@ -90,11 +90,11 @@ def build_argument_parser() -> argparse.ArgumentParser:
   parser = argparse.ArgumentParser(
     prog="configdiff",
     description=(
-      "Detect exact byte-content drift between one local regular file and an explicit baseline."
+      "Detect bounded file or directory drift under explicit comparison semantics."
     ),
   )
-  parser.add_argument("baseline", help="baseline regular file")
-  parser.add_argument("current", help="current regular file to compare with the baseline")
+  parser.add_argument("baseline", help="baseline regular file or directory")
+  parser.add_argument("current", help="current regular file or directory to compare with the baseline")
   modes = parser.add_mutually_exclusive_group()
   modes.add_argument("--ignore-whitespace", action="store_true", help="compare after removing ASCII whitespace")
   modes.add_argument("--ignore-comments", action="store_true", help="ignore blank and full-line # or ; comments")

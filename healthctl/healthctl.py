@@ -59,6 +59,10 @@ class ObservationError(Exception):
   """A configured check could not produce trustworthy evidence."""
 
 
+class RedirectPolicyError(urllib.error.URLError):
+  """An HTTP redirect exceeded the configured target boundary."""
+
+
 @dataclass(frozen=True)
 class DiskFreeCheck:
   name: str
@@ -414,9 +418,19 @@ def parse_config_document(document: object, *, path: str) -> HealthConfig:
     elif check_type in {"http", "https"}:
       _reject_unknown_keys(check, {"name", "type", "url", "timeout_seconds", "expected_status"} | COMMON_CHECK_FIELDS, context)
       url = _require_string(check, "url", context)
-      parsed = urllib.parse.urlsplit(url)
-      if parsed.scheme != check_type or not parsed.hostname or parsed.username or parsed.password or parsed.fragment:
-        raise ConfigError(f"{context}.url must be a credential-free {check_type} URL without a fragment")
+      if len(url) > 2048 or not url.isascii() or display_safe(url) != url:
+        raise ConfigError(f"{context}.url must be printable ASCII of at most 2048 characters")
+      try:
+        parsed = urllib.parse.urlsplit(url)
+        parsed.port
+      except ValueError as error:
+        raise ConfigError(f"{context}.url is malformed") from error
+      if (
+        parsed.scheme != check_type or not parsed.hostname or parsed.username or parsed.password
+        or parsed.fragment or parsed.query
+      ):
+        raise ConfigError(f"{context}.url must be a credential-free {check_type} URL without query or fragment")
+      parse_host(parsed.hostname, f"{context}.url host")
       timeout = _parse_timeout(check.get("timeout_seconds", DEFAULT_TCP_TIMEOUT_SECONDS), f"{context}.timeout_seconds")
       expected = _parse_nonnegative_int(check.get("expected_status", 200), f"{context}.expected_status", 599)
       if expected < 100:
@@ -732,7 +746,19 @@ class LimitedRedirectHandler(urllib.request.HTTPRedirectHandler):
   def redirect_request(self, req, fp, code, msg, headers, newurl):
     self.redirects += 1
     if self.redirects > MAX_HTTP_REDIRECTS:
-      raise urllib.error.HTTPError(req.full_url, code, "redirect limit exceeded", headers, fp)
+      raise RedirectPolicyError("redirect limit exceeded")
+    try:
+      old = urllib.parse.urlsplit(req.full_url)
+      new = urllib.parse.urlsplit(newurl)
+      old_port = old.port or (443 if old.scheme == "https" else 80)
+      new_port = new.port or (443 if new.scheme == "https" else 80)
+    except ValueError as exc:
+      raise RedirectPolicyError("redirect URL is malformed") from exc
+    if (
+      new.scheme != old.scheme or new.hostname != old.hostname or new_port != old_port
+      or new.username or new.password or new.fragment
+    ):
+      raise RedirectPolicyError("redirect left the configured origin or transport")
     return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
@@ -1004,7 +1030,7 @@ def result_exit_code(results: Sequence[CheckResult]) -> int:
 def build_argument_parser() -> argparse.ArgumentParser:
   parser = argparse.ArgumentParser(
     prog="healthctl",
-    description="Evaluate bounded host and TCP service criteria from one explicit JSON configuration file.",
+    description="Evaluate bounded dependency-aware criteria from one strict JSON configuration file.",
   )
   parser.add_argument("config", help="path to a HealthCtl V1 JSON configuration file")
   parser.add_argument("--profile", metavar="NAME", help="run only a named profile")
