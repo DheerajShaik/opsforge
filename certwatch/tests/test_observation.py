@@ -39,7 +39,7 @@ class ObservationTests(unittest.TestCase):
   result=c.observe_leaf(self.target(target),lambda *a:self.records()[:1],lambda *a:tcp,lambda:ctx)
   return result,tcp,tls,ctx
  def test_exact_der_peer_sni_cleanup(self):
-  result,tcp,tls,ctx=self.observe(); self.assertEqual(result,c.LeafObservation('203.0.113.9',b'DER')); self.assertEqual(ctx.calls[0]['server_hostname'],'example.com'); self.assertTrue(tls.closed); self.assertEqual(tcp.timeouts,[5.0,5.0])
+  result,tcp,tls,ctx=self.observe(); self.assertEqual((result.connected_address,result.der_certificate),('203.0.113.9',b'DER')); self.assertGreaterEqual(result.tcp_seconds,0); self.assertGreaterEqual(result.tls_seconds,0); self.assertEqual(ctx.calls[0]['server_hostname'],'example.com'); self.assertTrue(tls.closed); self.assertEqual(tcp.timeouts,[5.0,5.0])
  def test_ip_no_sni(self): self.assertIsNone(self.observe('192.0.2.1')[3].calls[0]['server_hostname'])
  def test_ipv6_peer(self): self.assertEqual(self.observe(tcp=Sock(peer=('2001:db8::1',443,0,0)))[0].connected_address,'[2001:db8::1]')
  def test_empty(self):
