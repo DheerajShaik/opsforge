@@ -1,6 +1,7 @@
 import contextlib
 import importlib.util
 import io
+import json
 import math
 import os
 from pathlib import Path
@@ -66,6 +67,16 @@ def sample(**overrides):
   return procwatch.ProcessSample(**values)
 
 
+def extended(*, incomplete=None, command="worker"):
+  initial = sample(command=command, observed_at=10.0)
+  final = None if incomplete else sample(command=command, observed_at=11.0)
+  analysis = procwatch.AnalysisResult(
+    123, 1.0, 100, 4096, initial, final,
+    None if incomplete else 1.0, incomplete, (initial,) if incomplete else (initial, final),
+  )
+  return procwatch.ExtendedResult(analysis, None, None, None, None, None, ())
+
+
 class CliTests(unittest.TestCase):
   def run_main(self, arguments):
     stdout = io.StringIO()
@@ -103,30 +114,32 @@ class CliTests(unittest.TestCase):
     self.assertEqual(parser.parse_args(["12", "--interval", "60"]).interval, 60.0)
 
   def test_success_partial_and_expected_errors(self):
-    with mock.patch.object(procwatch, "inspect", return_value=("report", None, 0)):
-      self.assertEqual(self.run_main(["1"]), (0, "report\n", ""))
+    with mock.patch.object(procwatch, "observe_extended", return_value=extended()):
+      code, stdout, stderr = self.run_main(["1"])
+      self.assertEqual((code, stderr), (0, ""))
+      self.assertIn("Conclusion: [OBSERVED]", stdout)
     with mock.patch.object(
-      procwatch, "inspect", return_value=("partial", "procwatch: warning: incomplete", 1)
+      procwatch, "observe_extended", return_value=extended(incomplete="exited")
     ):
-      self.assertEqual(
-        self.run_main(["1"]),
-        (1, "partial\n", "procwatch: warning: incomplete\n"),
-      )
+      code, stdout, stderr = self.run_main(["1"])
+      self.assertEqual(code, 1)
+      self.assertIn("Conclusion: [PARTIAL]", stdout)
+      self.assertIn("incomplete observation", stderr)
     with mock.patch.object(
-      procwatch, "inspect", side_effect=procwatch.InvalidTargetError("missing")
+      procwatch, "observe_extended", side_effect=procwatch.InvalidTargetError("missing")
     ):
       self.assertEqual(self.run_main(["1"]), (2, "", "procwatch: missing\n"))
     with mock.patch.object(
-      procwatch, "inspect", side_effect=procwatch.ObservationError("bad")
+      procwatch, "observe_extended", side_effect=procwatch.ObservationError("bad")
     ):
       self.assertEqual(self.run_main(["1"]), (3, "", "procwatch: bad\n"))
 
   def test_internal_error_and_interrupt_have_stable_output(self):
-    with mock.patch.object(procwatch, "inspect", side_effect=RuntimeError("secret")):
+    with mock.patch.object(procwatch, "observe_extended", side_effect=RuntimeError("secret")):
       self.assertEqual(
         self.run_main(["1"]), (3, "", "procwatch: internal execution failure\n")
       )
-    with mock.patch.object(procwatch, "inspect", side_effect=KeyboardInterrupt):
+    with mock.patch.object(procwatch, "observe_extended", side_effect=KeyboardInterrupt):
       self.assertEqual(self.run_main(["1"]), (130, "", "procwatch: interrupted\n"))
 
   def test_ascii_stdout_escapes_unencodable_unicode(self):
@@ -134,11 +147,20 @@ class CliTests(unittest.TestCase):
     stderr = io.StringIO()
     with mock.patch.object(procwatch.sys, "stdout", stdout), \
          mock.patch.object(procwatch.sys, "stderr", stderr), \
-         mock.patch.object(procwatch, "inspect", return_value=("process é", None, 0)):
+         mock.patch.object(procwatch, "observe_extended", return_value=extended(command="process é")):
       code = procwatch.main(["1"])
     self.assertEqual(code, 0)
     self.assertEqual(stderr.getvalue(), "")
     self.assertIn("process \\xe9", stdout.getvalue())
+
+  def test_json_brief_quiet_and_sample_bounds(self):
+    with mock.patch.object(procwatch, "observe_extended", return_value=extended()) as observe:
+      code, stdout, stderr = self.run_main(["--json", "--samples", "4", "1"])
+      self.assertEqual((code, stderr), (0, ""))
+      self.assertEqual(json.loads(stdout)["tool"], "procwatch")
+      observe.assert_called_with(1, 1.0, 4)
+      self.assertIn("Samples:", self.run_main(["--brief", "1"])[1])
+      self.assertEqual(self.run_main(["--quiet", "1"])[1], "")
 
 
 class StatParsingTests(unittest.TestCase):
