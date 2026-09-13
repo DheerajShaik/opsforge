@@ -188,4 +188,11 @@ def emit_output(
   if output_path is not None:
     _write_new_or_replace(os.fspath(Path(output_path)), rendered, force=force)
   if not quiet and output_path is None:
-    print(rendered, file=sys.stdout if stdout is None else stdout)
+    destination = sys.stdout if stdout is None else stdout
+    encoding = getattr(destination, "encoding", None)
+    if encoding:
+      try:
+        rendered = rendered.encode(encoding, errors="backslashreplace").decode(encoding)
+      except (LookupError, UnicodeError):
+        rendered = rendered.encode("ascii", errors="backslashreplace").decode("ascii")
+    print(rendered, file=destination)

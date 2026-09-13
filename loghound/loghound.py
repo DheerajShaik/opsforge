@@ -4,14 +4,25 @@
 from __future__ import annotations
 
 import argparse
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
+import ipaddress
 import os
 import re
 import stat
 import sys
+import time
 import unicodedata
 from typing import Sequence
+
+from opsforge_common import (
+  OutputError,
+  OutputRecord,
+  add_output_arguments,
+  emit_output,
+  make_conclusion,
+  validate_output_arguments,
+)
 
 
 MAX_FILE_BYTES = 256 * 1024 * 1024
@@ -19,6 +30,9 @@ MAX_LINE_BYTES = 1024 * 1024
 READ_CHUNK_BYTES = 64 * 1024
 RESULT_LIMIT = 10
 EXCERPT_CODEPOINTS = 160
+MAX_TOP = 100
+MAX_ROTATED = 3
+MAX_FILTERS = 16
 COMPRESSED_SIGNATURES = (
   (b"\x1f\x8b", "gzip"),
   (b"BZh", "bzip2"),
@@ -35,6 +49,11 @@ TIMESTAMP_PREFIX = re.compile(
   r"(?P<zone>Z|(?P<sign>[+-])(?P<zone_hour>[0-9]{2}):(?P<zone_minute>[0-9]{2}))"
   r"(?P<spaces> +)"
 )
+UUID_TOKEN = re.compile(r"\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}\b")
+IPV4_TOKEN = re.compile(r"(?<![0-9.])(?:[0-9]{1,3}\.){3}[0-9]{1,3}(?![0-9.])")
+PID_TOKEN = re.compile(r"(?i)\b(pid|process_id)([=: ]+)[0-9]{1,10}\b")
+IDENTIFIER_TOKEN = re.compile(r"(?i)\b(request[_-]?id|trace[_-]?id|user[_-]?id|job[_-]?id)([=: ]+)[A-Za-z0-9._-]{1,128}")
+SEVERITIES = ("critical", "error", "warning", "info", "debug")
 
 
 class InvalidTargetError(Exception):
@@ -62,10 +81,33 @@ class AnalysisResult:
   analyzable_lines: int
   patterns: tuple[PatternEvidence, ...]
   incomplete_warning: str | None = None
+  severity_counts: tuple[tuple[str, int], ...] = ()
+  filtered_lines: int = 0
+  timestamped_lines: int = 0
+  duration_seconds: float | None = None
+  peak_messages_per_minute: int | None = None
+  sources: tuple[str, ...] = ()
 
   @property
   def incomplete(self) -> bool:
     return self.incomplete_warning is not None
+
+
+@dataclass(frozen=True)
+class AnalysisOptions:
+  include: tuple[str, ...] = ()
+  exclude: tuple[str, ...] = ()
+  window_seconds: int | None = None
+
+
+@dataclass
+class LineMetrics:
+  severity: dict[str, int] = field(default_factory=dict)
+  filtered: int = 0
+  timestamped: int = 0
+  first_timestamp: datetime | None = None
+  last_timestamp: datetime | None = None
+  minute_counts: dict[int, int] = field(default_factory=dict)
 
 
 def build_argument_parser() -> argparse.ArgumentParser:
@@ -76,7 +118,21 @@ def build_argument_parser() -> argparse.ArgumentParser:
     ),
   )
   parser.add_argument("path", help="local regular log file to inspect")
+  parser.add_argument("--top", type=bounded_int(1, MAX_TOP, "top"), default=RESULT_LIMIT, metavar="N")
+  parser.add_argument("--include", action="append", default=[], metavar="TEXT", help="include lines containing literal text")
+  parser.add_argument("--exclude", action="append", default=[], metavar="TEXT", help="exclude lines containing literal text")
+  parser.add_argument("--window-seconds", type=bounded_int(1, 31_536_000, "window"), metavar="N")
+  parser.add_argument("--rotated", type=bounded_int(0, MAX_ROTATED, "rotated count"), default=0, metavar="N")
+  add_output_arguments(parser)
   return parser
+
+
+def bounded_int(minimum: int, maximum: int, label: str):
+  def parse(value: str) -> int:
+    if not value.isascii() or not value.isdecimal() or not minimum <= int(value, 10) <= maximum:
+      raise argparse.ArgumentTypeError(f"{label} must be from {minimum} through {maximum}")
+    return int(value, 10)
+  return parse
 
 
 def display_safe(value: object) -> str:
@@ -124,11 +180,10 @@ def print_safe(value: object, *, file: object) -> None:
   print(stream_safe(value, file), file=file)
 
 
-def normalize_message(message: str) -> str:
-  """Remove only a valid timezone-qualified RFC 3339 prefix and spaces."""
+def extract_timestamp(message: str) -> tuple[datetime | None, str]:
   match = TIMESTAMP_PREFIX.match(message)
   if match is None:
-    return message
+    return None, message
   try:
     zone = match.group("zone")
     if zone == "Z":
@@ -137,19 +192,50 @@ def normalize_message(message: str) -> str:
       zone_hour = int(match.group("zone_hour"))
       zone_minute = int(match.group("zone_minute"))
       if zone_hour > 23 or zone_minute > 59:
-        return message
+        return None, message
       offset = timedelta(hours=zone_hour, minutes=zone_minute)
       if match.group("sign") == "-":
         offset = -offset
       zone_info = timezone(offset)
-    datetime(
+    parsed = datetime(
       int(match.group("year")), int(match.group("month")), int(match.group("day")),
       int(match.group("hour")), int(match.group("minute")), int(match.group("second")),
       tzinfo=zone_info,
     )
   except (TypeError, ValueError, OverflowError):
-    return message
-  return message[match.end():]
+    return None, message
+  return parsed.astimezone(timezone.utc), message[match.end():]
+
+
+def _replace_ipv4(match: re.Match[str]) -> str:
+  try:
+    ipaddress.IPv4Address(match.group(0))
+  except ValueError:
+    return match.group(0)
+  return "<ip>"
+
+
+def normalize_message(message: str) -> str:
+  """Conservatively normalize timestamps and well-delimited operational identifiers."""
+  _, normalized = extract_timestamp(message)
+  normalized = UUID_TOKEN.sub("<uuid>", normalized)
+  normalized = IPV4_TOKEN.sub(_replace_ipv4, normalized)
+  normalized = PID_TOKEN.sub(lambda match: f"{match.group(1).lower()}{match.group(2)}<pid>", normalized)
+  normalized = IDENTIFIER_TOKEN.sub(lambda match: f"{match.group(1).lower()}{match.group(2)}<id>", normalized)
+  return normalized
+
+
+def classify_severity(message: str) -> str:
+  lowered = message.lower()
+  if re.search(r"\b(fatal|panic|critical|crit)\b", lowered):
+    return "critical"
+  if re.search(r"\b(error|exception|failed|failure)\b", lowered):
+    return "error"
+  if re.search(r"\b(warn|warning)\b", lowered):
+    return "warning"
+  if re.search(r"\bdebug\b", lowered):
+    return "debug"
+  return "info"
 
 
 def compressed_format(prefix: bytes) -> str | None:
@@ -198,12 +284,29 @@ def _record_pattern(
   patterns: dict[str, list[int]],
   *,
   terminated_by_lf: bool,
+  options: AnalysisOptions | None = None,
+  metrics: LineMetrics | None = None,
+  cutoff: datetime | None = None,
 ) -> bool:
   if terminated_by_lf and record.endswith(b"\r"):
     record = record[:-1]
   if len(record) > MAX_LINE_BYTES:
     raise ObservationError(f"logical line {physical_line} exceeds {MAX_LINE_BYTES} bytes")
   message = record.decode("utf-8", errors="surrogateescape")
+  timestamp, content = extract_timestamp(message)
+  options = AnalysisOptions() if options is None else options
+  if cutoff is not None and (timestamp is None or timestamp < cutoff):
+    if metrics is not None:
+      metrics.filtered += 1
+    return False
+  if options.include and not any(value in content for value in options.include):
+    if metrics is not None:
+      metrics.filtered += 1
+    return False
+  if options.exclude and any(value in content for value in options.exclude):
+    if metrics is not None:
+      metrics.filtered += 1
+    return False
   normalized = normalize_message(message)
   if not normalized or normalized.isspace():
     return False
@@ -213,10 +316,29 @@ def _record_pattern(
   else:
     evidence[0] += 1
     evidence[2] = physical_line
+  if metrics is not None:
+    severity = classify_severity(content)
+    metrics.severity[severity] = metrics.severity.get(severity, 0) + 1
+    if timestamp is not None:
+      metrics.timestamped += 1
+      metrics.first_timestamp = timestamp if metrics.first_timestamp is None else min(metrics.first_timestamp, timestamp)
+      metrics.last_timestamp = timestamp if metrics.last_timestamp is None else max(metrics.last_timestamp, timestamp)
+      bucket = int(timestamp.timestamp()) // 60
+      if bucket in metrics.minute_counts or len(metrics.minute_counts) < 10_000:
+        metrics.minute_counts[bucket] = metrics.minute_counts.get(bucket, 0) + 1
   return True
 
 
-def observe_descriptor(descriptor: int, target: str, boundary: int) -> AnalysisResult:
+def observe_descriptor(
+  descriptor: int,
+  target: str,
+  boundary: int,
+  options: AnalysisOptions | None = None,
+  clock=lambda: datetime.now(timezone.utc),
+) -> AnalysisResult:
+  options = AnalysisOptions() if options is None else options
+  cutoff = clock() - timedelta(seconds=options.window_seconds) if options.window_seconds is not None else None
+  metrics = LineMetrics()
   remaining = boundary
   consumed = 0
   buffer = bytearray()
@@ -258,7 +380,8 @@ def observe_descriptor(descriptor: int, target: str, boundary: int) -> AnalysisR
       record_start = separator + 1
       physical_lines += 1
       if _record_pattern(
-        record, physical_lines, patterns, terminated_by_lf=True
+        record, physical_lines, patterns, terminated_by_lf=True,
+        options=options, metrics=metrics, cutoff=cutoff,
       ):
         analyzable_lines += 1
     if record_start:
@@ -273,7 +396,8 @@ def observe_descriptor(descriptor: int, target: str, boundary: int) -> AnalysisR
   if warning is None and buffer:
     physical_lines += 1
     if _record_pattern(
-      bytes(buffer), physical_lines, patterns, terminated_by_lf=False
+      bytes(buffer), physical_lines, patterns, terminated_by_lf=False,
+      options=options, metrics=metrics, cutoff=cutoff,
     ):
       analyzable_lines += 1
   elif warning is not None:
@@ -293,16 +417,65 @@ def observe_descriptor(descriptor: int, target: str, boundary: int) -> AnalysisR
     analyzable_lines=analyzable_lines,
     patterns=evidence,
     incomplete_warning=warning,
+    severity_counts=tuple((name, metrics.severity.get(name, 0)) for name in SEVERITIES),
+    filtered_lines=metrics.filtered,
+    timestamped_lines=metrics.timestamped,
+    duration_seconds=(metrics.last_timestamp - metrics.first_timestamp).total_seconds()
+      if metrics.first_timestamp is not None and metrics.last_timestamp is not None else None,
+    peak_messages_per_minute=max(metrics.minute_counts.values(), default=None),
+    sources=(target,),
   )
 
 
-def analyze(path: str) -> AnalysisResult:
+def analyze(path: str, options: AnalysisOptions | None = None) -> AnalysisResult:
   target = normalize_target(path)
   descriptor, boundary = open_target(target)
   try:
-    return observe_descriptor(descriptor, target, boundary)
+    return observe_descriptor(descriptor, target, boundary, options)
   finally:
     os.close(descriptor)
+
+
+def analyze_sources(path: str, options: AnalysisOptions, rotated: int) -> AnalysisResult:
+  results = [analyze(path, options)]
+  missing = []
+  for index in range(1, rotated + 1):
+    candidate = f"{path}.{index}"
+    try:
+      results.append(analyze(candidate, options))
+    except InvalidTargetError:
+      missing.append(candidate)
+  merged: dict[str, list[int]] = {}
+  offset = 0
+  severity = {name: 0 for name in SEVERITIES}
+  for result in results:
+    for pattern in result.patterns:
+      values = merged.setdefault(pattern.key, [0, pattern.first_line + offset, pattern.last_line + offset])
+      values[0] += pattern.count
+      values[2] = pattern.last_line + offset
+    for name, count in result.severity_counts:
+      severity[name] += count
+    offset += result.physical_lines
+  warnings = [item.incomplete_warning for item in results if item.incomplete_warning]
+  if missing:
+    warnings.append(f"{len(missing)} requested rotated files were unavailable")
+  durations = [item.duration_seconds for item in results if item.duration_seconds is not None]
+  peaks = [item.peak_messages_per_minute for item in results if item.peak_messages_per_minute is not None]
+  return AnalysisResult(
+    target=results[0].target,
+    boundary_bytes=sum(item.boundary_bytes for item in results),
+    consumed_bytes=sum(item.consumed_bytes for item in results),
+    physical_lines=sum(item.physical_lines for item in results),
+    analyzable_lines=sum(item.analyzable_lines for item in results),
+    patterns=tuple(PatternEvidence(key, *values) for key, values in merged.items()),
+    incomplete_warning="; ".join(warnings) if warnings else None,
+    severity_counts=tuple((name, severity[name]) for name in SEVERITIES),
+    filtered_lines=sum(item.filtered_lines for item in results),
+    timestamped_lines=sum(item.timestamped_lines for item in results),
+    duration_seconds=sum(durations) if durations else None,
+    peak_messages_per_minute=max(peaks, default=None),
+    sources=tuple(item.target for item in results),
+  )
 
 
 def rank_recurring(patterns: Sequence[PatternEvidence]) -> list[PatternEvidence]:
@@ -315,9 +488,9 @@ def rank_recurring(patterns: Sequence[PatternEvidence]) -> list[PatternEvidence]
   ))
 
 
-def render_result(result: AnalysisResult) -> str:
+def render_result(result: AnalysisResult, *, top: int = RESULT_LIMIT) -> str:
   recurring = rank_recurring(result.patterns)
-  displayed = recurring[:RESULT_LIMIT]
+  displayed = recurring[:top]
   lines = [
     "Target",
     f"  Path: {display_safe(result.target)}",
@@ -333,6 +506,12 @@ def render_result(result: AnalysisResult) -> str:
     f"  Distinct normalized patterns: {len(result.patterns)}",
     f"  Recurring patterns: {len(recurring)}",
     f"  Displayed recurring patterns: {len(displayed)} of {len(recurring)}",
+    f"  Filtered physical lines: {result.filtered_lines}",
+    f"  Timestamped analyzed lines: {result.timestamped_lines}",
+    f"  Observed timestamp span: {result.duration_seconds if result.duration_seconds is not None else 'unavailable'} seconds",
+    f"  Peak messages in one timestamp minute: {result.peak_messages_per_minute if result.peak_messages_per_minute is not None else 'unavailable'}",
+    "Severity classification",
+    *[f"  {name}: {count}" for name, count in result.severity_counts],
     "Recurring patterns",
   ]
   if not displayed:
@@ -368,8 +547,21 @@ def inspect(path: str) -> tuple[str, str | None, int]:
 def main(argv: Sequence[str] | None = None) -> int:
   parser = build_argument_parser()
   arguments = parser.parse_args(argv)
+  validate_output_arguments(parser, arguments)
+  if len(arguments.include) > MAX_FILTERS or len(arguments.exclude) > MAX_FILTERS:
+    parser.error(f"include/exclude filters may each be repeated at most {MAX_FILTERS} times")
+  filters = (*arguments.include, *arguments.exclude)
+  if any(not value or len(value) > 256 or display_safe(value) != value for value in filters):
+    parser.error("filters must be printable literal text of at most 256 characters")
+  options = AnalysisOptions(tuple(arguments.include), tuple(arguments.exclude), arguments.window_seconds)
+  started = time.monotonic()
   try:
-    output, warning, exit_code = inspect(arguments.path)
+    result = analyze_sources(arguments.path, options, arguments.rotated)
+    output = render_result(result, top=arguments.top)
+    warning = None
+    if result.incomplete_warning is not None:
+      warning = f"loghound: warning: incomplete observation: {result.incomplete_warning}"
+    exit_code = 1 if result.incomplete else 0
   except InvalidTargetError as error:
     print_safe(f"loghound: {display_safe(error)}", file=sys.stderr)
     return 2
@@ -382,9 +574,62 @@ def main(argv: Sequence[str] | None = None) -> int:
   except Exception:
     print_safe("loghound: internal execution failure", file=sys.stderr)
     return 3
-  print_safe(output, file=sys.stdout)
   if warning is not None:
     print_safe(warning, file=sys.stderr)
+  recurring = rank_recurring(result.patterns)
+  errors = dict(result.severity_counts).get("error", 0) + dict(result.severity_counts).get("critical", 0)
+  status = "PARTIAL" if result.incomplete else "OBSERVED"
+  finding = f"{len(recurring)} recurring patterns and {errors} error/critical messages were observed"
+  next_action = (
+    "resolve the incomplete read before relying on absence evidence" if result.incomplete
+    else "review the highest-frequency patterns and timestamp bursts in context"
+  )
+  conclusion = make_conclusion(status, result.target, finding, next_action)
+  rate = None
+  if result.duration_seconds is not None and result.duration_seconds > 0:
+    rate = result.analyzable_lines / result.duration_seconds
+  record = OutputRecord(
+    tool="loghound",
+    status=status,
+    target=result.target,
+    observations={
+      "sources": result.sources,
+      "physical_lines": result.physical_lines,
+      "analyzable_lines": result.analyzable_lines,
+      "filtered_lines": result.filtered_lines,
+      "patterns": rank_recurring(result.patterns)[:arguments.top],
+      "severity_counts": dict(result.severity_counts),
+      "message_rate_per_second": rate,
+      "peak_messages_per_minute": result.peak_messages_per_minute,
+      "timestamp_span_seconds": result.duration_seconds,
+    },
+    conclusion=conclusion,
+    next_action=next_action + ".",
+    warnings=(warning,) if warning else (),
+    elapsed_seconds=time.monotonic() - started,
+  )
+  brief = "\n".join([
+    f"Target: {display_safe(result.target)}",
+    f"Analyzed lines: {result.analyzable_lines}",
+    f"Recurring patterns: {len(recurring)}",
+    f"Error/critical messages: {errors}",
+    f"Peak per minute: {result.peak_messages_per_minute if result.peak_messages_per_minute is not None else 'unavailable'}",
+  ])
+  try:
+    emit_output(
+      record,
+      detailed=output,
+      brief=brief,
+      json_mode=arguments.json,
+      brief_mode=arguments.brief,
+      quiet=arguments.quiet,
+      output_path=arguments.output,
+      force=arguments.force,
+      stdout=sys.stdout,
+    )
+  except OutputError as error:
+    print_safe(f"loghound: {display_safe(error)}", file=sys.stderr)
+    return 3
   return exit_code
 
 

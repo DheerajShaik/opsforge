@@ -1,6 +1,7 @@
 import contextlib
 import importlib.util
 import io
+import json
 import os
 from pathlib import Path
 import socket
@@ -64,13 +65,13 @@ class CliTests(unittest.TestCase):
     self.assertIn("Count: 2", stdout)
 
   def test_expected_and_internal_errors_use_stderr(self):
-    with mock.patch.object(loghound, "inspect", side_effect=loghound.ObservationError("bad")):
+    with mock.patch.object(loghound, "analyze_sources", side_effect=loghound.ObservationError("bad")):
       self.assertEqual(self.run_main(["x"]), (3, "", "loghound: bad\n"))
-    with mock.patch.object(loghound, "inspect", side_effect=RuntimeError("secret")):
+    with mock.patch.object(loghound, "analyze_sources", side_effect=RuntimeError("secret")):
       self.assertEqual(
         self.run_main(["x"]), (3, "", "loghound: internal execution failure\n")
       )
-    with mock.patch.object(loghound, "inspect", side_effect=KeyboardInterrupt):
+    with mock.patch.object(loghound, "analyze_sources", side_effect=KeyboardInterrupt):
       self.assertEqual(self.run_main(["x"]), (130, "", "loghound: interrupted\n"))
 
   def test_ascii_stdout_escapes_unencodable_unicode(self):
@@ -78,11 +79,25 @@ class CliTests(unittest.TestCase):
     stderr = io.StringIO()
     with mock.patch.object(loghound.sys, "stdout", stdout), \
          mock.patch.object(loghound.sys, "stderr", stderr), \
-         mock.patch.object(loghound, "inspect", return_value=("recurring é", None, 0)):
+         mock.patch.object(loghound, "analyze_sources", return_value=loghound.AnalysisResult(
+           "/log", 1, 1, 2, 2, (loghound.PatternEvidence("recurring é", 2, 1, 2),),
+         )):
       code = loghound.main(["x"])
     self.assertEqual(code, 0)
     self.assertEqual(stderr.getvalue(), "")
     self.assertIn("recurring \\xe9", stdout.getvalue())
+
+  def test_json_brief_and_quiet(self):
+    result = loghound.AnalysisResult(
+      "/log", 1, 1, 2, 2, (loghound.PatternEvidence("error", 2, 1, 2),),
+      severity_counts=(("critical", 0), ("error", 2), ("warning", 0), ("info", 0), ("debug", 0)),
+    )
+    with mock.patch.object(loghound, "analyze_sources", return_value=result):
+      code, stdout, stderr = self.run_main(["--json", "x"])
+      self.assertEqual((code, stderr), (0, ""))
+      self.assertEqual(json.loads(stdout)["tool"], "loghound")
+      self.assertIn("Recurring patterns:", self.run_main(["--brief", "x"])[1])
+      self.assertEqual(self.run_main(["--quiet", "x"])[1], "")
 
 
 class TargetTests(unittest.TestCase):
@@ -190,13 +205,22 @@ class NormalizationTests(unittest.TestCase):
       with self.subTest(value=value):
         self.assertEqual(loghound.normalize_message(value), value)
 
-  def test_all_other_textual_differences_are_preserved(self):
+  def test_conservative_identifier_normalization(self):
     values = (
       "pid=1", "pid=2", "number 1", "number 2", "uuid a-b", "uuid a-c",
       "10.0.0.1:80", "10.0.0.2:81", "/a", "/b", "ERROR", "error",
       "two spaces", "two  spaces", "trail", "trail ",
     )
-    self.assertEqual([loghound.normalize_message(value) for value in values], list(values))
+    normalized = [loghound.normalize_message(value) for value in values]
+    self.assertEqual(normalized[:2], ["pid=<pid>", "pid=<pid>"])
+    self.assertEqual(normalized[2:6], list(values[2:6]))
+    self.assertEqual(normalized[6:8], ["<ip>:80", "<ip>:81"])
+    self.assertEqual(normalized[8:], list(values[8:]))
+
+  def test_uuid_and_labeled_ids_normalize(self):
+    first = "request_id=abc-123 uuid 123e4567-e89b-12d3-a456-426614174000"
+    second = "request_id=xyz-999 uuid 223e4567-e89b-12d3-a456-426614174999"
+    self.assertEqual(loghound.normalize_message(first), loghound.normalize_message(second))
 
 
 class ObservationTests(unittest.TestCase):
