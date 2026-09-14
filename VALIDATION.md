@@ -1,6 +1,6 @@
 # OpsForge v0.2.0-beta.1 candidate validation
 
-Validation recorded on 2026-09-13. This record distinguishes deterministic unit coverage, clean-install integration checks, and live environment observations. It is not a production-readiness claim or a substitute for independent review.
+Validation updated on 2026-09-14 for pull-request head `f3dc8775b4ad11e7ff3bc043a8217b43d70f3188`. This record distinguishes deterministic unit coverage, clean-install integration checks, and live environment observations. It is not a production-readiness claim or a substitute for independent review.
 
 ## Local environment
 
@@ -11,26 +11,26 @@ Validation recorded on 2026-09-13. This record distinguishes deterministic unit 
 - systemd 255.4
 - iproute2 `ss` 6.1.0
 
-The release workflow remains configured for CPython 3.10, 3.11, 3.12, 3.13, and 3.14 on Ubuntu. Only Python 3.12 was available for this local run; the other interpreter jobs require the GitHub Actions matrix and are not claimed as locally executed.
+The real-world run below used CPython 3.12 in WSL2. The replacement-head GitHub Actions run separately passed on Ubuntu with CPython 3.10, 3.11, 3.12, 3.13, and 3.14.
 
 ## Unit tested
 
-All implementation modules compiled with `python -m compileall`. The final `unittest` run passed 440 tests:
+All implementation modules compiled successfully. The replacement-head GitHub Actions matrix passed 451 tests on each supported interpreter:
 
 | Suite | Tests |
 | --- | ---: |
-| Shared output contract | 8 |
-| PortLens | 35 |
+| Shared output contract | 10 |
+| PortLens | 37 |
 | DiskHound | 46 |
-| CertWatch | 62 |
-| SvcDoctor | 51 |
+| CertWatch | 64 |
+| SvcDoctor | 52 |
 | LogHound | 39 |
 | ProcWatch | 28 |
 | ConfigDiff | 31 |
 | NetDoctor | 30 |
-| HealthCtl | 47 |
-| Incident Snapshot | 63 |
-| **Total** | **440** |
+| HealthCtl | 50 |
+| Incident Snapshot | 64 |
+| **Total** | **451** |
 
 Coverage includes legacy invocation paths and deterministic success/failure behavior, malformed input, bounds, partial observations, terminal-safe/JSON/brief/quiet output, safe output-file replacement, resolver de-duplication, PID identity, filesystem mutation cases, dependency cycles, subprocess timeout/output limits, and privacy-sensitive paths.
 
@@ -41,7 +41,7 @@ Coverage includes legacy invocation paths and deterministic success/failure beha
 - `opsforge-0.2.0b1.tar.gz`
 - `opsforge-0.2.0b1-py3-none-any.whl`
 
-The wheel was installed with `pip install --no-deps` into a fresh virtual environment from outside the source tree. Metadata resolved as `opsforge 0.2.0b1`; all ten packages imported; every installed console command existed; and every `--help` invocation exited 0.
+The replacement-head workflow clean-installed both the wheel and source distribution on every supported interpreter from outside the source tree. Metadata resolved as `opsforge 0.2.0b1`; all ten packages imported; every installed console command existed; every `--help` invocation exited 0; and `pip check` passed.
 
 Nine installed commands then completed local schema-version-1 JSON smoke checks with expected exit semantics:
 
@@ -79,7 +79,7 @@ These checks validate execution in this WSL environment only. They do not establ
 - Portable intermediate-certificate expiry inspection is not implemented because CPython 3.10-3.12 lack a consistent public verified-chain certificate API.
 - Operating-system DNS resolution is not hard-cancellable through standard-library `getaddrinfo()`; socket/HTTP/TLS stages remain bounded.
 - No broad public-network, high-scale filesystem, container-orchestrator, non-WSL distribution, elevated-permission, or formal penetration test was performed.
-- GitHub Actions results for CPython 3.10-3.14 remain an external PR gate and must not be inferred from this local record.
+- GitHub Actions passed the CPython 3.10-3.14 full-suite and wheel/source-distribution clean-install gates on the replacement head.
 
 Manual real-world testing by the user remains the final release gate before any merge or tag.
 
@@ -87,4 +87,4 @@ Manual real-world testing by the user remains the final release gate before any 
 
 The release workflow now requires both wheel and source-distribution clean installs on CPython 3.10, 3.11, 3.12, 3.13, and 3.14. Each artifact/interpreter job verifies metadata, imports, all ten console scripts, `pip check`, nine installed-command JSON smoke checks, and complete console-script removal after uninstall.
 
-Focused regressions additionally cover the stdout/file 16 MiB boundary, Unicode presentation-control escaping, proxy-independent HTTP routing, total post-resolution HTTP deadlines, bounded headers and redirects, CertWatch trusted-leaf fingerprint correlation, and termination/reaping of subprocess process groups on interruption. Results for the replacement PR head must be taken from its own GitHub Actions run; the earlier 440-test record above remains a historical statement about the pre-hardening head.
+Focused regressions additionally cover the stdout/file 16 MiB boundary, Unicode presentation-control escaping, proxy-independent HTTP routing, total post-resolution HTTP deadlines, bounded headers and redirects, CertWatch trusted-leaf fingerprint correlation, and termination/reaping of subprocess process groups on interruption. All replacement-head focused workflows and the 15-job release matrix passed.
