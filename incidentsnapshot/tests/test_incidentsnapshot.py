@@ -298,7 +298,7 @@ class BoundedReaderTests(unittest.TestCase):
       children.append(process)
       return process
     with mock.patch.object(incident.subprocess, "Popen", side_effect=capture), \
-         mock.patch.object(incident.time, "sleep", side_effect=KeyboardInterrupt):
+         mock.patch.object(incident.time, "monotonic", side_effect=[0.0, KeyboardInterrupt]):
       with self.assertRaises(KeyboardInterrupt):
         incident.run_bounded_command(
           [sys.executable, "-c", "import time; time.sleep(30)"], timeout=1.0, limit=64,

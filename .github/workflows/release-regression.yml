@@ -127,7 +127,7 @@ jobs:
           set +e
           "$bin_dir/portlens" --all --json > "$temp_dir/portlens.json"
           portlens_status=$?
-          "$bin_dir/netdoctor" --json 127.0.0.1:1 > "$temp_dir/netdoctor.json"
+          "$bin_dir/netdoctor" --json 127.0.0.1 1 > "$temp_dir/netdoctor.json"
           netdoctor_status=$?
           set -e
           test "$portlens_status" -eq 0 -o "$portlens_status" -eq 1
