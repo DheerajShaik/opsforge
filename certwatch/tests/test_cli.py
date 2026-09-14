@@ -3,8 +3,12 @@ from datetime import datetime, timedelta, timezone
 import importlib.util
 import io
 import json
+import os
 import pathlib
+import stat
+import subprocess
 import sys
+import tempfile
 import unittest
 from unittest import mock
 
@@ -75,7 +79,7 @@ class TestCli(unittest.TestCase):
       status is c.ValidityStatus.WARNING,
       0 if status is c.ValidityStatus.NORMAL else 1,
     )
-    verification = verification or c.VerificationEvidence(True, True, None, 2)
+    verification = verification or c.VerificationEvidence(True, True, None, 2, True)
     with mock.patch.object(c, "find_decoder", return_value="/openssl"), \
          mock.patch.object(c, "observe_leaf", return_value=c.LeafObservation("1.2.3.4", b"x")), \
          mock.patch.object(c, "decode_certificate", return_value=certificate), \
@@ -104,7 +108,7 @@ class TestCli(unittest.TestCase):
     self.assertEqual(payload["status"], "VALID")
 
   def test_trust_or_identity_warning_exits_one(self):
-    verification = c.VerificationEvidence(False, False, "untrusted", None)
+    verification = c.VerificationEvidence(False, False, "untrusted", None, False)
     code, stdout, stderr = self.successful(c.ValidityStatus.NORMAL, verification=verification)
     self.assertEqual(code, 1)
     self.assertIn("Conclusion: [WARNING]", stdout)
@@ -128,6 +132,24 @@ class TestCli(unittest.TestCase):
       self.assertEqual((got, stdout), (code, ""))
       self.assertIn(text, stderr)
       self.assertNotIn("Traceback", stderr)
+
+  def test_decoder_interrupt_terminates_and_reaps_child(self):
+    with tempfile.TemporaryDirectory() as directory:
+      executable = pathlib.Path(directory, "fake-openssl")
+      executable.write_text(
+        f"#!{sys.executable}\nimport time\ntime.sleep(30)\n", encoding="utf-8",
+      )
+      executable.chmod(executable.stat().st_mode | stat.S_IXUSR)
+      children = []
+      real_popen = subprocess.Popen
+      def capture(*args, **kwargs):
+        child = real_popen(*args, **kwargs)
+        children.append(child)
+        return child
+      with mock.patch.object(c.selectors.DefaultSelector, "select", side_effect=KeyboardInterrupt), self.assertRaises(KeyboardInterrupt):
+        c.run_decoder(str(executable), b"DER", popen=capture)
+      self.assertEqual(len(children), 1)
+      self.assertIsNotNone(children[0].poll())
 
 
 def load_tests(loader, tests, pattern):

@@ -17,7 +17,7 @@ Targets accept `HOST`, `HOST:PORT`, bare IPv6, or `[IPv6]:PORT`; default port is
 
 For each target, CertWatch resolves at most 16 distinct TCP candidates, applies five-second TCP/TLS bounds, captures negotiated TLS version/cipher and per-stage timing, and decodes the leaf certificate with a shell-free, bounded `openssl x509` subprocess. It reports subject, issuer, serial, SANs, not-before/not-after, and SHA-256 fingerprint.
 
-Identity matching uses SANs, exact IP comparison, exact DNS names, and one-label wildcards only. A second default-trust handshake supplies separate CA-trust evidence. Verified-chain count is reported only when the running Python exposes a compatible public capability. Revocation is never checked.
+Identity matching uses SANs, exact IP comparison, exact DNS names, and one-label wildcards only. A second default-trust handshake supplies separate CA-trust evidence, and its leaf fingerprint must match the displayed leaf before the target can be `VALID`. Verified-chain count is reported only when the running Python exposes a compatible public capability. Revocation is never checked.
 
 Portable intermediate-certificate expiry decoding is deferred because CPython 3.10-3.12 do not expose a consistent public verified-chain certificate API. Chain count must not be read as intermediate-validity proof.
 

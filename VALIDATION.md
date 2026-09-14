@@ -82,3 +82,9 @@ These checks validate execution in this WSL environment only. They do not establ
 - GitHub Actions results for CPython 3.10-3.14 remain an external PR gate and must not be inferred from this local record.
 
 Manual real-world testing by the user remains the final release gate before any merge or tag.
+
+## Independent-review hardening gates
+
+The release workflow now requires both wheel and source-distribution clean installs on CPython 3.10, 3.11, 3.12, 3.13, and 3.14. Each artifact/interpreter job verifies metadata, imports, all ten console scripts, `pip check`, nine installed-command JSON smoke checks, and complete console-script removal after uninstall.
+
+Focused regressions additionally cover the stdout/file 16 MiB boundary, Unicode presentation-control escaping, proxy-independent HTTP routing, total post-resolution HTTP deadlines, bounded headers and redirects, CertWatch trusted-leaf fingerprint correlation, and termination/reaping of subprocess process groups on interruption. Results for the replacement PR head must be taken from its own GitHub Actions run; the earlier 440-test record above remains a historical statement about the pre-hardening head.

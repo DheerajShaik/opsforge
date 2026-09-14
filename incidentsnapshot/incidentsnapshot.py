@@ -12,6 +12,7 @@ import ipaddress
 import json
 import os
 import re
+import signal
 import socket
 import stat
 import subprocess
@@ -606,11 +607,31 @@ def collect_process_rankings(top: int, reader: Callable[[str, int], bytes] = rea
   }
 
 
+def _stop_process_group(process: subprocess.Popen[bytes]) -> None:
+  try:
+    running = process.poll() is None
+  except OSError:
+    running = False
+  if running:
+    try:
+      os.killpg(process.pid, signal.SIGKILL)
+    except OSError:
+      try:
+        process.kill()
+      except OSError:
+        pass
+  try:
+    process.wait(timeout=1.0)
+  except (OSError, subprocess.SubprocessError):
+    pass
+
+
 def run_bounded_command(arguments: Sequence[str], *, timeout: float, limit: int) -> tuple[int, bytes]:
   try:
     process = subprocess.Popen(
       list(arguments), stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL,
       env={**os.environ, "LC_ALL": "C", "SYSTEMD_PAGER": "", "SYSTEMD_COLORS": "0"},
+      start_new_session=True,
     )
   except OSError as error:
     raise SectionUnavailable("command unavailable") from error
@@ -647,12 +668,7 @@ def run_bounded_command(arguments: Sequence[str], *, timeout: float, limit: int)
     raise SectionUnavailable("command timed out") from error
   finally:
     process.stdout.close()
-    if process.poll() is None:
-      process.kill()
-      try:
-        process.wait(timeout=1.0)
-      except subprocess.TimeoutExpired:
-        pass
+    _stop_process_group(process)
 
 
 def collect_failed_services() -> tuple[str, ...]:

@@ -9,7 +9,8 @@ Notable changes to OpsForge will be recorded here.
 ### Common output and safety
 
 - Added a shared terminal-safe conclusion line plus `--brief`, schema-versioned `--json`, `--quiet`, elapsed timing, and safe `--output FILE`/`--force` behavior to all ten commands.
-- Output creation is bounded to 16 MiB, defaults to mode `0600`, refuses implicit overwrite, and does not follow symlinks or overwrite non-regular or multiply-linked targets.
+- All rendered stdout and file output is bounded to 16 MiB. Output files default to mode `0600`, refuse implicit overwrite, and do not follow symlinks or overwrite non-regular or multiply-linked targets.
+- Hardened terminal rendering against Unicode presentation controls, bound and reap subprocess process groups on every exceptional path, and correlate CertWatch trust to the displayed leaf fingerprint.
 - Retained the dependency-free CPython 3.10-3.14 and Linux-only package policy.
 
 ### Utility enhancements
@@ -22,7 +23,7 @@ Notable changes to OpsForge will be recorded here.
 - ProcWatch adds bounded multi-sample/duration/continuous modes plus FD/socket, I/O, context-switch, child, thread CPU, and cgroup constraint evidence while preserving PID identity checks.
 - ConfigDiff retains exact-byte mode and adds explicit bounded unified diff, whitespace/comment modes, semantic JSON and selected keys, metadata, permission/ownership, bounded directory, and optional symlink-target comparison.
 - NetDoctor adds resolver/TCP/TLS timings, retries, address-family comparison, resolver/default-route/source/interface context, proxy-variable-name detection, and resolution/route/TCP/TLS stage classification.
-- HealthCtl adds strict HTTP(S), DNS, certificate-expiry, process, systemd, file existence/metadata, and SHA-256 checks with severity, groups, profiles, dependencies, retries, and bounded parallelism. Arbitrary commands remain prohibited.
+- HealthCtl adds strict proxy-free HTTP(S), DNS, certificate-expiry, process, systemd, file existence/metadata, and SHA-256 checks with severity, groups, profiles, dependencies, retries, and bounded parallelism. HTTP response headers and post-resolution wall-clock duration are explicitly bounded; arbitrary commands remain prohibited.
 - Incident Snapshot adds privacy-conscious `basic`, `network`, `process`, and `full` profiles with PSI, inode, interface, route, listener, process-ranking, failed-service, and selected kernel scheduler evidence.
 
 ### Compatibility and deferrals
@@ -36,7 +37,7 @@ Notable changes to OpsForge will be recorded here.
 
 - Transitioned OpsForge from Experimental to Beta after completion of the initial ten-utility roadmap, while retaining explicit non-production-readiness and compatibility limits.
 - Added standard Python packaging with ten independent console commands and isolated local installation through `pipx install .`.
-- Added a repository-wide CPython 3.10–3.14 Linux regression gate covering compilation, all utility suites, distribution builds, clean wheel installation, installed entry points, safe smoke checks, and uninstallation.
+- Added a repository-wide CPython 3.10–3.14 Linux regression gate covering compilation, all utility suites, wheel and source-distribution builds, clean installation of both artifact types on every supported interpreter, installed entry points, nine safe JSON smoke checks, and complete script removal on uninstallation.
 - Reconciled project, security, contribution, compatibility, and utility documentation with completed implementation and recorded validation evidence.
 - Completed post-fix CertWatch real-world revalidation against `example.com:443` on Ubuntu 24.04.1 WSL2 with Python 3.12.3 and OpenSSL 3.0.13.
 

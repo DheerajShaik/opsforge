@@ -8,11 +8,13 @@ import os
 from pathlib import Path
 import tempfile
 import unittest
+from unittest import mock
 
 from opsforge_common.output import (
   OutputError,
   OutputRecord,
   add_output_arguments,
+  _bounded_output,
   emit_output,
   make_conclusion,
   to_jsonable,
@@ -86,9 +88,32 @@ class OutputTests(unittest.TestCase):
       self.assertEqual(original.read_text(encoding="utf-8"), "secret")
 
   def test_conclusion_sanitizes_controls(self):
-    result = make_conclusion("pass\n", "x\x1b", "ok\r", "none\t")
+    result = make_conclusion("pass\n", "x\x1b\u202e", "ok\r\u2028", "none\t\u2066")
     self.assertNotIn("\n", result)
     self.assertNotIn("\x1b", result)
+    for character in ("\u202e", "\u2028", "\u2066"):
+      self.assertNotIn(character, result)
+
+  def test_output_limit_applies_to_stdout_and_files_before_writing(self):
+    with mock.patch("opsforge_common.output.MAX_OUTPUT_BYTES", 64):
+      stream = io.StringIO()
+      with self.assertRaisesRegex(OutputError, "16 MiB"):
+        emit_output(self.record(), detailed="x" * 64, brief="brief", stdout=stream)
+      self.assertEqual(stream.getvalue(), "")
+      with tempfile.TemporaryDirectory() as directory:
+        destination = Path(directory, "result.txt")
+        with self.assertRaisesRegex(OutputError, "16 MiB"):
+          emit_output(
+            self.record(), detailed="x" * 64, brief="brief",
+            output_path=str(destination),
+          )
+        self.assertFalse(destination.exists())
+
+  def test_output_limit_accepts_exact_boundary_and_rejects_plus_one(self):
+    with mock.patch("opsforge_common.output.MAX_OUTPUT_BYTES", 4):
+      self.assertEqual(_bounded_output("abc")[1], b"abc\n")
+      with self.assertRaises(OutputError):
+        _bounded_output("abcd")
 
   def test_jsonable_handles_dataclasses_and_decimal(self):
     @dataclass

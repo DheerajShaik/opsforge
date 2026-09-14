@@ -41,6 +41,38 @@ class VerificationTests(unittest.TestCase):
     )
     self.assertIs(result.status, c.ValidityStatus.CRITICAL)
 
+  def test_trusted_handshake_leaf_is_correlated_to_observed_leaf(self):
+    class Tcp:
+      def settimeout(self, value): pass
+      def connect(self, address): pass
+      def close(self): pass
+    class Tls:
+      def __init__(self, der): self.der = der
+      def getpeercert(self, binary_form=False): return self.der
+      def close(self): pass
+    class Context:
+      def __init__(self, der): self.der = der
+      def wrap_socket(self, tcp, server_hostname=None): return Tls(self.der)
+
+    record = (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("192.0.2.1", 443))
+    target = c.parse_target("example.com")
+    observed_der = b"observed"
+    cert = certificate((("DNS", "example.com"),))
+    cert = c.replace(cert, sha256_fingerprint=c.fingerprint(observed_der))
+    matched = c.verify_endpoint(
+      target, cert, resolver=lambda *args: [record], socket_factory=lambda *args: Tcp(),
+      context_factory=lambda: Context(observed_der),
+    )
+    self.assertTrue(matched.trust_verified)
+    self.assertTrue(matched.leaf_matches_observation)
+    changed = c.verify_endpoint(
+      target, cert, resolver=lambda *args: [record], socket_factory=lambda *args: Tcp(),
+      context_factory=lambda: Context(b"different"),
+    )
+    self.assertTrue(changed.trust_verified)
+    self.assertFalse(changed.leaf_matches_observation)
+    self.assertIn("different leaf", changed.verification_error)
+
 
 if __name__ == "__main__":
   unittest.main()

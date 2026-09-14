@@ -290,6 +290,22 @@ class BoundedReaderTests(unittest.TestCase):
         incident.read_bounded_ascii("/proc/uptime", 10)
       close.assert_called_once_with(43)
 
+  def test_bounded_command_interrupt_terminates_and_reaps_child(self):
+    real_popen = incident.subprocess.Popen
+    children = []
+    def capture(*args, **kwargs):
+      process = real_popen(*args, **kwargs)
+      children.append(process)
+      return process
+    with mock.patch.object(incident.subprocess, "Popen", side_effect=capture), \
+         mock.patch.object(incident.time, "sleep", side_effect=KeyboardInterrupt):
+      with self.assertRaises(KeyboardInterrupt):
+        incident.run_bounded_command(
+          [sys.executable, "-c", "import time; time.sleep(30)"], timeout=1.0, limit=64,
+        )
+    self.assertEqual(len(children), 1)
+    self.assertIsNotNone(children[0].poll())
+
 
 class SnapshotAndRenderingTests(unittest.TestCase):
   def test_network_profile_adds_bounded_sections(self):

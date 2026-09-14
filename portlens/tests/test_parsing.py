@@ -105,7 +105,13 @@ class SsParsingTests(unittest.TestCase):
     self.assertEqual(len(result), 4)
 
   def test_terminal_controls_are_sanitized(self):
-    self.assertEqual(portlens.sanitize_display("a\n\t\x1b[31m"), "a???[31m")
+    self.assertEqual(portlens.sanitize_display("a\n\t\x1b[31m"), r"a\x0a\x09\x1b[31m")
+
+  def test_unicode_presentation_controls_are_sanitized(self):
+    rendered = portlens.sanitize_display("left\u202eright\u2028next\u2066")
+    self.assertNotIn("\u202e", rendered)
+    self.assertNotIn("\u2028", rendered)
+    self.assertNotIn("\u2066", rendered)
 
 
 

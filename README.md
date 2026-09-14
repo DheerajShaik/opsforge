@@ -45,7 +45,7 @@ incident-snapshot
 
 Run `<command> --help` for current syntax, then consult the linked utility README for semantics, exit codes, permissions, external activity, bounds, and limitations. Source-tree invocation with `PYTHONPATH=. python3 utility/utility.py` remains available for contributors.
 
-Every command supports `--brief`, `--json`, `--quiet`, and safe `--output FILE`. Human output ends with a deterministic `Conclusion:` line. JSON schema version `1` contains `tool`, `status`, `target`, `observations`, `conclusion`, `next_action`, `warnings`, and `elapsed_seconds`. Existing files are refused unless `--force` is explicit; symlinks, non-regular files, and multiply-linked overwrite targets are always refused.
+Every command supports `--brief`, `--json`, `--quiet`, and safe `--output FILE`. Human output ends with a deterministic terminal-safe `Conclusion:` line. JSON schema version `1` contains `tool`, `status`, `target`, `observations`, `conclusion`, `next_action`, `warnings`, and `elapsed_seconds`. All rendered stdout and file output is capped at 16 MiB. Existing files are refused unless `--force` is explicit; symlinks, non-regular files, and multiply-linked overwrite targets are always refused.
 
 ## Compatibility and support boundaries
 

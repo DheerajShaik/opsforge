@@ -53,7 +53,9 @@ Utilities may encounter sensitive operational information, including:
 
 Utilities should minimize unnecessary collection, display, storage, and transmission of sensitive information. Diagnostic output can contain operational metadata and should be stored, shared, and published with appropriate care.
 
-The shared `--output` path creates private regular files and requires `--force` before replacing one. Even with `--force`, final-component symlinks, non-regular files, and multiply-linked files are rejected. Explicit ConfigDiff `--unified` output can reveal configuration values and prints a warning. Incident Snapshot never collects full command lines, environments, arbitrary logs, or home-directory content.
+All rendered stdout and file output is capped at 16 MiB, and terminal-facing text escapes control, format, surrogate, and line/paragraph-separator characters. The shared `--output` path creates private regular files and requires `--force` before replacing one. Even with `--force`, final-component symlinks, non-regular files, and multiply-linked files are rejected. Explicit ConfigDiff `--unified` output can reveal configuration values and prints a warning. Incident Snapshot never collects full command lines, environments, arbitrary logs, or home-directory content.
+
+HealthCtl HTTP(S) checks do not use ambient proxy configuration, reject query-bearing redirects, cap response headers, and enforce one total post-resolution deadline across connection, TLS, redirects, and header collection. Shell-free helper processes run in isolated process groups and are terminated and reaped on timeout, output overflow, interruption, or other exceptional exits.
 
 ## Least privilege
 

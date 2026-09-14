@@ -9,6 +9,7 @@ import ipaddress
 import os
 import re
 import selectors
+import signal
 import shutil
 import socket
 import ssl
@@ -82,6 +83,7 @@ class VerificationEvidence:
     hostname_verified: Optional[bool]
     verification_error: Optional[str]
     chain_certificates: Optional[int] = None
+    leaf_matches_observation: Optional[bool] = None
 
 
 @dataclass(frozen=True)
@@ -361,9 +363,28 @@ def find_decoder(which=shutil.which) -> str:
 
 
 def _stop_decoder(proc: subprocess.Popen[bytes]) -> None:
-    if proc.poll() is None:
-        proc.kill()
-    proc.wait()
+    killed_group = False
+    pid = getattr(proc, "pid", None)
+    try:
+        running = proc.poll() is None
+    except OSError:
+        running = False
+    if running and isinstance(pid, int):
+        try:
+            os.killpg(pid, signal.SIGKILL)
+            killed_group = True
+        except OSError:
+            pass
+    if running and not killed_group:
+        try:
+            if proc.poll() is None:
+                proc.kill()
+        except OSError:
+            pass
+    try:
+        proc.wait(timeout=1.0)
+    except (OSError, subprocess.TimeoutExpired):
+        pass
 
 
 def run_decoder(path: str, der: bytes, popen=subprocess.Popen) -> bytes:
@@ -377,6 +398,7 @@ def run_decoder(path: str, der: bytes, popen=subprocess.Popen) -> bytes:
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             env=env,
+            start_new_session=True,
         )
     except OSError as exc:
         raise CertWatchError("could not execute certificate decoder") from exc
@@ -450,6 +472,9 @@ def run_decoder(path: str, der: bytes, popen=subprocess.Popen) -> bytes:
     except OSError as exc:
         _stop_decoder(proc)
         raise CertWatchError("certificate decoder failed") from exc
+    except BaseException:
+        _stop_decoder(proc)
+        raise
     finally:
         selector.close()
         input_view.release()
@@ -608,7 +633,14 @@ def verify_endpoint(
         tls = context.wrap_socket(tcp, server_hostname=target.sni_name)
         chain_method = getattr(tls, "get_verified_chain", None)
         chain_count = len(chain_method()) if callable(chain_method) else None
-        return VerificationEvidence(True, identity, None, chain_count)
+        verified_der = tls.getpeercert(binary_form=True)
+        if not isinstance(verified_der, bytes) or not verified_der or len(verified_der) > MAX_CERTIFICATE_BYTES:
+            return VerificationEvidence(
+                False, identity, "trusted handshake leaf certificate was unavailable", chain_count, False,
+            )
+        matched = fingerprint(verified_der) == certificate.sha256_fingerprint
+        error = None if matched else "trusted handshake presented a different leaf certificate"
+        return VerificationEvidence(True, identity, error, chain_count, matched)
     except ssl.SSLCertVerificationError as exc:
         return VerificationEvidence(False, identity, sanitize(exc)[:256], None)
     except (OSError, ssl.SSLError, CertWatchError) as exc:
@@ -689,6 +721,7 @@ def render_report(
             "Verification",
             f"  CA trust:      {'verified' if verification and verification.trust_verified else 'not verified'}",
             f"  Host identity: {('verified' if verification.hostname_verified else 'mismatch') if verification and verification.hostname_verified is not None else 'unavailable'}",
+            f"  Trusted leaf:  {('matched' if verification.leaf_matches_observation else 'different') if verification and verification.leaf_matches_observation is not None else 'unavailable'}",
             f"  Chain count:   {verification.chain_certificates if verification and verification.chain_certificates is not None else UNAVAILABLE}",
             f"  Baseline:      {('changed' if baseline_changed else 'unchanged') if baseline_changed is not None else 'not supplied'}",
             "",
@@ -781,7 +814,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     status = "FAIL"
                 elif assessment.status in {ValidityStatus.WARNING, ValidityStatus.CRITICAL}:
                     status = "WARNING"
-                elif not verification.trust_verified or verification.hostname_verified is not True:
+                elif (
+                    not verification.trust_verified
+                    or verification.hostname_verified is not True
+                    or verification.leaf_matches_observation is not True
+                ):
                     status = "WARNING"
                 else:
                     status = "VALID"
@@ -806,6 +843,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     "remaining_seconds": assessment.remaining.total_seconds() if assessment.remaining is not None else None,
                     "trust_verified": verification.trust_verified,
                     "hostname_verified": verification.hostname_verified,
+                    "trusted_leaf_matches_observation": verification.leaf_matches_observation,
                     "chain_certificates": verification.chain_certificates,
                     "revocation_checked": False,
                     "baseline_changed": baseline_changed,

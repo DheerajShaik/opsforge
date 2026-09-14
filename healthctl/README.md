@@ -18,7 +18,7 @@ Every check has `name`, `type`, optional `severity` (`WARN` or `CRITICAL`, defau
 
 - `disk_free_percent`: `path`, `minimum_free_percent` 0-100.
 - `tcp_connect`: strict `host`, `port` 1-65535, optional `timeout_seconds` 0.1-5 (default 1); at most 16 resolver candidates.
-- `http` / `https`: credential-free same-scheme ASCII `url` (at most 2,048 characters) without query or fragment, optional exact `expected_status` 100-599 (default 200), and timeout 0.1-5. Uses HEAD, default HTTPS trust/identity verification, and at most three same-origin/same-transport redirects; no authorization header or response body is sent/read.
+- `http` / `https`: credential-free same-scheme ASCII `url` (at most 2,048 characters) without query or fragment, optional exact `expected_status` 100-599 (default 200), and total post-resolution deadline 0.1-5 seconds. Uses a proxy-free HEAD request, default HTTPS trust/identity verification, at most 64 KiB of response headers, and at most three same-origin/same-transport redirects without query or fragment; no authorization header or response body is sent/read.
 - `dns`: strict `host`, with at most 16 unique addresses. OS resolution has no safe cancellable standard-library timeout.
 - `certificate_expiry`: `host`, optional `port` (443), timeout, `warn_days` (30), and `critical_days` (7). The handshake uses default trust and hostname verification; revocation is not checked.
 - `process`: positive `pid`; checks only that the procfs process directory is observable.
@@ -50,4 +50,4 @@ Passing checks have severity `OK`; negative results retain `WARN`/`CRITICAL`, wh
 
 ## Safety, privacy, and limits
 
-HealthCtl never accepts shell commands, scripts, plugins, environment interpolation, credentials, headers, or request bodies and never remediates. It reads only explicit local targets and contacts only configured network targets. Paths, names, endpoints, hashes, and results can be sensitive. A passed criterion proves only that narrow observation during this run—not overall host/service health or root cause.
+HealthCtl never accepts shell commands, scripts, plugins, environment interpolation, credentials, headers, or request bodies and never remediates. HTTP(S) checks ignore ambient proxy configuration. It reads only explicit local targets and contacts only configured network targets. Paths, names, endpoints, hashes, and results can be sensitive. A passed criterion proves only that narrow observation during this run—not overall host/service health or root cause.

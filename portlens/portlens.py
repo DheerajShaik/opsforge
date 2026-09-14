@@ -9,6 +9,7 @@ import os
 import pwd
 import re
 import selectors
+import signal
 import shutil
 import subprocess
 import sys
@@ -254,18 +255,44 @@ def find_ss() -> str:
   return executable
 
 
+def _stop_process(process: subprocess.Popen[bytes]) -> None:
+  """Best-effort termination and bounded reaping for every exceptional path."""
+  killed_group = False
+  pid = getattr(process, "pid", None)
+  try:
+    running = process.poll() is None
+  except OSError:
+    running = False
+  if running and isinstance(pid, int):
+    try:
+      os.killpg(pid, signal.SIGKILL)
+      killed_group = True
+    except OSError:
+      pass
+  if running and not killed_group:
+    try:
+      if process.poll() is None:
+        process.kill()
+    except OSError:
+      pass
+  try:
+    process.wait(timeout=1.0)
+  except (OSError, subprocess.TimeoutExpired):
+    pass
+
+
 def run_ss_query(executable: str, arguments: Sequence[str]) -> str:
   try:
     process = subprocess.Popen(
       [executable, *arguments],
       stdout=subprocess.PIPE,
       stderr=subprocess.PIPE,
+      start_new_session=True,
     )
   except OSError as error:
     raise PortLensError(f"could not execute 'ss': {error}") from error
   if process.stdout is None or process.stderr is None:
-    process.kill()
-    process.wait()
+    _stop_process(process)
     raise PortLensError("could not execute 'ss'")
   streams = {process.stdout: bytearray(), process.stderr: bytearray()}
   selector = selectors.DefaultSelector()
@@ -295,10 +322,8 @@ def run_ss_query(executable: str, arguments: Sequence[str]) -> str:
       returncode = process.wait(timeout=remaining)
     except subprocess.TimeoutExpired as error:
       raise PortLensError("'ss' timed out") from error
-  except PortLensError:
-    if process.poll() is None:
-      process.kill()
-    process.wait()
+  except BaseException:
+    _stop_process(process)
     raise
   finally:
     selector.close()
@@ -446,10 +471,22 @@ def to_display(observation: SocketObservation) -> DisplayObservation:
 
 def sanitize_display(value: object) -> str:
   text = str(value)
-  return "".join(
-    "?" if character == "\x1b" or unicodedata.category(character) == "Cc" else character
-    for character in text
-  )
+  rendered = []
+  for character in text:
+    codepoint = ord(character)
+    category = unicodedata.category(character)
+    if character == "\\":
+      rendered.append("\\\\")
+    elif category in {"Cc", "Cf", "Cs", "Zl", "Zp"}:
+      if codepoint <= 0xFF:
+        rendered.append(f"\\x{codepoint:02x}")
+      elif codepoint <= 0xFFFF:
+        rendered.append(f"\\u{codepoint:04x}")
+      else:
+        rendered.append(f"\\U{codepoint:08x}")
+    else:
+      rendered.append(character)
+  return "".join(rendered)
 
 
 def sort_observations(observations: Sequence[DisplayObservation]) -> list[DisplayObservation]:

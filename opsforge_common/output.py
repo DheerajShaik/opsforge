@@ -12,6 +12,7 @@ import os
 from pathlib import Path
 import stat
 import sys
+import unicodedata
 from typing import Any, Mapping, Sequence, TextIO
 
 
@@ -99,8 +100,16 @@ def _single_line(value: object) -> str:
   pieces = []
   for character in text:
     codepoint = ord(character)
-    if character == "\x1b" or codepoint < 32 or 127 <= codepoint <= 159:
-      pieces.append(f"\\x{codepoint:02x}" if codepoint <= 255 else "?")
+    category = unicodedata.category(character)
+    if character == "\\":
+      pieces.append("\\\\")
+    elif category in {"Cc", "Cf", "Cs", "Zl", "Zp"}:
+      if codepoint <= 0xFF:
+        pieces.append(f"\\x{codepoint:02x}")
+      elif codepoint <= 0xFFFF:
+        pieces.append(f"\\u{codepoint:04x}")
+      else:
+        pieces.append(f"\\U{codepoint:08x}")
     else:
       pieces.append(character)
   return "".join(pieces)
@@ -141,10 +150,15 @@ def _json_text(record: OutputRecord) -> str:
   )
 
 
-def _write_new_or_replace(path: str, text: str, *, force: bool) -> None:
-  encoded = (text.rstrip("\n") + "\n").encode("utf-8")
+def _bounded_output(text: str) -> tuple[str, bytes]:
+  rendered = text.rstrip("\n")
+  encoded = (rendered + "\n").encode("utf-8")
   if len(encoded) > MAX_OUTPUT_BYTES:
     raise OutputError("rendered output exceeds the 16 MiB safety limit")
+  return rendered, encoded
+
+
+def _write_new_or_replace(path: str, encoded: bytes, *, force: bool) -> None:
   flags = os.O_WRONLY
   if hasattr(os, "O_CLOEXEC"):
     flags |= os.O_CLOEXEC
@@ -203,8 +217,11 @@ def emit_output(
   else:
     body = brief if brief_mode else detailed
     rendered = f"{body.rstrip()}\n{record.conclusion}" if body.strip() else record.conclusion
+  if quiet and output_path is None:
+    return
+  rendered, encoded = _bounded_output(rendered)
   if output_path is not None:
-    _write_new_or_replace(os.fspath(Path(output_path)), rendered, force=force)
+    _write_new_or_replace(os.fspath(Path(output_path)), encoded, force=force)
   if not quiet and output_path is None:
     destination = sys.stdout if stdout is None else stdout
     encoding = getattr(destination, "encoding", None)
@@ -213,4 +230,10 @@ def emit_output(
         rendered = rendered.encode(encoding, errors="backslashreplace").decode(encoding)
       except (LookupError, UnicodeError):
         rendered = rendered.encode("ascii", errors="backslashreplace").decode("ascii")
+      try:
+        stream_bytes = (rendered + "\n").encode(encoding, errors="strict")
+      except (LookupError, UnicodeError):
+        stream_bytes = (rendered + "\n").encode("ascii", errors="backslashreplace")
+      if len(stream_bytes) > MAX_OUTPUT_BYTES:
+        raise OutputError("rendered output exceeds the 16 MiB safety limit")
     print(rendered, file=destination)

@@ -7,6 +7,7 @@ import argparse
 from dataclasses import dataclass
 import os
 import selectors
+import signal
 import subprocess
 import sys
 import time
@@ -156,9 +157,28 @@ def systemctl_arguments(target: str) -> list[str]:
 
 def _stop_process(process: subprocess.Popen[bytes]) -> None:
   """Terminate and reap a child after timeout or an output-limit violation."""
-  if process.poll() is None:
-    process.kill()
-  process.wait()
+  killed_group = False
+  pid = getattr(process, "pid", None)
+  try:
+    running = process.poll() is None
+  except OSError:
+    running = False
+  if running and isinstance(pid, int):
+    try:
+      os.killpg(pid, signal.SIGKILL)
+      killed_group = True
+    except OSError:
+      pass
+  if running and not killed_group:
+    try:
+      if process.poll() is None:
+        process.kill()
+    except OSError:
+      pass
+  try:
+    process.wait(timeout=1.0)
+  except (OSError, subprocess.TimeoutExpired):
+    pass
 
 
 def run_systemctl(target: str) -> CommandResult:
@@ -171,6 +191,7 @@ def run_systemctl(target: str) -> CommandResult:
       stdout=subprocess.PIPE,
       stderr=subprocess.PIPE,
       env=environment,
+      start_new_session=True,
     )
   except FileNotFoundError as error:
     raise SvcDoctorError("systemctl is not available") from error
@@ -215,6 +236,9 @@ def run_systemctl(target: str) -> CommandResult:
     except subprocess.TimeoutExpired as error:
       _stop_process(process)
       raise SvcDoctorError("systemd query timed out after 5 seconds") from error
+  except BaseException:
+    _stop_process(process)
+    raise
   finally:
     selector.close()
     process.stdout.close()
@@ -229,6 +253,7 @@ def run_simple_command(arguments: Sequence[str], label: str, timeout: float = TI
   try:
     process = subprocess.Popen(
       list(arguments), stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=environment,
+      start_new_session=True,
     )
   except FileNotFoundError as error:
     raise SvcDoctorError(f"{label} is not available") from error
@@ -270,6 +295,9 @@ def run_simple_command(arguments: Sequence[str], label: str, timeout: float = TI
     except subprocess.TimeoutExpired as error:
       _stop_process(process)
       raise SvcDoctorError(f"{label} query timed out") from error
+  except BaseException:
+    _stop_process(process)
+    raise
   finally:
     selector.close()
     process.stdout.close()

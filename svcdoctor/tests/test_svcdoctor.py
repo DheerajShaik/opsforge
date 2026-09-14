@@ -508,6 +508,20 @@ class SubprocessTests(unittest.TestCase):
       )
     self.assertLess(time.monotonic() - started, 2)
 
+  def test_keyboard_interrupt_terminates_and_reaps_child(self):
+    children = []
+    real_popen = subprocess.Popen
+    def capture(*args, **kwargs):
+      child = real_popen(*args, **kwargs)
+      children.append(child)
+      return child
+    with mock.patch.object(svcdoctor.subprocess, "Popen", side_effect=capture), mock.patch.object(
+      svcdoctor.selectors.DefaultSelector, "select", side_effect=KeyboardInterrupt,
+    ), self.assertRaises(KeyboardInterrupt):
+      svcdoctor.run_simple_command((sys.executable, "-c", "import time; time.sleep(30)"), "helper")
+    self.assertEqual(len(children), 1)
+    self.assertIsNotNone(children[0].poll())
+
 
 if __name__ == "__main__":
   unittest.main()

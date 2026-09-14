@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 import stat
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -153,6 +154,26 @@ class CliTests(unittest.TestCase):
       executable.chmod(executable.stat().st_mode | stat.S_IXUSR)
       with self.assertRaisesRegex(portlens.PortLensError, "8 MiB"):
         portlens.run_ss_query(str(executable), ())
+
+  def test_keyboard_interrupt_terminates_and_reaps_ss(self):
+    with tempfile.TemporaryDirectory() as directory:
+      executable = Path(directory, "fake-ss")
+      executable.write_text(
+        f"#!{sys.executable}\nimport time\ntime.sleep(30)\n", encoding="utf-8",
+      )
+      executable.chmod(executable.stat().st_mode | stat.S_IXUSR)
+      children = []
+      real_popen = subprocess.Popen
+      def capture(*args, **kwargs):
+        child = real_popen(*args, **kwargs)
+        children.append(child)
+        return child
+      with mock.patch.object(portlens.subprocess, "Popen", side_effect=capture), mock.patch.object(
+        portlens.selectors.DefaultSelector, "select", side_effect=KeyboardInterrupt,
+      ), self.assertRaises(KeyboardInterrupt):
+        portlens.run_ss_query(str(executable), ())
+      self.assertEqual(len(children), 1)
+      self.assertIsNotNone(children[0].poll())
 
 
 if __name__ == "__main__":

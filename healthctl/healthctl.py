@@ -14,6 +14,7 @@ import hashlib
 import math
 import os
 import re
+import signal
 import shutil
 import socket
 import ssl
@@ -46,6 +47,7 @@ MAX_TCP_TIMEOUT_SECONDS = 5.0
 MAX_RETRIES = 3
 MAX_WORKERS = 8
 MAX_HTTP_REDIRECTS = 3
+MAX_HTTP_HEADER_BYTES = 64 * 1024
 MAX_HASH_BYTES = 64 * 1024 * 1024
 CHECK_NAME_RE = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9._-]{0,63})\Z", re.ASCII)
 HOST_LABEL_RE = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\Z", re.ASCII)
@@ -747,19 +749,170 @@ class LimitedRedirectHandler(urllib.request.HTTPRedirectHandler):
     self.redirects += 1
     if self.redirects > MAX_HTTP_REDIRECTS:
       raise RedirectPolicyError("redirect limit exceeded")
+    destination = validate_redirect_url(req.full_url, newurl)
+    return super().redirect_request(req, fp, code, msg, headers, destination)
+
+
+def validate_redirect_url(current_url: str, new_url: str) -> str:
+  """Resolve and validate a same-origin redirect without consulting proxy state."""
+  destination = urllib.parse.urljoin(current_url, new_url)
+  if len(destination) > 2048 or not destination.isascii() or display_safe(destination) != destination:
+    raise RedirectPolicyError("redirect URL is malformed")
+  try:
+    old = urllib.parse.urlsplit(current_url)
+    new = urllib.parse.urlsplit(destination)
+    old_port = old.port or (443 if old.scheme == "https" else 80)
+    new_port = new.port or (443 if new.scheme == "https" else 80)
+  except ValueError as exc:
+    raise RedirectPolicyError("redirect URL is malformed") from exc
+  if (
+    new.scheme != old.scheme or new.hostname != old.hostname or new_port != old_port
+    or new.username or new.password or new.query or new.fragment
+  ):
+    raise RedirectPolicyError("redirect left the configured origin or transport")
+  return destination
+
+
+def _deadline_remaining(deadline: float, clock: Callable[[], float]) -> float:
+  remaining = deadline - clock()
+  if remaining <= 0:
+    raise TimeoutError("HTTP check exceeded its total deadline")
+  return remaining
+
+
+def _connect_http_target(
+  host: str,
+  host_kind: str,
+  port: int,
+  deadline: float,
+  *,
+  resolver: Callable[..., object],
+  socket_factory: Callable[[int, int, int], socket.socket],
+  clock: Callable[[], float],
+) -> socket.socket:
+  check = TcpConnectCheck("http", host, host_kind, port, 0.1)
+  candidates = resolve_tcp_candidates(check, resolver=resolver)
+  if not candidates:
+    raise socket.gaierror("name resolution returned no usable address")
+  last_error: OSError | None = None
+  for candidate in candidates:
+    client = socket_factory(candidate.family, candidate.socket_type, candidate.protocol)
     try:
-      old = urllib.parse.urlsplit(req.full_url)
-      new = urllib.parse.urlsplit(newurl)
-      old_port = old.port or (443 if old.scheme == "https" else 80)
-      new_port = new.port or (443 if new.scheme == "https" else 80)
-    except ValueError as exc:
-      raise RedirectPolicyError("redirect URL is malformed") from exc
-    if (
-      new.scheme != old.scheme or new.hostname != old.hostname or new_port != old_port
-      or new.username or new.password or new.fragment
-    ):
-      raise RedirectPolicyError("redirect left the configured origin or transport")
-    return super().redirect_request(req, fp, code, msg, headers, newurl)
+      client.settimeout(_deadline_remaining(deadline, clock))
+      client.connect(candidate.sockaddr)
+      return client
+    except OSError as error:
+      last_error = error
+      try:
+        client.close()
+      except OSError:
+        pass
+  if last_error is not None:
+    raise last_error
+  raise OSError("no TCP candidate was attempted")
+
+
+def _parse_http_head(data: bytes) -> tuple[int, str | None]:
+  head, separator, _remainder = data.partition(b"\r\n\r\n")
+  if not separator or b"\n" in head.replace(b"\r\n", b"") or b"\r" in head.replace(b"\r\n", b""):
+    raise ObservationError("HTTP response headers were malformed")
+  lines = head.split(b"\r\n")
+  match = re.fullmatch(rb"HTTP/1\.[01] ([0-9]{3})(?: [\x20-\x7e]*)?", lines[0])
+  if match is None:
+    raise ObservationError("HTTP status line was malformed")
+  status = int(match.group(1))
+  locations = []
+  for line in lines[1:]:
+    if not line or line[:1] in b" \t" or b":" not in line:
+      raise ObservationError("HTTP response headers were malformed")
+    name, value = line.split(b":", 1)
+    if re.fullmatch(rb"[!#$%&'*+\-.^_`|~0-9A-Za-z]+", name) is None:
+      raise ObservationError("HTTP response headers were malformed")
+    if name.lower() == b"location":
+      locations.append(value.strip().decode("latin-1"))
+  if len(locations) > 1:
+    raise ObservationError("HTTP response contained multiple Location headers")
+  return status, locations[0] if locations else None
+
+
+def _one_http_head(
+  url: str,
+  deadline: float,
+  *,
+  resolver: Callable[..., object],
+  socket_factory: Callable[[int, int, int], socket.socket],
+  context_factory: Callable[[], ssl.SSLContext],
+  clock: Callable[[], float],
+) -> tuple[int, str | None]:
+  parsed = urllib.parse.urlsplit(url)
+  assert parsed.hostname is not None
+  host, host_kind = parse_host(parsed.hostname, "HTTP URL host")
+  port = parsed.port or (443 if parsed.scheme == "https" else 80)
+  client = _connect_http_target(
+    host, host_kind, port, deadline,
+    resolver=resolver, socket_factory=socket_factory, clock=clock,
+  )
+  stream = client
+  try:
+    if parsed.scheme == "https":
+      client.settimeout(_deadline_remaining(deadline, clock))
+      stream = context_factory().wrap_socket(client, server_hostname=host)
+    path = parsed.path or "/"
+    if not path.startswith("/"):
+      path = "/" + path
+    default_port = 443 if parsed.scheme == "https" else 80
+    host_value = f"[{host}]" if host_kind == "ipv6" else host
+    if port != default_port:
+      host_value += f":{port}"
+    request = (
+      f"HEAD {path} HTTP/1.1\r\nHost: {host_value}\r\n"
+      "User-Agent: OpsForge-HealthCtl/0.2\r\nConnection: close\r\n\r\n"
+    ).encode("ascii")
+    stream.settimeout(_deadline_remaining(deadline, clock))
+    stream.sendall(request)
+    response = bytearray()
+    while b"\r\n\r\n" not in response:
+      stream.settimeout(_deadline_remaining(deadline, clock))
+      chunk = stream.recv(min(4096, MAX_HTTP_HEADER_BYTES + 1 - len(response)))
+      if not chunk:
+        raise ObservationError("HTTP response ended before complete headers")
+      response.extend(chunk)
+      if len(response) > MAX_HTTP_HEADER_BYTES:
+        raise ObservationError("HTTP response headers exceeded the 64 KiB limit")
+    return _parse_http_head(bytes(response))
+  finally:
+    try:
+      stream.close()
+    except OSError:
+      pass
+    if stream is not client:
+      try:
+        client.close()
+      except OSError:
+        pass
+
+
+def run_http_head(
+  check: GenericCheck,
+  *,
+  resolver: Callable[..., object] = socket.getaddrinfo,
+  socket_factory: Callable[[int, int, int], socket.socket] = socket.socket,
+  context_factory: Callable[[], ssl.SSLContext] = ssl.create_default_context,
+  clock: Callable[[], float] = time.monotonic,
+) -> int:
+  deadline = clock() + check.timeout_seconds
+  current = check.target
+  for redirects in range(MAX_HTTP_REDIRECTS + 1):
+    status, location = _one_http_head(
+      current, deadline, resolver=resolver, socket_factory=socket_factory,
+      context_factory=context_factory, clock=clock,
+    )
+    if status not in {301, 302, 303, 307, 308} or location is None:
+      return status
+    if redirects >= MAX_HTTP_REDIRECTS:
+      raise RedirectPolicyError("redirect limit exceeded")
+    current = validate_redirect_url(current, location)
+  raise RedirectPolicyError("redirect limit exceeded")
 
 
 def _options(check: GenericCheck) -> dict[str, object]:
@@ -800,16 +953,44 @@ def hash_regular_file(path: str, expected_metadata: os.stat_result) -> str:
     os.close(descriptor)
 
 
+def _stop_process_group(process: subprocess.Popen[bytes]) -> None:
+  running = process.poll() is None
+  if running:
+    try:
+      os.killpg(process.pid, signal.SIGKILL)
+    except (OSError, ProcessLookupError):
+      try:
+        process.kill()
+      except OSError:
+        pass
+  try:
+    process.wait(timeout=1.0)
+  except (OSError, subprocess.SubprocessError):
+    pass
+
+
+def run_silent_command(arguments: Sequence[str], timeout_seconds: float) -> int:
+  process = subprocess.Popen(
+    list(arguments), stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+    stderr=subprocess.DEVNULL,
+    env={**os.environ, "LC_ALL": "C", "SYSTEMD_PAGER": "", "SYSTEMD_COLORS": "0"},
+    start_new_session=True,
+  )
+  try:
+    return process.wait(timeout=timeout_seconds)
+  except subprocess.TimeoutExpired as error:
+    _stop_process_group(process)
+    raise ObservationError("command exceeded its deadline") from error
+  except BaseException:
+    _stop_process_group(process)
+    raise
+
+
 def run_generic_check(check: GenericCheck) -> CheckResult:
   options = _options(check)
   if check.type in {"http", "https"}:
-    request = urllib.request.Request(check.target, method="HEAD", headers={"User-Agent": "OpsForge-HealthCtl/0.2"})
-    opener = urllib.request.build_opener(LimitedRedirectHandler())
     try:
-      with opener.open(request, timeout=check.timeout_seconds) as response:
-        status_code = response.status
-    except urllib.error.HTTPError as error:
-      status_code = error.code
+      status_code = run_http_head(check)
     except urllib.error.URLError as error:
       reason = error.reason
       if isinstance(reason, ssl.SSLError):
@@ -821,6 +1002,10 @@ def run_generic_check(check: GenericCheck) -> CheckResult:
       else:
         layer = "HTTP"
       return CheckResult(check.name, check.type, "FAIL", check.target, f"{layer} layer failed: {type(reason).__name__}", check.severity)
+    except ssl.SSLError as error:
+      return CheckResult(check.name, check.type, "FAIL", check.target, f"TLS layer failed: {type(error).__name__}", check.severity)
+    except socket.gaierror as error:
+      return CheckResult(check.name, check.type, "FAIL", check.target, f"resolution layer failed: {type(error).__name__}", check.severity)
     except (OSError, TimeoutError) as error:
       return CheckResult(check.name, check.type, "FAIL", check.target, f"TCP layer failed: {type(error).__name__}", check.severity)
     expected = int(options["expected_status"])
@@ -874,16 +1059,14 @@ def run_generic_check(check: GenericCheck) -> CheckResult:
     return CheckResult(check.name, check.type, "PASS" if exists else "FAIL", check.target, "process directory exists" if exists else "process directory was not observed", "OK" if exists else check.severity)
   if check.type == "systemd_service":
     try:
-      completed = subprocess.run(
+      return_code = run_silent_command(
         ["systemctl", "is-active", "--system", "--quiet", "--", check.target],
-        check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-        timeout=check.timeout_seconds,
-        env={**os.environ, "LC_ALL": "C", "SYSTEMD_PAGER": "", "SYSTEMD_COLORS": "0"},
+        check.timeout_seconds,
       )
-    except (OSError, subprocess.SubprocessError):
+    except (OSError, subprocess.SubprocessError, ObservationError):
       return CheckResult(check.name, check.type, "ERROR", check.target, "systemd state could not be observed", "CRITICAL")
-    active = completed.returncode == 0
-    return CheckResult(check.name, check.type, "PASS" if active else "FAIL", check.target, "service is active" if active else f"service is not active (status {completed.returncode})", "OK" if active else check.severity)
+    active = return_code == 0
+    return CheckResult(check.name, check.type, "PASS" if active else "FAIL", check.target, "service is active" if active else f"service is not active (status {return_code})", "OK" if active else check.severity)
   if check.type in {"file_exists", "file_metadata", "config_hash"}:
     path = os.path.abspath(check.target)
     try:

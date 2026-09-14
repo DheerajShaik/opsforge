@@ -13,8 +13,8 @@ jobs:
       matrix:
         python-version: ["3.10", "3.11", "3.12", "3.13", "3.14"]
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: ${{ matrix.python-version }}
       - name: Compile all utility modules
@@ -40,23 +40,33 @@ jobs:
           done
 
   package:
-    name: Build and clean-install package
+    name: Python ${{ matrix.python-version }} clean-install ${{ matrix.distribution }}
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12", "3.13", "3.14"]
+        distribution: ["wheel", "sdist"]
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
         with:
-          python-version: "3.12"
+          python-version: ${{ matrix.python-version }}
       - name: Build wheel and source distribution
         run: |
           python -m pip install --upgrade build
           python -m build
-      - name: Install wheel into a clean environment
+      - name: Install distribution into a clean environment
         shell: bash
         run: |
           set -euo pipefail
           python -m venv /tmp/opsforge-release-venv
-          /tmp/opsforge-release-venv/bin/python -m pip install --no-deps dist/*.whl
+          if [ "${{ matrix.distribution }}" = "wheel" ]; then
+            artifact=(dist/*.whl)
+          else
+            artifact=(dist/*.tar.gz)
+          fi
+          /tmp/opsforge-release-venv/bin/python -m pip install --no-deps "${artifact[0]}"
       - name: Verify installed metadata, imports, and commands
         shell: bash
         run: |
@@ -88,11 +98,13 @@ jobs:
             test -x "$bin_dir/$command"
             "$bin_dir/$command" --help >/dev/null
           done
+          "$python_bin" -m pip check
       - name: Exercise safe installed invocations
         shell: bash
         run: |
           set -euo pipefail
           bin_dir=/tmp/opsforge-release-venv/bin
+          python_bin=/tmp/opsforge-release-venv/bin/python
           temp_dir="$(mktemp -d)"
           trap 'rm -rf "$temp_dir"' EXIT
           printf 'repeated\nrepeated\n' > "$temp_dir/sample.log"
@@ -105,12 +117,35 @@ jobs:
           "$bin_dir/healthctl" "$temp_dir/health.json" >/dev/null
           "$bin_dir/procwatch" "$PPID" --interval 0.1 >/dev/null
           "$bin_dir/incident-snapshot" >/dev/null
-          "$bin_dir/diskhound" --json "$temp_dir" | python -c 'import json,sys; assert json.load(sys.stdin)["tool"] == "diskhound"'
-          "$bin_dir/loghound" --json "$temp_dir/sample.log" | python -c 'import json,sys; assert json.load(sys.stdin)["schema_version"] == 1'
-          "$bin_dir/configdiff" --json "$temp_dir/baseline.conf" "$temp_dir/current.conf" | python -c 'import json,sys; assert json.load(sys.stdin)["status"] == "UNCHANGED"'
-          "$bin_dir/healthctl" --json "$temp_dir/health.json" | python -c 'import json,sys; assert json.load(sys.stdin)["tool"] == "healthctl"'
-          "$bin_dir/incident-snapshot" --json | python -c 'import json,sys; assert json.load(sys.stdin)["tool"] == "incidentsnapshot"'
+          "$bin_dir/diskhound" --json "$temp_dir" | "$python_bin" -c 'import json,sys; assert json.load(sys.stdin)["tool"] == "diskhound"'
+          "$bin_dir/loghound" --json "$temp_dir/sample.log" | "$python_bin" -c 'import json,sys; assert json.load(sys.stdin)["schema_version"] == 1'
+          "$bin_dir/configdiff" --json "$temp_dir/baseline.conf" "$temp_dir/current.conf" | "$python_bin" -c 'import json,sys; assert json.load(sys.stdin)["status"] == "UNCHANGED"'
+          "$bin_dir/healthctl" --json "$temp_dir/health.json" | "$python_bin" -c 'import json,sys; assert json.load(sys.stdin)["tool"] == "healthctl"'
+          "$bin_dir/incident-snapshot" --json | "$python_bin" -c 'import json,sys; assert json.load(sys.stdin)["tool"] == "incidentsnapshot"'
+          "$bin_dir/procwatch" --json "$PPID" --interval 0.1 | "$python_bin" -c 'import json,sys; assert json.load(sys.stdin)["tool"] == "procwatch"'
+
+          set +e
+          "$bin_dir/portlens" --all --json > "$temp_dir/portlens.json"
+          portlens_status=$?
+          "$bin_dir/netdoctor" --json 127.0.0.1:1 > "$temp_dir/netdoctor.json"
+          netdoctor_status=$?
+          set -e
+          test "$portlens_status" -eq 0 -o "$portlens_status" -eq 1
+          test "$netdoctor_status" -eq 0 -o "$netdoctor_status" -eq 1
+          "$python_bin" -c 'import json,sys; assert json.load(open(sys.argv[1]))["tool"] == "portlens"' "$temp_dir/portlens.json"
+          "$python_bin" -c 'import json,sys; assert json.load(open(sys.argv[1]))["tool"] == "netdoctor"' "$temp_dir/netdoctor.json"
+
+          mkdir "$temp_dir/fake-bin"
+          printf '%s\n' '#!/usr/bin/env python3' 'print("Id=dbus.service")' 'print("LoadState=loaded")' 'print("ActiveState=active")' 'print("SubState=running")' > "$temp_dir/fake-bin/systemctl"
+          printf '%s\n' '#!/usr/bin/env python3' > "$temp_dir/fake-bin/journalctl"
+          chmod 700 "$temp_dir/fake-bin/systemctl" "$temp_dir/fake-bin/journalctl"
+          PATH="$temp_dir/fake-bin:$PATH" "$bin_dir/svcdoctor" --json dbus.service | "$python_bin" -c 'import json,sys; assert json.load(sys.stdin)["tool"] == "svcdoctor"'
       - name: Uninstall cleanly
+        shell: bash
         run: |
-          /tmp/opsforge-release-venv/bin/python -m pip uninstall --yes opsforge
-          test ! -e /tmp/opsforge-release-venv/bin/portlens
+          set -euo pipefail
+          bin_dir=/tmp/opsforge-release-venv/bin
+          "$bin_dir/python" -m pip uninstall --yes opsforge
+          for command in portlens diskhound certwatch svcdoctor loghound procwatch configdiff netdoctor healthctl incident-snapshot; do
+            test ! -e "$bin_dir/$command"
+          done
