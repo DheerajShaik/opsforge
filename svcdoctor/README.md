@@ -18,6 +18,8 @@ One bounded `systemctl show` query reports load/active/sub states, result, main/
 
 Recent evidence uses `journalctl --system --unit UNIT --lines N`; lines are escaped and truncated to 512 characters. Subprocess argument arrays are shell-free, have five-second timeouts, and cap stdout and stderr at 64 KiB. Suggested follow-up commands are informational and never executed.
 
+Dependency evidence requires one recognized state per queried unit and a consistent command exit status. Confirmed zero failures render as `none observed` and JSON `failed_dependencies: []` with `dependencies_observed: true`. Failed, malformed, or unavailable dependency queries render as `unavailable`, JSON `failed_dependencies: null` and `dependencies_observed: false`, and a warning. Trustworthy main service state and its exit semantics remain available despite optional dependency failure.
+
 SvcDoctor never starts, stops, restarts, reloads, enables, disables, masks, or unmasks a unit. It does not print service environment variables.
 
 ## Output and exits

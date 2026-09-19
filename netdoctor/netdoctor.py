@@ -566,8 +566,8 @@ def render_result(result: DiagnosticResult) -> str:
     f"  Retry rounds used: {result.retries}",
     f"  Resolution scope: {resolution_scope}",
     f"  Resolver servers: {', '.join(result.resolver_servers) or '-'}",
-    f"  Default route: {display_safe(result.default_route or '-')}",
-    f"  Selected interface: {display_safe(result.selected_interface or '-')}",
+    f"  IPv4 default-route context: {display_safe(result.default_route or 'unavailable')}",
+    f"  Connection interface: {display_safe(result.selected_interface or 'unavailable (not established)')}",
     f"  Proxy variables present: {', '.join(result.proxy_variables) or 'none'}",
   ]
   if result.resolution_detail is not None:
@@ -649,12 +649,6 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     route_interface, gateway = default_route_context()
     connected_attempt = next((item for item in result.attempts if item.connected), None)
-    selected_interface = None
-    if connected_attempt and connected_attempt.local_endpoint:
-      if connected_attempt.local_endpoint.startswith("127.") or connected_attempt.local_endpoint.startswith("[::1]"):
-        selected_interface = "lo"
-      else:
-        selected_interface = route_interface
     tls_status = tls_version = tls_cipher = None
     tls_seconds = None
     if arguments.tls and connected_attempt is not None:
@@ -665,7 +659,7 @@ def main(argv: Sequence[str] | None = None) -> int:
       result,
       resolver_servers=resolver_context(),
       default_route=(f"{gateway} via {route_interface}" if gateway and route_interface else None),
-      selected_interface=selected_interface,
+      selected_interface=None,
       proxy_variables=proxy_context(),
       tls_status=tls_status,
       tls_version=tls_version,
@@ -718,7 +712,7 @@ def main(argv: Sequence[str] | None = None) -> int:
       "candidates": result.candidates,
       "attempts": result.attempts,
       "resolver_servers": result.resolver_servers,
-      "default_route": result.default_route,
+      "ipv4_default_route_context": result.default_route,
       "selected_interface": result.selected_interface,
       "proxy_variables_present": result.proxy_variables,
       "tls": {"status": result.tls_status, "version": result.tls_version, "cipher": result.tls_cipher, "seconds": result.tls_seconds},

@@ -34,6 +34,7 @@ MAX_TOP = 100
 MAX_ROTATED = 3
 MAX_FILTERS = 16
 MAX_STACK_LINES_PER_GROUP = 256
+MAX_MINUTE_BUCKETS = 10_000
 COMPRESSED_SIGNATURES = (
   (b"\x1f\x8b", "gzip"),
   (b"BZh", "bzip2"),
@@ -96,6 +97,10 @@ class AnalysisResult:
   stack_trace_lines: int = 0
   earlier_period_messages: int | None = None
   later_period_messages: int | None = None
+  first_timestamp: datetime | None = None
+  last_timestamp: datetime | None = None
+  minute_counts: tuple[tuple[int, int], ...] = ()
+  minute_counts_complete: bool = True
 
   @property
   def incomplete(self) -> bool:
@@ -117,6 +122,7 @@ class LineMetrics:
   first_timestamp: datetime | None = None
   last_timestamp: datetime | None = None
   minute_counts: dict[int, int] = field(default_factory=dict)
+  minute_counts_complete: bool = True
   stack_groups: int = 0
   stack_lines: int = 0
   last_stack_line: int | None = None
@@ -337,8 +343,10 @@ def _record_pattern(
       metrics.first_timestamp = timestamp if metrics.first_timestamp is None else min(metrics.first_timestamp, timestamp)
       metrics.last_timestamp = timestamp if metrics.last_timestamp is None else max(metrics.last_timestamp, timestamp)
       bucket = int(timestamp.timestamp()) // 60
-      if bucket in metrics.minute_counts or len(metrics.minute_counts) < 10_000:
+      if bucket in metrics.minute_counts or len(metrics.minute_counts) < MAX_MINUTE_BUCKETS:
         metrics.minute_counts[bucket] = metrics.minute_counts.get(bucket, 0) + 1
+      else:
+        metrics.minute_counts_complete = False
     if STACK_LINE.match(content):
       continues = (
         metrics.last_stack_line == physical_line - 1
@@ -434,7 +442,9 @@ def observe_descriptor(
     for key, values in patterns.items()
   )
   earlier = later = None
-  if metrics.minute_counts:
+  if not metrics.minute_counts_complete:
+    warning = "; ".join(filter(None, (warning, "minute histogram limit reached; peak and period counts unavailable")))
+  if metrics.minute_counts and metrics.minute_counts_complete:
     first_bucket = min(metrics.minute_counts)
     last_bucket = max(metrics.minute_counts)
     midpoint = (first_bucket + last_bucket) / 2
@@ -453,12 +463,16 @@ def observe_descriptor(
     timestamped_lines=metrics.timestamped,
     duration_seconds=(metrics.last_timestamp - metrics.first_timestamp).total_seconds()
       if metrics.first_timestamp is not None and metrics.last_timestamp is not None else None,
-    peak_messages_per_minute=max(metrics.minute_counts.values(), default=None),
+    peak_messages_per_minute=max(metrics.minute_counts.values(), default=None) if metrics.minute_counts_complete else None,
     sources=(target,),
     stack_trace_groups=metrics.stack_groups,
     stack_trace_lines=metrics.stack_lines,
     earlier_period_messages=earlier,
     later_period_messages=later,
+    first_timestamp=metrics.first_timestamp,
+    last_timestamp=metrics.last_timestamp,
+    minute_counts=tuple(sorted(metrics.minute_counts.items())),
+    minute_counts_complete=metrics.minute_counts_complete,
   )
 
 
@@ -494,8 +508,24 @@ def analyze_sources(path: str, options: AnalysisOptions, rotated: int) -> Analys
   warnings = [item.incomplete_warning for item in results if item.incomplete_warning]
   if missing:
     warnings.append(f"{len(missing)} requested rotated files were unavailable")
-  durations = [item.duration_seconds for item in results if item.duration_seconds is not None]
-  peaks = [item.peak_messages_per_minute for item in results if item.peak_messages_per_minute is not None]
+  first = min((item.first_timestamp for item in results if item.first_timestamp is not None), default=None)
+  last = max((item.last_timestamp for item in results if item.last_timestamp is not None), default=None)
+  minutes: dict[int, int] = {}
+  complete = all(item.minute_counts_complete for item in results)
+  for item in results:
+    for bucket, count in item.minute_counts:
+      if bucket in minutes or len(minutes) < MAX_MINUTE_BUCKETS:
+        minutes[bucket] = minutes.get(bucket, 0) + count
+      else:
+        complete = False
+  earlier = later = peak = None
+  if not complete:
+    warnings.append("global minute histogram limit reached; peak and period counts unavailable")
+  elif minutes:
+    midpoint = (min(minutes) + max(minutes)) / 2
+    earlier = sum(count for bucket, count in minutes.items() if bucket <= midpoint)
+    later = sum(count for bucket, count in minutes.items() if bucket > midpoint)
+    peak = max(minutes.values())
   return AnalysisResult(
     target=results[0].target,
     boundary_bytes=sum(item.boundary_bytes for item in results),
@@ -507,13 +537,17 @@ def analyze_sources(path: str, options: AnalysisOptions, rotated: int) -> Analys
     severity_counts=tuple((name, severity[name]) for name in SEVERITIES),
     filtered_lines=sum(item.filtered_lines for item in results),
     timestamped_lines=sum(item.timestamped_lines for item in results),
-    duration_seconds=sum(durations) if durations else None,
-    peak_messages_per_minute=max(peaks, default=None),
+    duration_seconds=(last - first).total_seconds() if first is not None and last is not None else None,
+    peak_messages_per_minute=peak,
     sources=tuple(item.target for item in results),
     stack_trace_groups=sum(item.stack_trace_groups for item in results),
     stack_trace_lines=sum(item.stack_trace_lines for item in results),
-    earlier_period_messages=(sum(item.earlier_period_messages or 0 for item in results) if any(item.earlier_period_messages is not None for item in results) else None),
-    later_period_messages=(sum(item.later_period_messages or 0 for item in results) if any(item.later_period_messages is not None for item in results) else None),
+    earlier_period_messages=earlier,
+    later_period_messages=later,
+    first_timestamp=first,
+    last_timestamp=last,
+    minute_counts=tuple(sorted(minutes.items())),
+    minute_counts_complete=complete,
   )
 
 
@@ -628,7 +662,7 @@ def main(argv: Sequence[str] | None = None) -> int:
   conclusion = make_conclusion(status, result.target, finding, next_action)
   rate = None
   if result.duration_seconds is not None and result.duration_seconds > 0:
-    rate = result.analyzable_lines / result.duration_seconds
+    rate = result.timestamped_lines / result.duration_seconds
   record = OutputRecord(
     tool="loghound",
     status=status,

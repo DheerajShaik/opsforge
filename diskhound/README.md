@@ -15,6 +15,8 @@ diskhound PATH --cross-filesystems --json
 
 Traversal stays on the target device unless `--cross-filesystems` is explicit. Final and encountered symlinks are not followed.
 
+The global entry budget includes enumeration and metadata attempts, including excluded, cross-device, and inaccessible entries. Enumeration retains at most the remaining budget, with one extra directory entry used only to detect truncation. Retained children are sorted before processing; when a directory exceeds the budget, its retained subset depends on filesystem enumeration order. Already observed metadata is retained, further descent stops, and one global entry-limit warning marks the scan partial. An unexamined directory at the budget boundary is conservatively partial even if it might be empty. The per-directory ceiling still applies when the global limit is larger.
+
 ## Evidence and interpretation
 
 The report includes byte capacity and inode use for the target filesystem, target-directory allocation, unique observed allocation with hard-link de-duplication, top immediate branches, largest individual regular files, logical versus allocated bytes, sparse-file count, old-file count, suffix groups, visited/excluded/depth-limited counts, and inaccessible or raced entries.

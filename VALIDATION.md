@@ -1,90 +1,78 @@
 # OpsForge v0.2.0-beta.1 candidate validation
 
-Validation updated on 2026-09-14 for pull-request head `f3dc8775b4ad11e7ff3bc043a8217b43d70f3188`. This record distinguishes deterministic unit coverage, clean-install integration checks, and live environment observations. It is not a production-readiness claim or a substitute for independent review.
+Hardening validation updated on 2026-09-19 for PR #16, branch `feat/opsforge-v0.2`. This record separates executed tests from support policy and outstanding environments. It is not production certification or a formal security audit.
+
+## Candidate and release gate
+
+The hardening baseline is reviewed commit `96a61406b2350abe3cdbd0a655cc822cc0454cdc`. The final hardening commit and its CI results will be recorded here after the required matrix completes; baseline CI is not evidence that a changed head passed.
+
+The supported Beta platform is **CPython 3.10–3.14 on Ubuntu 24.04 LTS Linux**. Merge readiness requires the final-head five-version regression matrix, both wheel and sdist clean-install matrices, the completed WSL2 manual campaign plus targeted hardening revalidation, and final external merge review. No merge, tag, publication, or GitHub release is part of this task.
+
+The user's completed WSL2 manual campaign reported functional PASS across all ten utilities, negative/error scenarios, output/symlink/security scenarios, bounded-scale/interruption behavior, and a privilege comparison, with no product discrepancy observed in that environment. Its stricter NO-GO statement depended on additional native-host and Kubernetes campaigns. Those campaigns are **unvalidated environments**, not failed tests and not additional Beta merge gates: Kubernetes is outside the claimed Beta contract. GitHub Actions supplies native Ubuntu coverage, without implying manual production-host certification.
+
+The previous local record referenced `f3dc8775b4ad11e7ff3bc043a8217b43d70f3188`. A Git diff of all Python files between that commit and `96a61406...` is empty: the previously validated runtime matched the reviewed runtime. The new hardening changes require the regression and targeted revalidation below; the older manual results do not claim execution of the new code.
 
 ## Local environment
 
-- Ubuntu 24.04.1 LTS under WSL2
-- Linux 6.18.33.2-microsoft-standard-WSL2, x86_64
+- Ubuntu 24.04.1 LTS under WSL2, x86_64
+- Linux 6.18.33.2-microsoft-standard-WSL2
 - CPython 3.12.3
 - OpenSSL 3.0.13
-- systemd 255.4
-- iproute2 `ss` 6.1.0
+- systemd 255.4; iproute2 `ss` 6.1.0
 
-The real-world run below used CPython 3.12 in WSL2. The replacement-head GitHub Actions run separately passed on Ubuntu with CPython 3.10, 3.11, 3.12, 3.13, and 3.14.
+Only CPython 3.12 is installed locally. Other interpreter results must come from the hosted CI matrix.
 
-## Unit tested
+## Deterministic regression coverage
 
-All implementation modules compiled successfully. The replacement-head GitHub Actions matrix passed 451 tests on each supported interpreter:
+The final suite has 516 tests, preserving all 451 baseline tests and adding 65 regressions. Local CPython 3.12.3 compilation of shared code, all ten utilities, and tests passed; all 516 tests passed with no failures or skips. CI on this hardening head is pending.
 
 | Suite | Tests |
 | --- | ---: |
-| Shared output contract | 10 |
-| PortLens | 37 |
-| DiskHound | 46 |
-| CertWatch | 64 |
-| SvcDoctor | 52 |
-| LogHound | 39 |
-| ProcWatch | 28 |
-| ConfigDiff | 31 |
-| NetDoctor | 30 |
-| HealthCtl | 50 |
-| Incident Snapshot | 64 |
-| **Total** | **451** |
+| Shared output | 10 |
+| PortLens | 39 |
+| DiskHound | 51 |
+| CertWatch | 66 |
+| SvcDoctor | 63 |
+| LogHound | 49 |
+| ProcWatch | 34 |
+| ConfigDiff | 38 |
+| NetDoctor | 34 |
+| HealthCtl | 62 |
+| Incident Snapshot | 70 |
+| **Total** | **516** |
 
-Coverage includes legacy invocation paths and deterministic success/failure behavior, malformed input, bounds, partial observations, terminal-safe/JSON/brief/quiet output, safe output-file replacement, resolver de-duplication, PID identity, filesystem mutation cases, dependency cycles, subprocess timeout/output limits, and privacy-sensitive paths.
+New regressions cover descriptor-relative ConfigDiff traversal and deterministic same-filesystem/symlink replacement; DiskHound global enumeration/visit budgets at 1 and 10 entries against 2,000 files; ProcWatch auxiliary start-tick identity changes before, after, and during collection; dependency command/format/count/state failures with JSON null-versus-empty distinctions; IPv4/IPv6/loopback route context; global rotated timestamp/minute aggregation and bounded overflow; certificate candidate caps, fallback, trust/hostname failures, numeric hosts, expiry thresholds, total deadlines, and interrupts; explicit PortLens enrichment limitations; exited-helper process-group cleanup; and Incident Snapshot unavailable evidence.
 
-## Packaging and clean-install integration
+Shared regression coverage retains schema version 1, 16 MiB output limits, terminal sanitization, 0600 output creation, symlink/non-regular/hardlink rejection, force semantics, and subprocess interruption/timeout bounds. Runtime dependencies remain empty.
 
-`python -m build` successfully produced:
+## Targeted local integration
 
-- `opsforge-0.2.0b1.tar.gz`
-- `opsforge-0.2.0b1-py3-none-any.whl`
+Executed on 2026-09-19 against the hardened runtime:
 
-The replacement-head workflow clean-installed both the wheel and source distribution on every supported interpreter from outside the source tree. Metadata resolved as `opsforge 0.2.0b1`; all ten packages imported; every installed console command existed; every `--help` invocation exited 0; and `pip check` passed.
+- ConfigDiff: equal nested trees with explicitly compared directory symlinks.
+- DiskHound: 2,000-file fixture, `--max-entries 10`, exactly 10 visited entries, one global-limit failure, exit 1, 3,679-byte JSON output.
+- ProcWatch: live validation process, stable initial/final auxiliary evidence.
+- SvcDoctor: active `dbus.service` and observed dependencies; unavailable paths covered deterministically.
+- NetDoctor: successful local loopback listener; connection interface null and IPv4 default-route context separate.
+- LogHound: rotations eight hours apart produced a 28,801-second span; overlapping minute counts summed correctly.
+- HealthCtl certificate candidate/deadline/trust paths: deterministic controlled socket/resolver tests.
 
-Nine installed commands then completed local schema-version-1 JSON smoke checks with expected exit semantics:
+No public endpoints were contacted during this pass. Historical CertWatch controlled/public validation is retained in `certwatch/VALIDATION.md`; the new CertWatch change concerns interrupted socket/helper cleanup, not certificate interpretation.
 
-- DiskHound on a temporary directory
-- LogHound on a controlled two-line log
-- ConfigDiff on identical temporary files
-- HealthCtl with a root free-space criterion
-- ProcWatch against the live validation process
-- Incident Snapshot with the `full` profile
-- PortLens against a selected local port
-- NetDoctor against a selected refused/local endpoint
-- SvcDoctor against `dbus.service`
+## Packaging
 
-Every stdout document parsed as JSON and contained the shared schema/tool fields. The clean environment uninstalled OpsForge successfully, the installed command scripts disappeared, and the disposable environment was removed.
+Both `opsforge-0.2.0b1-py3-none-any.whl` and `opsforge-0.2.0b1.tar.gz` built successfully. Disposable CPython 3.12 environments outside the source tree passed metadata/version, empty runtime dependencies, imports, all ten commands and `--help`, nine installed schema-version-1 JSON smoke checks, `pip check`, and removal of every console script after uninstall. Final artifact rebuild and hosted matrix results are recorded when completed.
 
-## Real-world validated
+The nine JSON smoke commands are DiskHound, LogHound, ConfigDiff, HealthCtl, ProcWatch, Incident Snapshot, PortLens, NetDoctor, and SvcDoctor. Hosted SvcDoctor packaging smoke uses controlled systemd helper output; the targeted local service check used real systemd. CertWatch receives help/import checks and deterministic TLS tests, not unsolicited public-network packaging smoke.
 
-The following live surfaces were exercised on the environment above:
+## Limitations and unvalidated environments
 
-- Linux procfs/sysfs process, memory, load, PSI, cgroup, socket-table, route, and kernel scheduler sources
-- root filesystem capacity and inode metadata
-- local TCP refusal and `ss` listener inspection
-- systemd service state and failed-service collection
-- resolver and default-route context
-- bounded full-profile Incident Snapshot collection
-- one intentional public CertWatch request to `example.com:443`
+- Kubernetes/container orchestrators, other Linux distributions, alternative libc implementations, different namespace layouts, broad production filesystems, broad scale campaigns, and other systemd/OpenSSL/iproute2 versions are not claimed validated.
+- Native non-WSL manual production-host testing remains unperformed. Native Ubuntu GitHub Actions is a separate automated validation surface.
+- The earlier user-reported WSL privilege comparison does not establish general elevated-permission support; no new privilege escalation or elevated-permission campaign was performed.
+- No formal penetration test, formal security audit, or broad production certification was performed.
+- OS `getaddrinfo()` cannot be hard-cancelled. HTTP/certificate checks use one deadline across subsequent network operations; resolver time consumes that budget, but the resolver itself may overrun it.
+- Certificate revocation is not checked. Portable intermediate expiry inspection and semantic TOML remain deferred under the Python 3.10/standard-library-only boundary.
+- Filesystem, procfs, systemd, and socket evidence is live and non-atomic. PortLens explicitly cannot prove that later procfs metadata belongs to the exact process incarnation reported by `ss`.
 
-The public CertWatch validation returned `VALID` with TLS 1.3, a negotiated cipher, leaf/SAN/fingerprint/validity evidence, successful CA trust and hostname identity, and explicit `revocation_checked: false`. Chain count was unavailable on CPython 3.12 as documented. No other public target was contacted.
-
-These checks validate execution in this WSL environment only. They do not establish compatibility across distributions, namespace layouts, permission models, network policies, filesystems, systemd versions, OpenSSL versions, or all supported Python interpreters.
-
-## Deferred and limited validation
-
-- Semantic TOML is not implemented because CPython 3.10 lacks `tomllib` and the project retains no third-party runtime dependencies.
-- Portable intermediate-certificate expiry inspection is not implemented because CPython 3.10-3.12 lack a consistent public verified-chain certificate API.
-- Operating-system DNS resolution is not hard-cancellable through standard-library `getaddrinfo()`; socket/HTTP/TLS stages remain bounded.
-- No broad public-network, high-scale filesystem, container-orchestrator, non-WSL distribution, elevated-permission, or formal penetration test was performed.
-- GitHub Actions passed the CPython 3.10-3.14 full-suite and wheel/source-distribution clean-install gates on the replacement head.
-
-Manual real-world testing by the user remains the final release gate before any merge or tag.
-
-## Independent-review hardening gates
-
-The release workflow now requires both wheel and source-distribution clean installs on CPython 3.10, 3.11, 3.12, 3.13, and 3.14. Each artifact/interpreter job verifies metadata, imports, all ten console scripts, `pip check`, nine installed-command JSON smoke checks, and complete console-script removal after uninstall.
-
-Focused regressions additionally cover the stdout/file 16 MiB boundary, Unicode presentation-control escaping, proxy-independent HTTP routing, total post-resolution HTTP deadlines, bounded headers and redirects, CertWatch trusted-leaf fingerprint correlation, and termination/reaping of subprocess process groups on interruption. All replacement-head focused workflows and the 15-job release matrix passed.
+These limits are not failed compatibility tests. The Beta gate above is the single release-readiness policy; no additional full manual campaign is requested.

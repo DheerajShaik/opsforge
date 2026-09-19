@@ -20,6 +20,8 @@ Normalization removes valid leading RFC3339 timestamps and conservatively replac
 
 The report includes recurring pattern counts, severity counts, timestamp span, approximate message rate, peak timestamp-minute burst, bounded earlier/later-period counts, and recognized Python/Java-style stack-trace groups (maximum 256 recognized lines per group). Stack evidence counts/grouping do not reconstruct arbitrary multiline events or infer exception causes.
 
+Rotated sources share one earliest/latest timestamp range and merged minute counts. Overlapping minutes add their messages; gaps between rotations remain part of the observed span. Rate uses timestamped analyzed messages only. Earlier/later periods split the global minute range at its midpoint. Physical source order and line evidence remain current file, then numbered rotations. At most 10,000 distinct minute buckets are retained; overflow marks the analysis partial and makes peak/period counts unavailable, while the timestamp span remains available. Untimestamped messages still contribute to pattern and severity evidence.
+
 ## Output and exits
 
 Status is `OBSERVED` or `PARTIAL`. Exit 0 means the requested bounded input was analyzed, 1 means useful but incomplete evidence (including missing requested rotations), 2 means invalid target/invocation, 3 means no trustworthy analysis, and 130 means interrupted.

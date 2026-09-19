@@ -1,5 +1,7 @@
 # Incident Snapshot
 
+Failed systemd queries and unavailable IPv6 route reads make the affected section unavailable; they are never reported as a confirmed empty service/route result. Other trustworthy snapshot sections remain available.
+
 Incident Snapshot collects a bounded, privacy-conscious operational snapshot useful at the beginning of a Linux incident. The default `basic` profile preserves the v0.1 invocation and avoids process/network/service enumeration.
 
 ## Usage and profiles

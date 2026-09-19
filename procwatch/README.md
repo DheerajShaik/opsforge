@@ -17,6 +17,8 @@ PID is a strict decimal 1-2147483647. Interval is 0.1-60 seconds (default 1). `-
 
 Every main sample is anchored to a no-follow `/proc/PID` directory and checks the stat PID/start-time identity. Exit, replacement, malformed procfs evidence, or PID reuse produces partial/error semantics instead of silently joining different processes.
 
+Auxiliary collection is bracketed by start-tick checks on the same open procfs descriptor. Both initial and final auxiliary identities must match the main analysis identity; mismatches discard the affected sample with a warning. Initial cgroup context is also discarded on an identity mismatch. No auxiliary delta is calculated without two correlated samples. This does not make individual procfs fields an atomic snapshot.
+
 Main evidence includes state, parent PID, thread count, CPU ticks and elapsed/normalized CPU use, virtual size, resident pages/bytes, and memory change. Best-effort initial/final auxiliary evidence adds FD/socket counts, read/write bytes, voluntary/nonvoluntary context switches, up to 256 child PIDs, and up to 256 thread CPU counters. Procfs enumeration is capped at 100,000 FD entries. Cgroup v2 path, `cpu.max`, and `memory.max` are read when visible.
 
 Growth wording is deliberately observational: memory or FD increases do not establish a leak. CPU percentage is bounded-sample evidence, not a scheduler or health verdict.

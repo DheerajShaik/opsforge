@@ -502,10 +502,7 @@ def collect_routes(reader: Callable[[str, int], bytes] = read_bounded_ascii) -> 
       raise SectionUnavailable("malformed route data")
     if fields[1] == "00000000" and fields[7] == "00000000":
       routes.append({"family": "IPv4", "interface": display_safe(_safe_interface_name(fields[0])), "gateway": _ipv4_from_proc_hex(fields[2])})
-  try:
-    ipv6_data = reader(IPV6_ROUTE_PATH, SECTION_MAX_BYTES).decode("ascii")
-  except SectionUnavailable:
-    ipv6_data = ""
+  ipv6_data = reader(IPV6_ROUTE_PATH, SECTION_MAX_BYTES).decode("ascii")
   ipv6_lines = ipv6_data.splitlines()
   if len(ipv6_lines) > MAX_ROUTES:
     raise SectionUnavailable("route count exceeds limit")
@@ -612,10 +609,10 @@ def _stop_process_group(process: subprocess.Popen[bytes]) -> None:
     running = process.poll() is None
   except OSError:
     running = False
-  if running:
-    try:
-      os.killpg(process.pid, signal.SIGKILL)
-    except OSError:
+  try:
+    os.killpg(process.pid, signal.SIGKILL)
+  except OSError:
+    if running:
       try:
         process.kill()
       except OSError:
@@ -637,11 +634,11 @@ def run_bounded_command(arguments: Sequence[str], *, timeout: float, limit: int)
     raise SectionUnavailable("command unavailable") from error
   assert process.stdout is not None
   descriptor = process.stdout.fileno()
-  os.set_blocking(descriptor, False)
   deadline = time.monotonic() + timeout
   chunks = []
   observed = 0
   try:
+    os.set_blocking(descriptor, False)
     while True:
       if time.monotonic() >= deadline:
         raise SectionUnavailable("command timed out")
@@ -665,10 +662,13 @@ def run_bounded_command(arguments: Sequence[str], *, timeout: float, limit: int)
     remaining = max(0.01, deadline - time.monotonic())
     return process.wait(timeout=remaining), b"".join(chunks)
   except subprocess.TimeoutExpired as error:
+    _stop_process_group(process)
     raise SectionUnavailable("command timed out") from error
+  except BaseException:
+    _stop_process_group(process)
+    raise
   finally:
     process.stdout.close()
-    _stop_process_group(process)
 
 
 def collect_failed_services() -> tuple[str, ...]:
@@ -679,12 +679,18 @@ def collect_failed_services() -> tuple[str, ...]:
     )
   except SectionUnavailable as error:
     raise SectionUnavailable("systemd observation unavailable") from error
-  if return_code not in {0, 1}:
+  if return_code != 0:
     raise SectionUnavailable("systemd observation failed")
   services = []
-  for line in stdout.decode("utf-8", errors="replace").splitlines()[:64]:
+  try:
+    lines = stdout.decode("utf-8", errors="strict").splitlines()
+  except UnicodeDecodeError as error:
+    raise SectionUnavailable("malformed systemd response") from error
+  for line in lines[:64]:
     fields = line.split()
     if fields:
+      if len(fields) < 4 or not fields[0].endswith(".service") or fields[2] != "failed":
+        raise SectionUnavailable("malformed systemd response")
       services.append(display_safe(fields[0][:256]))
   return tuple(services)
 

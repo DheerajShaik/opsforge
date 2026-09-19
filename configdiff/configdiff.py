@@ -175,9 +175,9 @@ def _open_flags() -> int:
   return flags
 
 
-def open_regular_file(path: str, label: str) -> tuple[int, os.stat_result]:
+def open_regular_file(path: str, label: str, *, dir_fd: int | None = None) -> tuple[int, os.stat_result]:
   try:
-    descriptor = os.open(path, _open_flags())
+    descriptor = os.open(path, _open_flags(), dir_fd=dir_fd)
   except (OSError, ValueError) as error:
     raise InvalidTargetError(
       f"cannot open {label} file {display_safe(path)}: {display_safe(error)}"
@@ -412,55 +412,72 @@ def collect_directory(path: str, *, max_files: int, max_depth: int, symlinks: bo
     raise InvalidTargetError(f"cannot inspect directory {display_safe(root)}: {display_safe(error)}") from error
   if stat.S_ISLNK(root_metadata.st_mode) or not stat.S_ISDIR(root_metadata.st_mode):
     raise InvalidTargetError(f"directory target is not a non-symlink directory: {display_safe(root)}")
-  pending = [(root, 0)]
+  flags = _open_flags() | getattr(os, "O_DIRECTORY", 0)
+  try:
+    root_fd = os.open(root, flags)
+  except OSError as error:
+    raise InvalidTargetError(f"cannot open directory {display_safe(root)}: {display_safe(error)}") from error
   entries = []
-  while pending:
-    directory, depth = pending.pop()
-    try:
-      with os.scandir(directory) as iterator:
-        children = []
-        for child in iterator:
-          if len(entries) + len(children) >= max_files:
-            raise ObservationError(f"directory comparison exceeded the {max_files}-entry limit")
-          children.append(child)
-        children.sort(key=lambda item: os.fsencode(item.name))
-    except OSError as error:
-      raise ObservationError(f"cannot enumerate directory {display_safe(directory)}: {display_safe(error)}") from error
-    for child in children:
-      relative = os.path.relpath(child.path, root)
-      try:
-        metadata = child.stat(follow_symlinks=False)
-      except OSError as error:
-        raise ObservationError(f"cannot inspect directory entry {display_safe(relative)}: {display_safe(error)}") from error
+  observed = 0
+
+  def verify_directory(descriptor: int, expected: os.stat_result) -> None:
+    opened = os.fstat(descriptor)
+    if not stat.S_ISDIR(opened.st_mode) or (opened.st_dev, opened.st_ino) != (expected.st_dev, expected.st_ino):
+      raise ObservationError("directory identity changed during comparison")
+
+  def visit(descriptor: int, prefix: str, depth: int) -> None:
+    nonlocal observed
+    children = []
+    with os.scandir(descriptor) as iterator:
+      for child in iterator:
+        if observed >= max_files:
+          raise ObservationError(f"directory comparison exceeded the {max_files}-entry limit")
+        observed += 1
+        metadata = os.stat(child.name, dir_fd=descriptor, follow_symlinks=False)
+        children.append((child.name, metadata))
+    for name, metadata in sorted(children, key=lambda item: os.fsencode(item[0])):
+      relative = os.path.join(prefix, name)
       if metadata.st_dev != root_metadata.st_dev:
         continue
-      if len(entries) >= max_files:
-        raise ObservationError(f"directory comparison exceeded the {max_files}-entry limit")
       if stat.S_ISLNK(metadata.st_mode):
         target = None
         if symlinks:
-          try:
-            target = os.readlink(child.path)
-          except OSError as error:
-            raise ObservationError(f"cannot read symlink {display_safe(relative)}: {display_safe(error)}") from error
+          target = os.readlink(name, dir_fd=descriptor)
+          current = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
+          if metadata_identity(current) != metadata_identity(metadata):
+            raise ObservationError(f"symlink changed during comparison: {display_safe(relative)}")
         entries.append(DirectoryEntry(relative, "symlink", 0, None, stat.S_IMODE(metadata.st_mode), metadata.st_uid, metadata.st_gid, target))
       elif stat.S_ISDIR(metadata.st_mode):
         entries.append(DirectoryEntry(relative, "directory", 0, None, stat.S_IMODE(metadata.st_mode), metadata.st_uid, metadata.st_gid, None))
         if depth < max_depth:
-          pending.append((child.path, depth + 1))
+          child_fd = os.open(name, flags, dir_fd=descriptor)
+          try:
+            verify_directory(child_fd, metadata)
+            visit(child_fd, relative, depth + 1)
+          finally:
+            os.close(child_fd)
       elif stat.S_ISREG(metadata.st_mode):
-        descriptor, opened = open_regular_file(child.path, "directory entry")
+        file_fd, opened = open_regular_file(name, "directory entry", dir_fd=descriptor)
         try:
-          data = read_exact_snapshot(descriptor, opened, "directory entry")
-          verify_unchanged(descriptor, opened, "directory entry")
+          if metadata_identity(opened) != metadata_identity(metadata):
+            raise ObservationError(f"file changed during comparison: {display_safe(relative)}")
+          data = read_exact_snapshot(file_fd, opened, "directory entry")
+          verify_unchanged(file_fd, opened, "directory entry")
         finally:
-          os.close(descriptor)
+          os.close(file_fd)
         entries.append(DirectoryEntry(
           relative, "file", len(data), hashlib.sha256(data).hexdigest(),
           stat.S_IMODE(opened.st_mode), opened.st_uid, opened.st_gid, None,
         ))
       else:
         entries.append(DirectoryEntry(relative, "special", 0, None, stat.S_IMODE(metadata.st_mode), metadata.st_uid, metadata.st_gid, None))
+  try:
+    verify_directory(root_fd, root_metadata)
+    visit(root_fd, "", 0)
+  except (OSError, InvalidTargetError) as error:
+    raise ObservationError(f"cannot observe directory {display_safe(root)}: {display_safe(error)}") from error
+  finally:
+    os.close(root_fd)
   return root, tuple(sorted(entries, key=lambda item: os.fsencode(item.relative_path)))
 
 

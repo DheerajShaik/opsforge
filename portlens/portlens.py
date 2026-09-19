@@ -263,7 +263,8 @@ def _stop_process(process: subprocess.Popen[bytes]) -> None:
     running = process.poll() is None
   except OSError:
     running = False
-  if running and isinstance(pid, int):
+  # A helper may exit while descendants still hold its output pipes open.
+  if isinstance(pid, int):
     try:
       os.killpg(pid, signal.SIGKILL)
       killed_group = True
@@ -296,10 +297,10 @@ def run_ss_query(executable: str, arguments: Sequence[str]) -> str:
     raise PortLensError("could not execute 'ss'")
   streams = {process.stdout: bytearray(), process.stderr: bytearray()}
   selector = selectors.DefaultSelector()
-  selector.register(process.stdout, selectors.EVENT_READ)
-  selector.register(process.stderr, selectors.EVENT_READ)
   deadline = time.monotonic() + SS_TIMEOUT_SECONDS
   try:
+    selector.register(process.stdout, selectors.EVENT_READ)
+    selector.register(process.stderr, selectors.EVENT_READ)
     while selector.get_map():
       remaining = deadline - time.monotonic()
       if remaining <= 0:
@@ -389,7 +390,7 @@ def _read_proc_text(path: str) -> str:
 
 
 def process_details(reference: ProcessReference) -> tuple[str, str, str, str, str, str, str]:
-  """Read bounded, non-command-line process metadata from procfs."""
+  """Collect live, non-atomic metadata; ss alone supplies the socket/PID association."""
   user, process = enrich_process(reference)
   proc_path = f"/proc/{reference.pid}"
   try:
@@ -503,6 +504,7 @@ def render_result(port: int | str, observations: Sequence[DisplayObservation], *
   lines = [
     f"PortLens: local port {port}",
     f"Scope: {protocol.upper()} local sockets visible in the current network namespace",
+    "Process enrichment: live, non-atomic, best-effort; PID reuse can make later /proc metadata refer to another process. Socket/PID associations come from ss.",
     "",
   ]
   if not observations:
@@ -651,6 +653,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     status=status,
     target=target,
     observations={
+      "process_enrichment": "live, non-atomic, best-effort; socket/PID association from ss; later /proc metadata may belong to a reused PID",
       "protocol": protocol,
       "families": list(families),
       "watch_count": watch_count,
@@ -659,7 +662,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     },
     conclusion=conclusion,
     next_action=next_action + ".",
-    warnings=("Process metadata may be unavailable without sufficient procfs permissions.",),
+    warnings=("Process metadata is live, non-atomic, and best-effort; PID reuse or procfs permissions can invalidate enrichment.",),
     elapsed_seconds=elapsed,
   )
   try:

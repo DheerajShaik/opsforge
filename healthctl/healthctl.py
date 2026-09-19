@@ -776,11 +776,11 @@ def validate_redirect_url(current_url: str, new_url: str) -> str:
 def _deadline_remaining(deadline: float, clock: Callable[[], float]) -> float:
   remaining = deadline - clock()
   if remaining <= 0:
-    raise TimeoutError("HTTP check exceeded its total deadline")
+    raise TimeoutError("network check exceeded its total deadline")
   return remaining
 
 
-def _connect_http_target(
+def _connect_tcp_target(
   host: str,
   host_kind: str,
   port: int,
@@ -790,23 +790,26 @@ def _connect_http_target(
   socket_factory: Callable[[int, int, int], socket.socket],
   clock: Callable[[], float],
 ) -> socket.socket:
-  check = TcpConnectCheck("http", host, host_kind, port, 0.1)
+  check = TcpConnectCheck("network", host, host_kind, port, 0.1)
   candidates = resolve_tcp_candidates(check, resolver=resolver)
   if not candidates:
     raise socket.gaierror("name resolution returned no usable address")
   last_error: OSError | None = None
   for candidate in candidates:
+    remaining = _deadline_remaining(deadline, clock)
     client = socket_factory(candidate.family, candidate.socket_type, candidate.protocol)
     try:
-      client.settimeout(_deadline_remaining(deadline, clock))
+      client.settimeout(remaining)
       client.connect(candidate.sockaddr)
       return client
-    except OSError as error:
-      last_error = error
+    except BaseException as error:
       try:
         client.close()
       except OSError:
         pass
+      if not isinstance(error, OSError):
+        raise
+      last_error = error
   if last_error is not None:
     raise last_error
   raise OSError("no TCP candidate was attempted")
@@ -848,7 +851,7 @@ def _one_http_head(
   assert parsed.hostname is not None
   host, host_kind = parse_host(parsed.hostname, "HTTP URL host")
   port = parsed.port or (443 if parsed.scheme == "https" else 80)
-  client = _connect_http_target(
+  client = _connect_tcp_target(
     host, host_kind, port, deadline,
     resolver=resolver, socket_factory=socket_factory, clock=clock,
   )
@@ -955,10 +958,10 @@ def hash_regular_file(path: str, expected_metadata: os.stat_result) -> str:
 
 def _stop_process_group(process: subprocess.Popen[bytes]) -> None:
   running = process.poll() is None
-  if running:
-    try:
-      os.killpg(process.pid, signal.SIGKILL)
-    except (OSError, ProcessLookupError):
+  try:
+    os.killpg(process.pid, signal.SIGKILL)
+  except OSError:
+    if running:
       try:
         process.kill()
       except OSError:
@@ -1030,16 +1033,23 @@ def run_generic_check(check: GenericCheck) -> CheckResult:
   if check.type == "certificate_expiry":
     host, port = str(options["host"]), int(options["port"])
     try:
+      deadline = time.monotonic() + check.timeout_seconds
       context = ssl.create_default_context()
-      with socket.create_connection((host, port), timeout=check.timeout_seconds) as tcp:
+      _, host_kind = parse_host(host, "certificate host")
+      with _connect_tcp_target(
+        host, host_kind, port, deadline, resolver=socket.getaddrinfo,
+        socket_factory=socket.socket, clock=time.monotonic,
+      ) as tcp:
+        tcp.settimeout(_deadline_remaining(deadline, time.monotonic))
         with context.wrap_socket(tcp, server_hostname=host) as tls:
           certificate = tls.getpeercert()
+          _deadline_remaining(deadline, time.monotonic)
       not_after = certificate.get("notAfter")
       if not isinstance(not_after, str):
         raise ValueError
       remaining = ssl.cert_time_to_seconds(not_after) - time.time()
-    except (OSError, ssl.SSLError, ValueError):
-      return CheckResult(check.name, check.type, "ERROR", check.target, "trusted TLS certificate observation failed", "CRITICAL")
+    except (OSError, ssl.SSLError, ValueError, ObservationError):
+      return CheckResult(check.name, check.type, "ERROR", check.target, "trusted TLS certificate observation failed; revocation not checked", "CRITICAL")
     days = remaining / 86400
     critical, warn = int(options["critical_days"]), int(options["warn_days"])
     if days < critical:

@@ -516,17 +516,27 @@ def collect_cgroup_context(directory_fd: int) -> tuple[str | None, str | None, s
 def observe_extended(pid: int, interval: float, sample_count: int) -> ExtendedResult:
   warnings = []
   initial_aux = None
+  initial_identity = None
   cgroup = cpu_constraint = memory_constraint = None
   try:
     descriptor = open_process_directory(pid)
     try:
+      initial_identity = capture_sample(descriptor, pid).start_ticks
       initial_aux = capture_auxiliary(descriptor, pid)
       cgroup, cpu_constraint, memory_constraint = collect_cgroup_context(descriptor)
+      if capture_sample(descriptor, pid).start_ticks != initial_identity:
+        raise ProcReadError("process identity mismatch during initial auxiliary collection")
     finally:
       os.close(descriptor)
-  except (InvalidTargetError, OSError) as error:
+  except (InvalidTargetError, ProcReadError, OSError) as error:
+    initial_aux = None
+    cgroup = cpu_constraint = memory_constraint = None
     warnings.append(f"initial auxiliary evidence unavailable: {display_safe(error)}")
   analysis = observe_samples(pid, interval, sample_count=sample_count)
+  if initial_identity is not None and initial_identity != analysis.initial.start_ticks:
+    initial_aux = None
+    cgroup = cpu_constraint = memory_constraint = None
+    warnings.append("initial auxiliary evidence discarded because of process identity mismatch")
   final_aux = None
   if not analysis.incomplete:
     try:
@@ -535,11 +545,14 @@ def observe_extended(pid: int, interval: float, sample_count: int) -> ExtendedRe
         current = capture_sample(descriptor, pid)
         if current.start_ticks == analysis.initial.start_ticks:
           final_aux = capture_auxiliary(descriptor, pid)
+          if capture_sample(descriptor, pid).start_ticks != analysis.initial.start_ticks:
+            raise ProcReadError("process identity mismatch during final auxiliary collection")
         else:
-          warnings.append("auxiliary evidence discarded because process identity changed")
+          warnings.append("final auxiliary evidence discarded because of process identity mismatch")
       finally:
         os.close(descriptor)
     except (InvalidTargetError, ProcReadError, OSError) as error:
+      final_aux = None
       warnings.append(f"final auxiliary evidence unavailable: {display_safe(error)}")
   return ExtendedResult(analysis, initial_aux, final_aux, cgroup, cpu_constraint, memory_constraint, tuple(warnings))
 

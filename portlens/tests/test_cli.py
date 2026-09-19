@@ -15,6 +15,23 @@ import portlens
 
 
 class CliTests(unittest.TestCase):
+  def test_exited_helper_still_terminates_descendants_and_reaps(self):
+    process = mock.Mock(pid=12345)
+    process.poll.return_value = 0
+    with mock.patch.object(portlens.os, 'killpg') as killpg:
+      portlens._stop_process(process)
+    killpg.assert_called_once_with(12345, portlens.signal.SIGKILL)
+    process.wait.assert_called_once_with(timeout=1.0)
+
+  def test_enrichment_caveat_in_human_and_json_output(self):
+    self.assertIn('non-atomic', portlens.render_result(8080, []))
+    with mock.patch.object(portlens, 'inspect_selection', return_value=('report', [], 1)):
+      code, stdout, stderr = self.run_main(['8080', '--json'])
+    self.assertEqual(code, 1)
+    result = json.loads(stdout)
+    self.assertIn('socket/PID association from ss', result['observations']['process_enrichment'])
+    self.assertIn('PID reuse', result['warnings'][0])
+
   def run_main(self, arguments):
     stdout = io.StringIO()
     stderr = io.StringIO()

@@ -20,7 +20,7 @@ Every check has `name`, `type`, optional `severity` (`WARN` or `CRITICAL`, defau
 - `tcp_connect`: strict `host`, `port` 1-65535, optional `timeout_seconds` 0.1-5 (default 1); at most 16 resolver candidates.
 - `http` / `https`: credential-free same-scheme ASCII `url` (at most 2,048 characters) without query or fragment, optional exact `expected_status` 100-599 (default 200), and total post-resolution deadline 0.1-5 seconds. Uses a proxy-free HEAD request, default HTTPS trust/identity verification, at most 64 KiB of response headers, and at most three same-origin/same-transport redirects without query or fragment; no authorization header or response body is sent/read.
 - `dns`: strict `host`, with at most 16 unique addresses. OS resolution has no safe cancellable standard-library timeout.
-- `certificate_expiry`: `host`, optional `port` (443), timeout, `warn_days` (30), and `critical_days` (7). The handshake uses default trust and hostname verification; revocation is not checked.
+- `certificate_expiry`: `host`, optional `port` (443), timeout 0.1-5 seconds, `warn_days` (30), and `critical_days` (7). Uses the same validated resolver/candidate path as TCP/HTTP, at most 16 distinct candidates, and one deadline shared across connection attempts and TLS. The handshake uses default CA trust, hostname verification, and appropriate SNI; revocation is not checked. No proxies are used.
 - `process`: positive `pid`; checks only that the procfs process directory is observable.
 - `systemd_service`: concrete `service` and timeout; checks `systemctl is-active` without capturing output.
 - `file_exists`: `path`, refusing final symlinks.
@@ -43,6 +43,8 @@ Example:
 ## Execution, output, and exits
 
 Ready checks run in dependency layers with at most eight workers; configuration order is preserved in output. A failed/error dependency skips dependents visibly. Retries apply only within the configured bound.
+
+HTTP(S) and certificate deadlines start before resolution; time spent resolving consumes the available connection/TLS budget. The OS resolver itself cannot be hard-cancelled and may overrun that deadline. Once control returns, expired budgets prevent further network attempts. HTTP redirects also share the same deadline. TCP-only checks retain their documented per-candidate timeouts.
 
 Passing checks have severity `OK`; negative results retain `WARN`/`CRITICAL`, while observation errors are critical. Aggregate status is `OK`, `WARN`, or `CRITICAL`. Exit 0 means all selected checks passed, 1 means at least one failed with no error, 2 means invalid configuration/invocation, 3 means at least one error or an execution/output failure, and 130 means interrupted.
 

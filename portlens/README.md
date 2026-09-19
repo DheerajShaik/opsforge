@@ -19,7 +19,7 @@ PortLens calls `ss` separately for selected IPv4/IPv6 families. The command is s
 
 Wildcard binds mean all local interfaces visible in this namespace; loopback binds are local-only. Multiple rows for the same protocol/family/address/port are reported as a likely shared/reused bind group. This can reflect `SO_REUSEPORT`, multiple owners, or duplicate kernel reporting and is not proof of a conflict.
 
-Procfs enrichment is mutable and permission-dependent. PortLens never reads process command lines or environments and cannot exclude PID reuse between `ss` collection and enrichment.
+Procfs enrichment is live, non-atomic, best-effort, and permission-dependent, as stated in human output and the JSON `process_enrichment` field. `ss` supplies the socket/PID association. A later `/proc/PID` read may refer to another process if the PID has been reused; the enrichment is not proof of atomic ownership. PortLens never reads process command lines or environments.
 
 ## Output and exit codes
 

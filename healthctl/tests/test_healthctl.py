@@ -464,6 +464,7 @@ class HealthCtlTests(unittest.TestCase):
     )
 
     class CertificateSocket:
+      def settimeout(self, timeout): pass
       def __enter__(self): return self
       def __exit__(self, *args): pass
     class Tls(CertificateSocket):
@@ -474,7 +475,7 @@ class HealthCtlTests(unittest.TestCase):
       "certificate", "certificate_expiry", "example.com:443", 1.0,
       options=(("host", "example.com"), ("port", 443), ("warn_days", 30), ("critical_days", 7)),
     )
-    with mock.patch.object(healthctl.socket, "create_connection", return_value=CertificateSocket()), mock.patch.object(
+    with mock.patch.object(healthctl, "_connect_tcp_target", return_value=CertificateSocket()), mock.patch.object(
       healthctl.ssl, "create_default_context", return_value=Context(),
     ):
       self.assertEqual(healthctl.run_generic_check(certificate).status, "PASS")

@@ -271,6 +271,9 @@ def _connect(candidates: list[ConnectionCandidate], socket_factory=socket.socket
             sock.close()
         except OSError:
             sock.close()
+        except BaseException:
+            sock.close()
+            raise
     if timed_out == len(candidates):
         raise CertWatchError("TCP connection timed out")
     raise CertWatchError("TCP connection failed")
@@ -369,7 +372,8 @@ def _stop_decoder(proc: subprocess.Popen[bytes]) -> None:
         running = proc.poll() is None
     except OSError:
         running = False
-    if running and isinstance(pid, int):
+    # A helper may exit while descendants still hold its output pipes open.
+    if isinstance(pid, int):
         try:
             os.killpg(pid, signal.SIGKILL)
             killed_group = True

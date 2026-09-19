@@ -119,6 +119,8 @@ class ScanAccumulator:
   options: ScanOptions
   target: str
   visited_entries: int = 0
+  enumerated_entries: int = 0
+  entry_limit_reached: bool = False
   excluded_entries: int = 0
   depth_limited_directories: int = 0
   old_file_count: int = 0
@@ -293,8 +295,12 @@ def _open_directory(path: str) -> int:
 def list_directory(
   path: str,
   expected: os.stat_result | None = None,
+  accumulator: ScanAccumulator | None = None,
 ) -> tuple[list[ObservedEntry], list[ObservationFailure]]:
   """Inspect direct children relative to a no-follow directory descriptor."""
+  if accumulator is not None and accumulator.enumerated_entries >= accumulator.options.max_entries:
+    accumulator.entry_limit_reached = True
+    return [], []
   descriptor = _open_directory(path)
   try:
     opened = os.fstat(descriptor)
@@ -306,6 +312,11 @@ def list_directory(
     failures = []
     with os.scandir(descriptor) as iterator:
       for entry in iterator:
+        if accumulator is not None:
+          if accumulator.enumerated_entries >= accumulator.options.max_entries:
+            accumulator.entry_limit_reached = True
+            break
+          accumulator.enumerated_entries += 1
         if len(entries) + len(failures) >= MAX_DIRECTORY_ENTRIES:
           failures.append(ObservationFailure(
             path, "entry-limit", f"directory exceeded {MAX_DIRECTORY_ENTRIES} entries",
@@ -318,6 +329,7 @@ def list_directory(
           failures.append(ObservationFailure(child_path, "metadata", str(error)))
         else:
           entries.append(ObservedEntry(child_path, metadata))
+    entries.sort(key=lambda item: path_sort_key(item.path))
     return entries, failures
   finally:
     os.close(descriptor)
@@ -342,9 +354,7 @@ def _scan_branch(
     metadata = entry.metadata
     if accumulator is not None:
       if accumulator.visited_entries >= accumulator.options.max_entries:
-        failures.append(ObservationFailure(
-          entry.path, "entry-limit", f"scan stopped at {accumulator.options.max_entries} entries",
-        ))
+        accumulator.entry_limit_reached = True
         break
       accumulator.visited_entries += 1
       relative = os.path.relpath(entry.path, accumulator.target)
@@ -401,12 +411,12 @@ def _scan_branch(
         accumulator.depth_limited_directories += 1
         continue
       try:
-        children, child_failures = list_directory(entry.path, metadata)
+        children, child_failures = list_directory(entry.path, metadata, accumulator)
       except OSError as error:
         failures.append(ObservationFailure(entry.path, "enumeration", str(error)))
       else:
         failures.extend(child_failures)
-        pending.extend((child, depth + 1) for child in children)
+        pending.extend((child, depth + 1) for child in reversed(children))
   return total, new_global_total, failures, logical_total, file_count
 
 
@@ -432,8 +442,9 @@ def validate_target(path: str) -> tuple[str, os.stat_result]:
 def scan(path: str, options: ScanOptions | None = None) -> ScanResult:
   options = ScanOptions() if options is None else options
   target, target_metadata = validate_target(path)
+  accumulator = ScanAccumulator(options, target)
   try:
-    immediate, initial_failures = list_directory(target, target_metadata)
+    immediate, initial_failures = list_directory(target, target_metadata, accumulator)
   except OSError as error:
     raise DiagnosticError(
       f"could not enumerate target {display_safe(target)}: {display_safe(error)}"
@@ -461,7 +472,6 @@ def scan(path: str, options: ScanOptions | None = None) -> ScanResult:
     capacity_warning = f"filesystem capacity unavailable: {display_safe(error)}"
 
   failures = list(initial_failures)
-  accumulator = ScanAccumulator(options, target)
   target_allocation = None
   unique_total = 0
   target_identity = (target_metadata.st_dev, target_metadata.st_ino)
@@ -485,6 +495,9 @@ def scan(path: str, options: ScanOptions | None = None) -> ScanResult:
 
   branches = []
   for entry in eligible:
+    if accumulator.visited_entries >= options.max_entries:
+      accumulator.entry_limit_reached = True
+      break
     if options.max_depth == 0:
       accumulator.depth_limited_directories += int(stat.S_ISDIR(entry.metadata.st_mode))
       continue
@@ -494,6 +507,11 @@ def scan(path: str, options: ScanOptions | None = None) -> ScanResult:
     failures.extend(branch_failures)
     branches.append(BranchResult(entry.path, total, logical_total, file_count))
     unique_total += new_global_total
+
+  if accumulator.entry_limit_reached:
+    failures.append(ObservationFailure(
+      target, "entry-limit", f"scan stopped at the global {options.max_entries}-entry budget",
+    ))
 
   branches.sort(key=lambda branch: (-branch.allocated_bytes, path_sort_key(branch.path)))
   return ScanResult(

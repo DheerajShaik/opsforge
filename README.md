@@ -69,7 +69,9 @@ The complete Beta packaging and regression evidence is recorded in [VALIDATION.m
 
 ### May work but unvalidated
 
-Other Linux distributions, non-WSL deployments, other systemd/iproute2/OpenSSL versions, alternative libc implementations, and Python implementations other than CPython may work but are not claimed as supported or validated for this Beta. Windows and macOS are not supported execution platforms. NetDoctor and parts of HealthCtl use broadly available socket APIs, but the packaged project support policy remains Linux-only.
+Kubernetes/container orchestrators, other Linux distributions, alternative libc implementations, different namespace layouts, and other systemd/iproute2/OpenSSL versions may work but are not claimed as validated for this Beta. Native Ubuntu 24.04 is exercised by GitHub Actions; manual validation is limited to WSL2 Ubuntu 24.04 and does not certify broad non-WSL production deployments. Python implementations other than CPython, Windows, and macOS are not supported execution platforms. NetDoctor and parts of HealthCtl use broadly available socket APIs, but the packaged project support policy remains Linux-only.
+
+The Beta merge gate is final-head CPython 3.10–3.14 regression and wheel/sdist clean-install CI, completed WSL manual validation plus targeted hardening revalidation, and final external merge review. A separate Kubernetes or native production-host manual campaign is not a Beta merge requirement. See [VALIDATION.md](VALIDATION.md) for executed checks and honest limitations.
 
 Utility requirements remain distinct:
 

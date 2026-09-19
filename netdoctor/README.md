@@ -15,7 +15,9 @@ Host is a strict ASCII DNS-style name or unbracketed IPv4/IPv6 literal; port is 
 
 ## Evidence and network activity
 
-NetDoctor times the OS resolver and each TCP attempt, suppresses exact duplicate candidates, and accepts at most 16 distinct IPv4/IPv6 results. It reports candidate/peer endpoints, selected local source IP, default IPv4 route/gateway, inferred interface, nameservers from bounded `/etc/resolv.conf`, and only the names—not values—of recognized proxy environment variables.
+NetDoctor times the OS resolver and each TCP attempt, suppresses exact duplicate candidates, and accepts at most 16 distinct IPv4/IPv6 results. It reports candidate/peer endpoints, selected local source IP, IPv4 default-route context, nameservers from bounded `/etc/resolv.conf`, and only the names—not values—of recognized proxy environment variables.
+
+The IPv4 default-route gateway/interface is context only: policy routes, IPv6, VPNs, subnet routes, and namespaces can select a different path. It does not establish the successful connection's interface, even for loopback. JSON uses `ipv4_default_route_context`; `selected_interface` remains `null`, and human output calls the connection interface unavailable. No route interface is inferred from a successful TCP connection.
 
 Network/host-unreachable outcomes are classified at the route stage; other failures remain resolution, TCP, or TLS stage evidence. Optional TLS performs one additional targeted handshake to the successful candidate, reports version/cipher/time, intentionally disables certificate trust and identity verification, sends no application data, and explicitly does not assess revocation or application readiness.
 

@@ -28,6 +28,6 @@ Status is `UNCHANGED` or `DRIFT`. Exit 0 means no difference under the selected 
 
 ## Security and limitations
 
-Final file targets use no-follow descriptors and are rechecked for identity/size/time changes. Directory trees are live and cannot be atomic; raced entries fail visibly. Paths, hashes, metadata, link targets, and explicit unified content can be sensitive. No remediation or baseline creation occurs.
+Final file targets use no-follow descriptors and are rechecked for identity/size/time changes. Directory traversal is anchored to open no-follow directory descriptors; child opens are relative to their parent descriptor and checked against the observed device/inode before descent. Regular files are identity-checked before reading, and optional symlink text is rechecked after reading. Root symlinks are refused. Directory trees are live and cannot be atomic; detected replacement races fail visibly. Paths, hashes, metadata, link targets, and explicit unified content can be sensitive. No remediation or baseline creation occurs.
 
 Semantic TOML is deferred because supported CPython 3.10 has no `tomllib`; adding a third-party runtime parser solely for this mode would violate the dependency policy. YAML and format-guessing are intentionally absent.
