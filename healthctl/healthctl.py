@@ -317,7 +317,7 @@ COMMON_CHECK_FIELDS = {"severity", "group", "profile", "depends_on", "retries"}
 
 def _common_check_fields(check: Mapping[str, object], context: str) -> dict[str, object]:
   severity = check.get("severity", "CRITICAL")
-  if severity not in {"WARN", "CRITICAL"}:
+  if not isinstance(severity, str) or severity not in {"WARN", "CRITICAL"}:
     raise ConfigError(f"{context}.severity must be WARN or CRITICAL")
   group_value = check.get("group", "default")
   profile_value = check.get("profile", "default")
@@ -428,7 +428,8 @@ def parse_config_document(document: object, *, path: str) -> HealthConfig:
       except ValueError as error:
         raise ConfigError(f"{context}.url is malformed") from error
       if (
-        parsed.scheme != check_type or not parsed.hostname or parsed.username or parsed.password
+        parsed.scheme != check_type or not parsed.hostname or parsed.username is not None or parsed.password is not None
+        or parsed.port == 0
         or parsed.fragment or parsed.query
       ):
         raise ConfigError(f"{context}.url must be a credential-free {check_type} URL without query or fragment")
@@ -767,7 +768,8 @@ def validate_redirect_url(current_url: str, new_url: str) -> str:
     raise RedirectPolicyError("redirect URL is malformed") from exc
   if (
     new.scheme != old.scheme or new.hostname != old.hostname or new_port != old_port
-    or new.username or new.password or new.query or new.fragment
+    or new.username is not None or new.password is not None or new.query or new.fragment
+    or new.port == 0 or old.port == 0
   ):
     raise RedirectPolicyError("redirect left the configured origin or transport")
   return destination
@@ -1276,7 +1278,7 @@ def main(argv: Sequence[str] | None = None) -> int:
   critical = sum(result.status != "PASS" and result.severity == "CRITICAL" for result in results)
   warnings = sum(result.status != "PASS" and result.severity == "WARN" for result in results)
   status = "CRITICAL" if errors or critical else "WARN" if warnings else "OK"
-  finding = f"{sum(result.status == 'PASS' for result in results)} of {len(results)} checks passed; {warnings} warning and {critical + errors} critical/error results"
+  finding = f"{sum(result.status == 'PASS' for result in results)} of {len(results)} checks passed; {warnings} warning and {critical} critical/error results"
   next_action = "review failed checks in dependency order" if exit_code else "all selected criteria passed during this invocation"
   conclusion = make_conclusion(status, config.path, finding, next_action)
   record = OutputRecord(
@@ -1292,7 +1294,7 @@ def main(argv: Sequence[str] | None = None) -> int:
   brief = "\n".join([
     f"Configuration: {display_safe(config.path)}",
     f"Checks: {len(results)}",
-    f"OK/WARN/CRITICAL: {sum(result.status == 'PASS' for result in results)}/{warnings}/{critical + errors}",
+    f"OK/WARN/CRITICAL: {sum(result.status == 'PASS' for result in results)}/{warnings}/{critical}",
   ])
   try:
     emit_output(

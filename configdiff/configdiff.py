@@ -517,6 +517,12 @@ def render_report(result: ComparisonResult) -> str:
     if result.drift_detected
     else "Observed current bytes are exactly identical to the observed baseline bytes."
   )
+  if result.mode != "exact":
+    status = "DRIFT DETECTED" if result.drift_detected else "NO DRIFT"
+    evidence = (
+      f"Observed inputs {'differ' if result.drift_detected else 'match'} under {result.mode} comparison "
+      "and selected metadata checks; this does not establish exact byte equality."
+    )
   return "\n".join(
     [
       "ConfigDiff: exact configuration-content comparison",

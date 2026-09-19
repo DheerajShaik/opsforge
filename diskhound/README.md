@@ -7,7 +7,7 @@ DiskHound is a bounded, read-only Linux filesystem diagnostic. It combines files
 ```console
 diskhound PATH
 diskhound PATH --top 20 --max-depth 8 --max-entries 50000
-diskhound PATH --min-size 10MiB --exclude '*.cache' --age-days 90
+diskhound PATH --min-size 10485760 --exclude '*.cache' --age-days 90
 diskhound PATH --cross-filesystems --json
 ```
 

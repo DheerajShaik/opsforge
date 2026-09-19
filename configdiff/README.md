@@ -20,7 +20,7 @@ Directory mode is capped by `--max-files` 1-10,000 (default 1,000) and `--max-de
 
 ## Evidence, status, and exits
 
-Reports include normalized absolute paths, sizes and SHA-256 fingerprints; selected permission and numeric owner/group drift; or added/removed/changed tree paths. `--metadata-only` compares size, permission mode, UID, and GID without content. Exact and semantic equality do not prove that a configuration is valid or effective.
+Reports include normalized absolute paths, sizes and SHA-256 fingerprints; selected permission and numeric owner/group drift; or added/removed/changed tree paths. `--metadata-only` uses size, permission mode, UID, and GID for comparison; bounded file reads still supply the displayed hashes. Normalized/semantic/metadata matches do not establish byte equality. Exact and semantic equality do not prove that a configuration is valid or effective.
 
 Status is `UNCHANGED` or `DRIFT`. Exit 0 means no difference under the selected semantics, 1 means drift, 2 means invalid target/invocation, 3 means an unstable/untrustworthy observation or output failure, and 130 means interrupted.
 

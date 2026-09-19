@@ -1,3 +1,6 @@
+import contextlib
+import io
+import json
 import socket
 import ssl
 import unittest
@@ -18,6 +21,24 @@ class ManagedSocket(FakeSocket):
 
 
 class CertificateBoundsTests(unittest.TestCase):
+  def test_invalid_http_targets_and_severity_are_config_errors(self):
+    for url, severity in (('http://example.test:0/', 'CRITICAL'), ('http://@example.test/', 'CRITICAL'), ('http://example.test/', [])):
+      with self.subTest(url=url, severity=severity), self.assertRaises(healthctl.ConfigError):
+        healthctl.parse_config_document({'version': 1, 'checks': [
+          {'name': 'web', 'type': 'http', 'url': url, 'severity': severity}]}, path='health.json')
+    with self.assertRaises(healthctl.RedirectPolicyError):
+      healthctl.validate_redirect_url('http://example.test/', 'http://example.test:0/')
+
+  def test_error_is_counted_once_in_summary(self):
+    check = self.check()
+    result = healthctl.CheckResult(check.name, check.type, 'ERROR', check.target, 'unavailable', 'CRITICAL')
+    stdout = io.StringIO()
+    with mock.patch.object(healthctl, 'load_config', return_value=healthctl.HealthConfig('/health.json', (check,))), \
+         mock.patch.object(healthctl, 'evaluate_config', return_value=(result,)), \
+         contextlib.redirect_stdout(stdout):
+      self.assertEqual(healthctl.main(['health.json', '--json']), 3)
+    self.assertIn('1 critical/error results', json.loads(stdout.getvalue())['conclusion'])
+
   def test_exited_helper_still_terminates_descendants_and_reaps(self):
     process = mock.Mock(pid=12345)
     process.poll.return_value = 0

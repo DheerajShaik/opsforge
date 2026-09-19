@@ -24,7 +24,7 @@ Only CPython 3.12 is installed locally. Other interpreter results must come from
 
 ## Deterministic regression coverage
 
-The final suite has 516 tests, preserving all 451 baseline tests and adding 65 regressions. Local CPython 3.12.3 compilation of shared code, all ten utilities, and tests passed; all 516 tests passed with no failures or skips. CI on this hardening head is pending.
+The final suite has 519 tests, preserving all 451 baseline tests and adding 68 regressions. Local CPython 3.12.3 compilation of shared code, all ten utilities, and tests passed; all 519 tests passed with no failures or skips. CI on this hardening head is pending.
 
 | Suite | Tests |
 | --- | ---: |
@@ -35,15 +35,17 @@ The final suite has 516 tests, preserving all 451 baseline tests and adding 65 r
 | SvcDoctor | 63 |
 | LogHound | 49 |
 | ProcWatch | 34 |
-| ConfigDiff | 38 |
+| ConfigDiff | 39 |
 | NetDoctor | 34 |
-| HealthCtl | 62 |
+| HealthCtl | 64 |
 | Incident Snapshot | 70 |
-| **Total** | **516** |
+| **Total** | **519** |
 
 New regressions cover descriptor-relative ConfigDiff traversal and deterministic same-filesystem/symlink replacement; DiskHound global enumeration/visit budgets at 1 and 10 entries against 2,000 files; ProcWatch auxiliary start-tick identity changes before, after, and during collection; dependency command/format/count/state failures with JSON null-versus-empty distinctions; IPv4/IPv6/loopback route context; global rotated timestamp/minute aggregation and bounded overflow; certificate candidate caps, fallback, trust/hostname failures, numeric hosts, expiry thresholds, total deadlines, and interrupts; explicit PortLens enrichment limitations; exited-helper process-group cleanup; and Incident Snapshot unavailable evidence.
 
 Shared regression coverage retains schema version 1, 16 MiB output limits, terminal sanitization, 0600 output creation, symlink/non-regular/hardlink rejection, force semantics, and subprocess interruption/timeout bounds. Runtime dependencies remain empty.
+
+Final review also added regressions for accurate normalized ConfigDiff match wording, rejecting HTTP port zero/empty credentials and malformed severity, and counting HealthCtl errors once in human summaries.
 
 ## Targeted local integration
 

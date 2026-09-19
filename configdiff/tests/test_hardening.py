@@ -8,6 +8,19 @@ from test_configdiff import configdiff
 
 
 class DirectoryAnchoringTests(unittest.TestCase):
+  def test_normalized_match_does_not_claim_byte_equality(self):
+    with tempfile.TemporaryDirectory() as temp:
+      a, b = Path(temp) / 'a', Path(temp) / 'b'
+      a.write_bytes(b'x = 1\n')
+      b.write_bytes(b'x=1\n')
+      result = configdiff.compare_files_mode(str(a), str(b), mode='whitespace',
+        permissions=False, ownership=False, selected_keys=(), unified=False, max_diff_lines=20)
+    self.assertFalse(result.drift_detected)
+    self.assertNotEqual(result.baseline.sha256, result.current.sha256)
+    output = configdiff.render_report(result)
+    self.assertIn('match under whitespace comparison', output)
+    self.assertNotIn('exactly identical', output)
+
   def collect(self, root, **options):
     return configdiff.collect_directory(str(root), max_files=options.get('max_files', 20),
       max_depth=options.get('max_depth', 4), symlinks=options.get('symlinks', False))[1]

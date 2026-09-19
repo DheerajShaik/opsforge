@@ -32,6 +32,7 @@ Notable changes to OpsForge will be recorded here.
 - NetDoctor labels IPv4 default-route context without claiming an unproven connection interface. LogHound merges rotated timestamps/minute counts before deriving rates and bursts. HealthCtl certificate checks share bounded resolver candidates and one TCP/TLS deadline. PortLens explicitly labels process enrichment as live and non-atomic.
 - Pin GitHub Actions to immutable commits on Ubuntu 24.04; retain the Python 3.10–3.14 full-suite and wheel/sdist clean-install matrices. Reconcile the Beta gate with completed WSL validation and explicitly unvalidated environments.
 - Correct exceptional subprocess cleanup when a helper exits before its descendants, close interrupted CertWatch connection sockets, and preserve unavailable Incident Snapshot service/IPv6-route evidence instead of reporting an empty success.
+- Correct ConfigDiff normalized-match wording and HealthCtl critical/error counts; reject HTTP port zero/empty credentials and malformed severity values without changing the requested target or reporting an internal failure.
 
 - Existing normal positional invocations and established exit meanings remain compatible except that CertWatch now correctly returns exit `1` when trust or identity evidence produces `WARNING`.
 - Semantic TOML is deferred because Python 3.10 lacks `tomllib` and OpsForge does not add a third-party runtime parser solely for this mode.
