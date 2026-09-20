@@ -4,7 +4,7 @@ Hardening validation updated on 2026-09-19 for PR #16, branch `feat/opsforge-v0.
 
 ## Candidate and release gate
 
-The hardening baseline is reviewed commit `96a61406b2350abe3cdbd0a655cc822cc0454cdc`. The final hardening commit and its CI results will be recorded here after the required matrix completes; baseline CI is not evidence that a changed head passed.
+The hardening baseline is reviewed commit `96a61406b2350abe3cdbd0a655cc822cc0454cdc`. The final hardened runtime is commit `c6e8e0fa843b1bae502e700095c90811694670aa`. Its [release regression run](https://github.com/DheerajShaik/opsforge/actions/runs/35443737283) and all ten focused utility workflows passed. A later documentation-only commit may move the branch head without changing the tested runtime, tests, packaging configuration, or workflows.
 
 The supported Beta platform is **CPython 3.10–3.14 on Ubuntu 24.04 LTS Linux**. Merge readiness requires the final-head five-version regression matrix, both wheel and sdist clean-install matrices, the completed WSL2 manual campaign plus targeted hardening revalidation, and final external merge review. No merge, tag, publication, or GitHub release is part of this task.
 
@@ -24,7 +24,15 @@ Only CPython 3.12 is installed locally. Other interpreter results must come from
 
 ## Deterministic regression coverage
 
-The final suite has 519 tests, preserving all 451 baseline tests and adding 68 regressions. Local CPython 3.12.3 compilation of shared code, all ten utilities, and tests passed; all 519 tests passed with no failures or skips. CI on this hardening head is pending.
+The final suite has 519 tests, preserving all 451 baseline tests and adding 68 regressions. Local CPython 3.12.3 compilation of shared code, all ten utilities, and tests passed; all 519 tests passed with no failures or skips. Hosted Ubuntu 24.04 compilation and all 519 tests passed independently on CPython 3.10, 3.11, 3.12, 3.13, and 3.14, with no failures or skips.
+
+| Hosted interpreter | Compilation | Tests | Wheel clean install | sdist clean install |
+| --- | --- | ---: | --- | --- |
+| CPython 3.10 | PASS | 519 | PASS | PASS |
+| CPython 3.11 | PASS | 519 | PASS | PASS |
+| CPython 3.12 | PASS | 519 | PASS | PASS |
+| CPython 3.13 | PASS | 519 | PASS | PASS |
+| CPython 3.14 | PASS | 519 | PASS | PASS |
 
 | Suite | Tests |
 | --- | ---: |
@@ -63,7 +71,7 @@ No public endpoints were contacted during this pass. Historical CertWatch contro
 
 ## Packaging
 
-Both `opsforge-0.2.0b1-py3-none-any.whl` and `opsforge-0.2.0b1.tar.gz` built successfully. Disposable CPython 3.12 environments outside the source tree passed metadata/version, empty runtime dependencies, imports, all ten commands and `--help`, nine installed schema-version-1 JSON smoke checks, `pip check`, and removal of every console script after uninstall. Final artifact rebuild and hosted matrix results are recorded when completed.
+Both `opsforge-0.2.0b1-py3-none-any.whl` and `opsforge-0.2.0b1.tar.gz` built successfully from the final runtime. Disposable local CPython 3.12 environments outside the source tree passed metadata/version, empty runtime dependencies, imports, all ten commands and `--help`, nine installed schema-version-1 JSON smoke checks, `pip check`, and removal of every console script after uninstall. The hosted matrix repeated those checks for both artifacts on every supported interpreter from 3.10 through 3.14.
 
 The nine JSON smoke commands are DiskHound, LogHound, ConfigDiff, HealthCtl, ProcWatch, Incident Snapshot, PortLens, NetDoctor, and SvcDoctor. Hosted SvcDoctor packaging smoke uses controlled systemd helper output; the targeted local service check used real systemd. CertWatch receives help/import checks and deterministic TLS tests, not unsolicited public-network packaging smoke.
 
