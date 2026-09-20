@@ -2,6 +2,7 @@ import contextlib
 import hashlib
 import importlib.util
 import io
+import json
 import os
 from pathlib import Path
 import stat
@@ -48,6 +49,12 @@ def metadata(
   return value
 
 
+def comparison(drift=False, path="/a"):
+  baseline = configdiff.FileObservation(path, 1, "0" * 64)
+  current = configdiff.FileObservation("/b", 1, ("1" if drift else "0") * 64)
+  return configdiff.ComparisonResult(baseline, current, drift)
+
+
 class CliTests(unittest.TestCase):
   def run_main(self, arguments):
     stdout = io.StringIO()
@@ -63,7 +70,7 @@ class CliTests(unittest.TestCase):
         with contextlib.redirect_stdout(stdout), self.assertRaises(SystemExit) as caught:
           configdiff.main([option])
         self.assertEqual(caught.exception.code, 0)
-        self.assertIn("exact byte-content drift", stdout.getvalue())
+        self.assertIn("bounded file or directory drift", stdout.getvalue())
         inspect.assert_not_called()
 
   def test_invalid_invocation_exits_two(self):
@@ -74,32 +81,36 @@ class CliTests(unittest.TestCase):
       self.assertEqual(caught.exception.code, 2)
 
   def test_success_and_drift_exit_codes(self):
-    with mock.patch.object(configdiff, "inspect", return_value=("same", 0)):
-      self.assertEqual(self.run_main(["a", "b"]), (0, "same\n", ""))
-    with mock.patch.object(configdiff, "inspect", return_value=("different", 1)):
-      self.assertEqual(self.run_main(["a", "b"]), (1, "different\n", ""))
+    with mock.patch.object(configdiff, "compare_files_mode", return_value=comparison(False)):
+      code, stdout, stderr = self.run_main(["a", "b"])
+      self.assertEqual((code, stderr), (0, ""))
+      self.assertIn("Conclusion: [UNCHANGED]", stdout)
+    with mock.patch.object(configdiff, "compare_files_mode", return_value=comparison(True)):
+      code, stdout, stderr = self.run_main(["a", "b"])
+      self.assertEqual((code, stderr), (1, ""))
+      self.assertIn("Conclusion: [DRIFT]", stdout)
 
   def test_expected_errors_have_stable_exit_codes(self):
     with mock.patch.object(
-      configdiff, "inspect", side_effect=configdiff.InvalidTargetError("bad target")
+      configdiff, "compare_files_mode", side_effect=configdiff.InvalidTargetError("bad target")
     ):
       self.assertEqual(
         self.run_main(["a", "b"]), (2, "", "configdiff: bad target\n")
       )
     with mock.patch.object(
-      configdiff, "inspect", side_effect=configdiff.ObservationError("unstable")
+      configdiff, "compare_files_mode", side_effect=configdiff.ObservationError("unstable")
     ):
       self.assertEqual(
         self.run_main(["a", "b"]), (3, "", "configdiff: unstable\n")
       )
 
   def test_internal_error_and_interrupt_have_stable_output(self):
-    with mock.patch.object(configdiff, "inspect", side_effect=RuntimeError("secret")):
+    with mock.patch.object(configdiff, "compare_files_mode", side_effect=RuntimeError("secret")):
       self.assertEqual(
         self.run_main(["a", "b"]),
         (3, "", "configdiff: internal execution failure\n"),
       )
-    with mock.patch.object(configdiff, "inspect", side_effect=KeyboardInterrupt):
+    with mock.patch.object(configdiff, "compare_files_mode", side_effect=KeyboardInterrupt):
       self.assertEqual(
         self.run_main(["a", "b"]), (130, "", "configdiff: interrupted\n")
       )
@@ -109,11 +120,19 @@ class CliTests(unittest.TestCase):
     stderr = io.StringIO()
     with mock.patch.object(configdiff.sys, "stdout", stdout), \
          mock.patch.object(configdiff.sys, "stderr", stderr), \
-         mock.patch.object(configdiff, "inspect", return_value=("path é", 0)):
+         mock.patch.object(configdiff, "compare_files_mode", return_value=comparison(False, "/path é")):
       code = configdiff.main(["a", "b"])
     self.assertEqual(code, 0)
     self.assertEqual(stderr.getvalue(), "")
     self.assertIn("path \\xe9", stdout.getvalue())
+
+  def test_json_brief_and_quiet(self):
+    with mock.patch.object(configdiff, "compare_files_mode", return_value=comparison(False)):
+      code, stdout, stderr = self.run_main(["--json", "a", "b"])
+      self.assertEqual((code, stderr), (0, ""))
+      self.assertEqual(json.loads(stdout)["tool"], "configdiff")
+      self.assertIn("Drift: no", self.run_main(["--brief", "a", "b"])[1])
+      self.assertEqual(self.run_main(["--quiet", "a", "b"])[1], "")
 
 
 class FileAccessTests(unittest.TestCase):
@@ -287,6 +306,56 @@ class ComparisonTests(unittest.TestCase):
       with self.assertRaises(configdiff.InvalidTargetError):
         configdiff.compare_files("baseline", "current")
     closed.assert_called_once_with(9)
+
+  def test_semantic_json_and_duplicate_keys(self):
+    with tempfile.TemporaryDirectory() as directory:
+      baseline = Path(directory, "a.json")
+      current = Path(directory, "b.json")
+      baseline.write_text('{"a":1,"nested":{"x":2}}', encoding="utf-8")
+      current.write_text('{"nested":{"x":2},"a":1}', encoding="utf-8")
+      result = configdiff.compare_files_mode(
+        str(baseline), str(current), mode="json", permissions=False,
+        ownership=False, selected_keys=(), unified=False, max_diff_lines=20,
+      )
+      self.assertFalse(result.drift_detected)
+      current.write_text('{"a":1,"a":2}', encoding="utf-8")
+      with self.assertRaises(configdiff.InvalidTargetError):
+        configdiff.compare_files_mode(
+          str(baseline), str(current), mode="json", permissions=False,
+          ownership=False, selected_keys=(), unified=False, max_diff_lines=20,
+        )
+
+  def test_whitespace_comments_and_bounded_unified_diff(self):
+    with tempfile.TemporaryDirectory() as directory:
+      baseline = Path(directory, "a.conf")
+      current = Path(directory, "b.conf")
+      baseline.write_text("# old\na = 1\n", encoding="utf-8")
+      current.write_text("; new\na=1\n", encoding="utf-8")
+      whitespace = configdiff.compare_files_mode(
+        str(baseline), str(current), mode="whitespace", permissions=False,
+        ownership=False, selected_keys=(), unified=True, max_diff_lines=2,
+      )
+      self.assertTrue(whitespace.drift_detected)
+      self.assertLessEqual(len(whitespace.diff_lines), 2)
+      self.assertTrue(whitespace.diff_truncated)
+
+  def test_bounded_directory_comparison_and_symlink_target(self):
+    with tempfile.TemporaryDirectory() as directory:
+      baseline = Path(directory, "a")
+      current = Path(directory, "b")
+      baseline.mkdir()
+      current.mkdir()
+      (baseline / "same").write_text("x")
+      (current / "same").write_text("x")
+      (current / "added").write_text("y")
+      (baseline / "link").symlink_to("one")
+      (current / "link").symlink_to("two")
+      result = configdiff.compare_directories(
+        str(baseline), str(current), max_files=20, max_depth=3,
+        permissions=False, ownership=False, symlinks=True,
+      )
+      self.assertEqual(result.added, ("added",))
+      self.assertIn("link", result.changed)
 
 
 class DisplayTests(unittest.TestCase):

@@ -33,7 +33,15 @@ class SsParsingTests(unittest.TestCase):
     observation = portlens.parse_ss_row(self.IPV4, "ipv4")
     self.assertEqual((observation.protocol, observation.state, observation.family), ("tcp", "LISTEN", "ipv4"))
     self.assertEqual((observation.local_address, observation.local_port), ("127.0.0.1", 8080))
-    self.assertEqual(observation.processes, (portlens.ProcessReference(1234, "python3"),))
+    self.assertEqual(observation.processes, (portlens.ProcessReference(1234, "python3", 3),))
+
+  def test_udp_row(self):
+    observation = portlens.parse_ss_row(
+      'UNCONN 0 0 0.0.0.0:53 0.0.0.0:* users:(("dns",pid=2,fd=4))'.replace("0.0.0.0", "0.0.0.0", 1),
+      "ipv4",
+      "udp",
+    )
+    self.assertEqual((observation.protocol, observation.state, observation.local_port), ("udp", "UNCONN", 53))
 
   def test_process_metadata_absent(self):
     observation = portlens.parse_ss_row("LISTEN 0 128 0.0.0.0:8080 0.0.0.0:*", "ipv4")
@@ -74,7 +82,7 @@ class SsParsingTests(unittest.TestCase):
     stat.return_value.st_uid = 1000
     getpwuid.return_value.pw_name = "appuser"
     reference = portlens.ProcessReference(1234, "ss-name")
-    with mock.patch("builtins.open", mock.mock_open(read_data="listener\n")):
+    with mock.patch("builtins.open", mock.mock_open(read_data=b"listener\n")):
       self.assertEqual(portlens.enrich_process(reference), ("appuser", "listener"))
 
   @mock.patch.object(portlens.pwd, "getpwuid", side_effect=KeyError)
@@ -82,7 +90,7 @@ class SsParsingTests(unittest.TestCase):
   def test_numeric_uid_is_preserved_when_username_lookup_fails(self, stat, getpwuid):
     stat.return_value.st_uid = 4242
     reference = portlens.ProcessReference(1234, "ss-name")
-    with mock.patch("builtins.open", mock.mock_open(read_data="listener\n")):
+    with mock.patch("builtins.open", mock.mock_open(read_data=b"listener\n")):
       self.assertEqual(portlens.enrich_process(reference)[0], "4242")
 
   def test_deterministic_sorting_and_no_deduplication(self):
@@ -97,7 +105,13 @@ class SsParsingTests(unittest.TestCase):
     self.assertEqual(len(result), 4)
 
   def test_terminal_controls_are_sanitized(self):
-    self.assertEqual(portlens.sanitize_display("a\n\t\x1b[31m"), "a???[31m")
+    self.assertEqual(portlens.sanitize_display("a\n\t\x1b[31m"), r"a\x0a\x09\x1b[31m")
+
+  def test_unicode_presentation_controls_are_sanitized(self):
+    rendered = portlens.sanitize_display("left\u202eright\u2028next\u2066")
+    self.assertNotIn("\u202e", rendered)
+    self.assertNotIn("\u2028", rendered)
+    self.assertNotIn("\u2066", rendered)
 
 
 

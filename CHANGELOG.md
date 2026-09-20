@@ -4,13 +4,46 @@ Notable changes to OpsForge will be recorded here.
 
 ## Unreleased
 
-No changes yet.
+## 0.2.0-beta.1 - 2026-09-13
+
+### Common output and safety
+
+- Added a shared terminal-safe conclusion line plus `--brief`, schema-versioned `--json`, `--quiet`, elapsed timing, and safe `--output FILE`/`--force` behavior to all ten commands.
+- All rendered stdout and file output is bounded to 16 MiB. Output files default to mode `0600`, refuse implicit overwrite, and do not follow symlinks or overwrite non-regular or multiply-linked targets.
+- Hardened terminal rendering against Unicode presentation controls, bound and reap subprocess process groups on every exceptional path, and correlate CertWatch trust to the displayed leaf fingerprint.
+- Retained the dependency-free CPython 3.10-3.14 and Linux-only package policy.
+
+### Utility enhancements
+
+- PortLens adds UDP, all-port and range selection, family/PID/process filters, bounded watch mode, ownership/executable/FD/cgroup evidence, bind interpretation, and likely shared-bind evidence.
+- DiskHound adds top/depth/entry/size/age bounds, excludes, inode and mount context, largest-file, sparse-file, file-type, logical/allocation, cross-filesystem, and concentration evidence.
+- CertWatch adds bounded multi-target operation, critical thresholds, explicit SNI, TLS/cipher/timing and fingerprint evidence, SAN identity checks, a separate trust handshake, capability-detected chain count, and explicit revocation limits.
+- SvcDoctor adds bounded journal and direct dependency evidence, restart/exit/signal interpretation, unit/drop-in paths, activation, resource/task limits, selected execution identity, and safe follow-up commands.
+- LogHound adds conservative RFC3339/PID/IP/UUID/labelled-ID normalization, literal filters, time windows, top-N, bounded rotations, severity/rate/burst summaries, stack-trace grouping evidence, and bounded-period comparison.
+- ProcWatch adds bounded multi-sample/duration/continuous modes plus FD/socket, I/O, context-switch, child, thread CPU, and cgroup constraint evidence while preserving PID identity checks.
+- ConfigDiff retains exact-byte mode and adds explicit bounded unified diff, whitespace/comment modes, semantic JSON and selected keys, metadata, permission/ownership, bounded directory, and optional symlink-target comparison.
+- NetDoctor adds resolver/TCP/TLS timings, retries, address-family comparison, resolver/default-route/source/interface context, proxy-variable-name detection, and resolution/route/TCP/TLS stage classification.
+- HealthCtl adds strict proxy-free HTTP(S), DNS, certificate-expiry, process, systemd, file existence/metadata, and SHA-256 checks with severity, groups, profiles, dependencies, retries, and bounded parallelism. HTTP response headers and post-resolution wall-clock duration are explicitly bounded; arbitrary commands remain prohibited.
+- Incident Snapshot adds privacy-conscious `basic`, `network`, `process`, and `full` profiles with PSI, inode, interface, route, listener, process-ranking, failed-service, and selected kernel scheduler evidence.
+
+### Compatibility and deferrals
+
+- Final hardening anchors ConfigDiff directory traversal to descriptors, makes DiskHound's enumeration/work budget global, correlates ProcWatch auxiliary evidence to the sampled PID identity, and distinguishes unavailable SvcDoctor dependency observations from confirmed zero failures.
+- NetDoctor labels IPv4 default-route context without claiming an unproven connection interface. LogHound merges rotated timestamps/minute counts before deriving rates and bursts. HealthCtl certificate checks share bounded resolver candidates and one TCP/TLS deadline. PortLens explicitly labels process enrichment as live and non-atomic.
+- Pin GitHub Actions to immutable commits on Ubuntu 24.04; retain the Python 3.10–3.14 full-suite and wheel/sdist clean-install matrices. Reconcile the Beta gate with completed WSL validation and explicitly unvalidated environments.
+- Correct exceptional subprocess cleanup when a helper exits before its descendants, close interrupted CertWatch connection sockets, and preserve unavailable Incident Snapshot service/IPv6-route evidence instead of reporting an empty success.
+- Correct ConfigDiff normalized-match wording and HealthCtl critical/error counts; reject HTTP port zero/empty credentials and malformed severity values without changing the requested target or reporting an internal failure.
+
+- Existing normal positional invocations and established exit meanings remain compatible except that CertWatch now correctly returns exit `1` when trust or identity evidence produces `WARNING`.
+- Semantic TOML is deferred because Python 3.10 lacks `tomllib` and OpsForge does not add a third-party runtime parser solely for this mode.
+- Portable intermediate-certificate expiry decoding is deferred: Python 3.10-3.12 do not expose a consistent public verified-chain certificate API. CertWatch reports chain count when the runtime supports it without implying intermediate validity coverage.
+- Direct DNS timeouts remain governed by the operating-system resolver because the Python standard library exposes no cancellable `getaddrinfo()` timeout. All subsequent socket and HTTP/TLS operations remain explicitly bounded.
 
 ## 0.1.0-beta.1 - 2026-09-12
 
 - Transitioned OpsForge from Experimental to Beta after completion of the initial ten-utility roadmap, while retaining explicit non-production-readiness and compatibility limits.
 - Added standard Python packaging with ten independent console commands and isolated local installation through `pipx install .`.
-- Added a repository-wide CPython 3.10–3.14 Linux regression gate covering compilation, all utility suites, distribution builds, clean wheel installation, installed entry points, safe smoke checks, and uninstallation.
+- Added a repository-wide CPython 3.10–3.14 Linux regression gate covering compilation, all utility suites, wheel and source-distribution builds, clean installation of both artifact types on every supported interpreter, installed entry points, nine safe JSON smoke checks, and complete script removal on uninstallation.
 - Reconciled project, security, contribution, compatibility, and utility documentation with completed implementation and recorded validation evidence.
 - Completed post-fix CertWatch real-world revalidation against `example.com:443` on Ubuntu 24.04.1 WSL2 with Python 3.12.3 and OpenSSL 3.0.13.
 

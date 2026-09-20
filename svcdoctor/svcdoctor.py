@@ -3,14 +3,25 @@
 
 from __future__ import annotations
 
+import argparse
 from dataclasses import dataclass
 import os
 import selectors
+import signal
 import subprocess
 import sys
 import time
 import unicodedata
 from typing import Mapping, Sequence
+
+from opsforge_common import (
+  OutputError,
+  OutputRecord,
+  add_output_arguments,
+  emit_output,
+  make_conclusion,
+  validate_output_arguments,
+)
 
 
 PROPERTIES = (
@@ -21,9 +32,24 @@ PROPERTIES = (
   "Result",
   "ExecMainCode",
   "ExecMainStatus",
+  "FragmentPath",
+  "DropInPaths",
+  "Requires",
+  "Wants",
+  "NRestarts",
+  "Restart",
+  "ActiveEnterTimestamp",
+  "CPUUsageNSec",
+  "MemoryCurrent",
+  "MemoryMax",
+  "TasksCurrent",
+  "TasksMax",
+  "User",
+  "Group",
+  "DynamicUser",
 )
 CORE_PROPERTIES = ("Id", "LoadState", "ActiveState")
-OPTIONAL_PROPERTIES = ("SubState", "Result", "ExecMainCode", "ExecMainStatus")
+OPTIONAL_PROPERTIES = tuple(name for name in PROPERTIES if name not in CORE_PROPERTIES)
 UNIT_SUFFIXES = (
   ".service", ".socket", ".target", ".device", ".mount", ".automount",
   ".swap", ".timer", ".path", ".slice", ".scope", ".snapshot",
@@ -31,6 +57,8 @@ UNIT_SUFFIXES = (
 SYSTEMD_GLOB_METACHARACTERS = frozenset("*?[]")
 TIMEOUT_SECONDS = 5
 MAX_STREAM_BYTES = 64 * 1024
+MAX_JOURNAL_LINES = 200
+MAX_DEPENDENCIES = 32
 UNAVAILABLE = "-"
 
 HELP = """usage: svcdoctor SERVICE
@@ -58,6 +86,16 @@ class CommandResult:
   returncode: int
   stdout: bytes
   stderr: bytes
+
+
+@dataclass(frozen=True)
+class ServiceEvidence:
+  target: str
+  properties: Mapping[str, str]
+  journal: tuple[str, ...]
+  journal_warning: str | None
+  failed_dependencies: tuple[str, ...] | None
+  dependency_warning: str | None = None
 
 
 def display_safe(value: object) -> str:
@@ -120,9 +158,29 @@ def systemctl_arguments(target: str) -> list[str]:
 
 def _stop_process(process: subprocess.Popen[bytes]) -> None:
   """Terminate and reap a child after timeout or an output-limit violation."""
-  if process.poll() is None:
-    process.kill()
-  process.wait()
+  killed_group = False
+  pid = getattr(process, "pid", None)
+  try:
+    running = process.poll() is None
+  except OSError:
+    running = False
+  # A helper may exit while descendants still hold its output pipes open.
+  if isinstance(pid, int):
+    try:
+      os.killpg(pid, signal.SIGKILL)
+      killed_group = True
+    except OSError:
+      pass
+  if running and not killed_group:
+    try:
+      if process.poll() is None:
+        process.kill()
+    except OSError:
+      pass
+  try:
+    process.wait(timeout=1.0)
+  except (OSError, subprocess.TimeoutExpired):
+    pass
 
 
 def run_systemctl(target: str) -> CommandResult:
@@ -135,6 +193,7 @@ def run_systemctl(target: str) -> CommandResult:
       stdout=subprocess.PIPE,
       stderr=subprocess.PIPE,
       env=environment,
+      start_new_session=True,
     )
   except FileNotFoundError as error:
     raise SvcDoctorError("systemctl is not available") from error
@@ -147,18 +206,16 @@ def run_systemctl(target: str) -> CommandResult:
 
   streams = {process.stdout: bytearray(), process.stderr: bytearray()}
   selector = selectors.DefaultSelector()
-  selector.register(process.stdout, selectors.EVENT_READ)
-  selector.register(process.stderr, selectors.EVENT_READ)
   deadline = time.monotonic() + TIMEOUT_SECONDS
   try:
+    selector.register(process.stdout, selectors.EVENT_READ)
+    selector.register(process.stderr, selectors.EVENT_READ)
     while selector.get_map():
       remaining = deadline - time.monotonic()
       if remaining <= 0:
-        _stop_process(process)
         raise SvcDoctorError("systemd query timed out after 5 seconds")
       events = selector.select(remaining)
       if not events:
-        _stop_process(process)
         raise SvcDoctorError("systemd query timed out after 5 seconds")
       for key, _ in events:
         chunk = os.read(key.fileobj.fileno(), 8192)
@@ -168,23 +225,119 @@ def run_systemctl(target: str) -> CommandResult:
         captured = streams[key.fileobj]
         captured.extend(chunk)
         if len(captured) > MAX_STREAM_BYTES:
-          _stop_process(process)
           raise ResponseTooLargeError("systemd returned a malformed response")
     remaining = deadline - time.monotonic()
     if remaining <= 0:
-      _stop_process(process)
       raise SvcDoctorError("systemd query timed out after 5 seconds")
     try:
       returncode = process.wait(timeout=remaining)
     except subprocess.TimeoutExpired as error:
-      _stop_process(process)
       raise SvcDoctorError("systemd query timed out after 5 seconds") from error
+  except BaseException:
+    _stop_process(process)
+    raise
   finally:
     selector.close()
     process.stdout.close()
     process.stderr.close()
 
   return CommandResult(returncode, bytes(streams[process.stdout]), bytes(streams[process.stderr]))
+
+
+def run_simple_command(arguments: Sequence[str], label: str, timeout: float = TIMEOUT_SECONDS) -> CommandResult:
+  environment = os.environ.copy()
+  environment.update({"LC_ALL": "C", "SYSTEMD_PAGER": "", "SYSTEMD_COLORS": "0"})
+  try:
+    process = subprocess.Popen(
+      list(arguments), stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=environment,
+      start_new_session=True,
+    )
+  except FileNotFoundError as error:
+    raise SvcDoctorError(f"{label} is not available") from error
+  except OSError as error:
+    raise SvcDoctorError(f"could not execute {label}") from error
+  if process.stdout is None or process.stderr is None:
+    _stop_process(process)
+    raise SvcDoctorError(f"could not execute {label}")
+  streams = {process.stdout: bytearray(), process.stderr: bytearray()}
+  selector = selectors.DefaultSelector()
+  deadline = time.monotonic() + timeout
+  try:
+    selector.register(process.stdout, selectors.EVENT_READ)
+    selector.register(process.stderr, selectors.EVENT_READ)
+    while selector.get_map():
+      remaining = deadline - time.monotonic()
+      if remaining <= 0:
+        raise SvcDoctorError(f"{label} query timed out")
+      events = selector.select(remaining)
+      if not events:
+        raise SvcDoctorError(f"{label} query timed out")
+      for key, _ in events:
+        chunk = os.read(key.fileobj.fileno(), 8192)
+        if not chunk:
+          selector.unregister(key.fileobj)
+          continue
+        streams[key.fileobj].extend(chunk)
+        if len(streams[key.fileobj]) > MAX_STREAM_BYTES:
+          raise ResponseTooLargeError(f"{label} returned oversized output")
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+      raise SvcDoctorError(f"{label} query timed out")
+    try:
+      returncode = process.wait(timeout=remaining)
+    except subprocess.TimeoutExpired as error:
+      raise SvcDoctorError(f"{label} query timed out") from error
+  except BaseException:
+    _stop_process(process)
+    raise
+  finally:
+    selector.close()
+    process.stdout.close()
+    process.stderr.close()
+  return CommandResult(returncode, bytes(streams[process.stdout]), bytes(streams[process.stderr]))
+
+
+def collect_journal(target: str, lines: int) -> tuple[tuple[str, ...], str | None]:
+  result = run_simple_command(
+    ("journalctl", "--system", "--no-pager", "--output=short-iso", "--lines", str(lines), "--unit", target),
+    "journalctl",
+  )
+  if result.returncode != 0:
+    return (), "recent journal evidence unavailable"
+  try:
+    text = result.stdout.decode("utf-8", "strict")
+  except UnicodeDecodeError:
+    return (), "recent journal evidence was not valid UTF-8"
+  rendered = tuple(display_safe(line)[:512] for line in text.splitlines()[:lines])
+  return rendered, None
+
+
+def dependency_names(properties: Mapping[str, str]) -> tuple[str, ...]:
+  names = []
+  for field in ("Requires", "Wants"):
+    for name in properties.get(field, "").split():
+      if name.endswith(".service") and name not in names:
+        names.append(name)
+      if len(names) >= MAX_DEPENDENCIES:
+        return tuple(names)
+  return tuple(names)
+
+
+def find_failed_dependencies(names: Sequence[str]) -> tuple[str, ...]:
+  if not names:
+    return ()
+  result = run_simple_command(("systemctl", "is-failed", "--system", "--no-pager", "--", *names), "systemctl")
+  try:
+    states = result.stdout.decode("ascii", "strict").splitlines()
+  except UnicodeDecodeError as error:
+    raise SvcDoctorError("dependency evidence unavailable: non-ASCII systemd response") from error
+  known_states = {"active", "reloading", "inactive", "failed", "activating", "deactivating", "maintenance", "refreshing"}
+  if len(states) != len(names) or any(state not in known_states for state in states):
+    raise SvcDoctorError("dependency evidence unavailable: malformed or incomplete systemd response")
+  failed = tuple(name for name, state in zip(names, states) if state == "failed")
+  if result.returncode != (0 if failed else 1):
+    raise SvcDoctorError("dependency evidence unavailable: systemd query failed or returned inconsistent status")
+  return failed
 
 
 def decode_output(output: bytes) -> str:
@@ -239,6 +392,18 @@ def render_diagnostic(target: str, properties: Mapping[str, str]) -> str:
   """Render one accepted observation in the frozen field order."""
   safe = lambda name: display_safe(properties.get(name) or UNAVAILABLE)
   failed = properties["ActiveState"] == "failed"
+  code = properties.get("ExecMainCode", "")
+  status = properties.get("ExecMainStatus", "")
+  if code == "1":
+    interpretation = f"process exited with status {display_safe(status or UNAVAILABLE)}"
+  elif code == "2":
+    interpretation = f"process was killed by signal {display_safe(status or UNAVAILABLE)}"
+  elif code == "3":
+    interpretation = f"process dumped core after signal {display_safe(status or UNAVAILABLE)}"
+  elif code in {"", "0"}:
+    interpretation = "no terminating main-process result was reported"
+  else:
+    interpretation = f"unrecognized systemd execution code {display_safe(code)}"
   return "\n".join((
     "Target",
     f"  Requested: {display_safe(target)}",
@@ -251,9 +416,69 @@ def render_diagnostic(target: str, properties: Mapping[str, str]) -> str:
     f"  Result: {safe('Result')}",
     f"  Main code: {safe('ExecMainCode')}",
     f"  Main status: {safe('ExecMainStatus')}",
+    f"  Interpretation: {interpretation}",
+    f"  Restart policy: {safe('Restart')}",
+    f"  Restarts: {safe('NRestarts')}",
+    f"  Active since: {safe('ActiveEnterTimestamp')}",
+    "Unit configuration",
+    f"  Unit file: {safe('FragmentPath')}",
+    f"  Drop-ins: {safe('DropInPaths')}",
+    f"  Requires: {safe('Requires')}",
+    f"  Wants: {safe('Wants')}",
+    "Resource evidence",
+    f"  CPU usage (ns): {safe('CPUUsageNSec')}",
+    f"  Memory current: {safe('MemoryCurrent')}",
+    f"  Memory limit: {safe('MemoryMax')}",
+    f"  Tasks current: {safe('TasksCurrent')}",
+    f"  Tasks limit: {safe('TasksMax')}",
+    "Selected execution context",
+    f"  User: {safe('User')}",
+    f"  Group: {safe('Group')}",
+    f"  Dynamic user: {safe('DynamicUser')}",
     "Assessment",
     f'  ActiveState equals "failed": {"yes" if failed else "no"}',
   ))
+
+
+def render_service_evidence(evidence: ServiceEvidence) -> str:
+  lines = [render_diagnostic(evidence.target, evidence.properties)]
+  lines.extend([
+    "Dependencies",
+    f"  Failed dependencies: {'unavailable' if evidence.failed_dependencies is None else ', '.join(map(display_safe, evidence.failed_dependencies)) or 'none observed'}",
+    "Recent journal evidence",
+  ])
+  lines.extend(f"  {line}" for line in evidence.journal)
+  if not evidence.journal:
+    lines.append("  unavailable or empty")
+  lines.extend([
+    "Next diagnostic command",
+    f"  journalctl --system --unit {display_safe(evidence.target)} --lines 50 --no-pager",
+  ])
+  return "\n".join(lines)
+
+
+def collect_service(target: str, journal_lines: int) -> ServiceEvidence:
+  result = run_systemctl(target)
+  if result.returncode != 0:
+    raise SvcDoctorError("systemd query failed")
+  properties = parse_properties(decode_output(result.stdout))
+  validate_properties(properties)
+  if properties["LoadState"] == "not-found":
+    raise SvcDoctorError(f"service not found: {display_safe(target)}")
+  names = dependency_names(properties)
+  dependency_warning = None
+  try:
+    if "Requires" not in properties or "Wants" not in properties:
+      raise SvcDoctorError("systemd response omitted dependency properties")
+    failed = find_failed_dependencies(names)
+  except SvcDoctorError as error:
+    failed = None
+    dependency_warning = f"dependency evidence unavailable: {error}"
+  try:
+    journal, journal_warning = collect_journal(target, journal_lines)
+  except SvcDoctorError as error:
+    journal, journal_warning = (), str(error)
+  return ServiceEvidence(target, properties, journal, journal_warning, failed, dependency_warning)
 
 
 def inspect_service(target: str) -> tuple[str, int]:
@@ -267,21 +492,101 @@ def inspect_service(target: str) -> tuple[str, int]:
   return render_diagnostic(target, properties), 1 if properties["ActiveState"] == "failed" else 0
 
 
+def parse_journal_lines(value: str) -> int:
+  if not value.isascii() or not value.isdecimal():
+    raise argparse.ArgumentTypeError("journal line count must be from 0 through 200")
+  result = int(value, 10)
+  if not 0 <= result <= MAX_JOURNAL_LINES:
+    raise argparse.ArgumentTypeError("journal line count must be from 0 through 200")
+  return result
+
+
+class Parser(argparse.ArgumentParser):
+  def error(self, message):
+    self.print_usage(sys.stderr)
+    self.exit(2, f"svcdoctor: error: {message}\n")
+
+
+def build_argument_parser() -> argparse.ArgumentParser:
+  parser = Parser(
+    prog="svcdoctor",
+    description="Report bounded, read-only systemd evidence for one local system service.",
+    epilog='Exit codes: 0 not failed; 1 ActiveState is "failed"; 2 invocation or observation failure; 130 interrupted.',
+  )
+  parser.add_argument("service", help="concrete service unit; bare names receive .service")
+  parser.add_argument("--journal-lines", type=parse_journal_lines, default=20, metavar="N")
+  add_output_arguments(parser)
+  return parser
+
+
 def main(arguments: Sequence[str] | None = None) -> int:
-  argv = list(sys.argv[1:] if arguments is None else arguments)
-  if argv in (["-h"], ["--help"]):
-    print(HELP, end="")
-    return 0
-  if len(argv) != 1:
-    print("svcdoctor: expected exactly one SERVICE", file=sys.stderr)
-    return 2
+  parser = build_argument_parser()
   try:
-    target = normalize_target(argv[0])
-    output, exit_code = inspect_service(target)
+    args = parser.parse_args(arguments)
+  except SystemExit as error:
+    return int(error.code)
+  validate_output_arguments(parser, args)
+  started = time.monotonic()
+  try:
+    target = normalize_target(args.service)
+    evidence = collect_service(target, args.journal_lines)
   except SvcDoctorError as error:
     print(f"svcdoctor: {error}", file=sys.stderr)
     return 2
-  print(output)
+  except KeyboardInterrupt:
+    print("svcdoctor: interrupted", file=sys.stderr)
+    return 130
+  except Exception:
+    print("svcdoctor: internal execution failure", file=sys.stderr)
+    return 2
+  failed = evidence.properties["ActiveState"] == "failed"
+  exit_code = 1 if failed else 0
+  status = "FAILED" if failed else "ACTIVE" if evidence.properties["ActiveState"] == "active" else "INACTIVE"
+  finding = f"ActiveState is {evidence.properties['ActiveState']} and SubState is {evidence.properties.get('SubState') or UNAVAILABLE}"
+  next_action = (
+    f"inspect the bounded journal and failed dependencies for {target}" if failed
+    else "no service failure was established; use the suggested journal command for deeper context"
+  )
+  conclusion = make_conclusion(status, target, finding, next_action)
+  warnings = tuple(item for item in (evidence.journal_warning, evidence.dependency_warning) if item)
+  for warning in warnings:
+    print(f"svcdoctor: warning: {display_safe(warning)}", file=sys.stderr)
+  record = OutputRecord(
+    tool="svcdoctor",
+    status=status,
+    target=target,
+    observations={
+      "properties": dict(evidence.properties),
+      "failed_dependencies": evidence.failed_dependencies,
+      "dependencies_observed": evidence.failed_dependencies is not None,
+      "recent_journal": evidence.journal,
+    },
+    conclusion=conclusion,
+    next_action=next_action + ".",
+    warnings=warnings,
+    elapsed_seconds=time.monotonic() - started,
+  )
+  brief = "\n".join([
+    f"Service: {display_safe(target)}",
+    f"State: {display_safe(evidence.properties['ActiveState'])}/{display_safe(evidence.properties.get('SubState') or UNAVAILABLE)}",
+    f"Result: {display_safe(evidence.properties.get('Result') or UNAVAILABLE)}",
+    f"Restarts: {display_safe(evidence.properties.get('NRestarts') or UNAVAILABLE)}",
+    f"Failed dependencies: {len(evidence.failed_dependencies) if evidence.failed_dependencies is not None else 'unavailable'}",
+  ])
+  try:
+    emit_output(
+      record,
+      detailed=render_service_evidence(evidence),
+      brief=brief,
+      json_mode=args.json,
+      brief_mode=args.brief,
+      quiet=args.quiet,
+      output_path=args.output,
+      force=args.force,
+    )
+  except OutputError as error:
+    print(f"svcdoctor: {display_safe(error)}", file=sys.stderr)
+    return 2
   return exit_code
 
 

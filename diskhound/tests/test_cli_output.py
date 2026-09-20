@@ -1,6 +1,7 @@
 import contextlib
 from decimal import Decimal
 import io
+import json
 import os
 from pathlib import Path
 import stat
@@ -104,27 +105,54 @@ class CliTests(unittest.TestCase):
     self.assertEqual(normalized, "/")
     self.assertTrue(stat.S_ISDIR(metadata.st_mode))
 
-  @mock.patch.object(diskhound, "inspect", return_value=("normal", (), 0))
-  def test_complete_result_stdout_and_empty_stderr(self, inspect):
+  @mock.patch.object(diskhound, "scan", return_value=result())
+  def test_complete_result_stdout_and_empty_stderr(self, scan):
     code, stdout, stderr = self.run_main(["/target"])
-    self.assertEqual((code, stdout, stderr), (0, "normal\n", ""))
+    self.assertEqual((code, stderr), (0, ""))
+    self.assertIn("Conclusion: [OBSERVED]", stdout)
 
-  @mock.patch.object(diskhound, "inspect", return_value=("partial", ("diskhound: warning: gap",), 1))
-  def test_partial_result_and_warning_streams(self, inspect):
+  @mock.patch.object(diskhound, "scan", return_value=result(failures=(
+    diskhound.ObservationFailure("/target/gap", "metadata", "gone"),
+  )))
+  def test_partial_result_and_warning_streams(self, scan):
     code, stdout, stderr = self.run_main(["/target"])
-    self.assertEqual((code, stdout), (1, "partial\n"))
-    self.assertEqual(stderr, "diskhound: warning: gap\n")
+    self.assertEqual(code, 1)
+    self.assertIn("Conclusion: [PARTIAL]", stdout)
+    self.assertIn("diskhound: warning:", stderr)
 
-  @mock.patch.object(diskhound, "inspect", side_effect=diskhound.DiagnosticError("fatal"))
-  def test_fatal_has_no_normal_stdout(self, inspect):
+  @mock.patch.object(diskhound, "scan", side_effect=diskhound.DiagnosticError("fatal"))
+  def test_fatal_has_no_normal_stdout(self, scan):
     code, stdout, stderr = self.run_main(["/target"])
     self.assertEqual((code, stdout), (3, ""))
     self.assertIn("fatal", stderr)
 
-  @mock.patch.object(diskhound, "inspect", side_effect=KeyboardInterrupt)
-  def test_ctrl_c_has_no_normal_stdout(self, inspect):
+  @mock.patch.object(diskhound, "scan", side_effect=KeyboardInterrupt)
+  def test_ctrl_c_has_no_normal_stdout(self, scan):
     code, stdout, stderr = self.run_main(["/target"])
     self.assertEqual((code, stdout, stderr), (130, "", "diskhound: interrupted\n"))
+
+  @mock.patch.object(diskhound, "scan", return_value=result())
+  def test_json_brief_and_quiet_modes(self, scan):
+    code, stdout, stderr = self.run_main(["--json", "/target"])
+    self.assertEqual((code, stderr), (0, ""))
+    payload = json.loads(stdout)
+    self.assertEqual(payload["tool"], "diskhound")
+    self.assertEqual(payload["status"], "OBSERVED")
+    code, stdout, _ = self.run_main(["--brief", "/target"])
+    self.assertEqual(code, 0)
+    self.assertIn("Filesystem use:", stdout)
+    self.assertNotIn("File types:", stdout)
+    code, stdout, _ = self.run_main(["--quiet", "/target"])
+    self.assertEqual((code, stdout), (0, ""))
+
+  def test_bounded_options(self):
+    parser = diskhound.build_argument_parser()
+    parsed = parser.parse_args([
+      "--top", "20", "--max-depth", "3", "--max-entries", "50",
+      "--min-size", "1024", "--exclude", "cache/*", "/tmp",
+    ])
+    self.assertEqual((parsed.top, parsed.max_depth, parsed.max_entries), (20, 3, 50))
+    self.assertEqual(parsed.min_size, 1024)
 
 
 class OutputTests(unittest.TestCase):

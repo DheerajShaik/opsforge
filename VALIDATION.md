@@ -1,67 +1,88 @@
-# OpsForge v0.1.0-beta.1 release validation
+# OpsForge v0.2.0-beta.1 candidate validation
 
-Validation recorded on 2026-09-12. This record covers release-regression and packaging work; it does not replace the utility-specific interpretation limits or claim production readiness.
+Hardening validation updated on 2026-09-19 for PR #16, branch `feat/opsforge-v0.2`. This record separates executed tests from support policy and outstanding environments. It is not production certification or a formal security audit.
+
+## Candidate and release gate
+
+The hardening baseline is reviewed commit `96a61406b2350abe3cdbd0a655cc822cc0454cdc`. The final hardened runtime is commit `c6e8e0fa843b1bae502e700095c90811694670aa`. Its [release regression run](https://github.com/DheerajShaik/opsforge/actions/runs/35443737283) and all ten focused utility workflows passed. A later documentation-only commit may move the branch head without changing the tested runtime, tests, packaging configuration, or workflows.
+
+The supported Beta platform is **CPython 3.10–3.14 on Ubuntu 24.04 LTS Linux**. Merge readiness requires the final-head five-version regression matrix, both wheel and sdist clean-install matrices, the completed WSL2 manual campaign plus targeted hardening revalidation, and final external merge review. No merge, tag, publication, or GitHub release is part of this task.
+
+The user's completed WSL2 manual campaign reported functional PASS across all ten utilities, negative/error scenarios, output/symlink/security scenarios, bounded-scale/interruption behavior, and a privilege comparison, with no product discrepancy observed in that environment. Its stricter NO-GO statement depended on additional native-host and Kubernetes campaigns. Those campaigns are **unvalidated environments**, not failed tests and not additional Beta merge gates: Kubernetes is outside the claimed Beta contract. GitHub Actions supplies native Ubuntu coverage, without implying manual production-host certification.
+
+The previous local record referenced `f3dc8775b4ad11e7ff3bc043a8217b43d70f3188`. A Git diff of all Python files between that commit and `96a61406...` is empty: the previously validated runtime matched the reviewed runtime. The new hardening changes require the regression and targeted revalidation below; the older manual results do not claim execution of the new code.
 
 ## Local environment
 
-- Ubuntu 24.04.1 LTS under WSL2
-- Linux kernel 6.18.33.2-microsoft-standard-WSL2, x86_64
+- Ubuntu 24.04.1 LTS under WSL2, x86_64
+- Linux 6.18.33.2-microsoft-standard-WSL2
 - CPython 3.12.3
 - OpenSSL 3.0.13
-- `ss` and `systemctl` available; the systemd system manager was running
+- systemd 255.4; iproute2 `ss` 6.1.0
 
-This is the locally validated environment, not a claim of universal Linux, WSL, distribution, kernel, systemd, OpenSSL, or Python compatibility.
+Only CPython 3.12 is installed locally. Other interpreter results must come from the hosted CI matrix.
 
-## Automated regression result
+## Deterministic regression coverage
 
-All ten modules compiled with `python3 -m py_compile`. Each existing suite then passed with `python3 -m unittest discover -s UTILITY/tests -q`:
+The final suite has 519 tests, preserving all 451 baseline tests and adding 68 regressions. Local CPython 3.12.3 compilation of shared code, all ten utilities, and tests passed; all 519 tests passed with no failures or skips. Hosted Ubuntu 24.04 compilation and all 519 tests passed independently on CPython 3.10, 3.11, 3.12, 3.13, and 3.14, with no failures or skips.
 
-| Utility | Tests |
+| Hosted interpreter | Compilation | Tests | Wheel clean install | sdist clean install |
+| --- | --- | ---: | --- | --- |
+| CPython 3.10 | PASS | 519 | PASS | PASS |
+| CPython 3.11 | PASS | 519 | PASS | PASS |
+| CPython 3.12 | PASS | 519 | PASS | PASS |
+| CPython 3.13 | PASS | 519 | PASS | PASS |
+| CPython 3.14 | PASS | 519 | PASS | PASS |
+
+| Suite | Tests |
 | --- | ---: |
-| PortLens | 28 |
-| DiskHound | 44 |
-| CertWatch | 56 |
-| SvcDoctor | 48 |
-| LogHound | 36 |
-| ProcWatch | 27 |
-| ConfigDiff | 27 |
-| NetDoctor | 28 |
-| HealthCtl | 41 |
-| Incident Snapshot | 59 |
-| **Total** | **394** |
+| Shared output | 10 |
+| PortLens | 39 |
+| DiskHound | 51 |
+| CertWatch | 66 |
+| SvcDoctor | 63 |
+| LogHound | 49 |
+| ProcWatch | 34 |
+| ConfigDiff | 39 |
+| NetDoctor | 34 |
+| HealthCtl | 64 |
+| Incident Snapshot | 70 |
+| **Total** | **519** |
 
-No utility implementation was changed for this release transition.
+New regressions cover descriptor-relative ConfigDiff traversal and deterministic same-filesystem/symlink replacement; DiskHound global enumeration/visit budgets at 1 and 10 entries against 2,000 files; ProcWatch auxiliary start-tick identity changes before, after, and during collection; dependency command/format/count/state failures with JSON null-versus-empty distinctions; IPv4/IPv6/loopback route context; global rotated timestamp/minute aggregation and bounded overflow; certificate candidate caps, fallback, trust/hostname failures, numeric hosts, expiry thresholds, total deadlines, and interrupts; explicit PortLens enrichment limitations; exited-helper process-group cleanup; and Incident Snapshot unavailable evidence.
 
-## Distribution and clean-install result
+Shared regression coverage retains schema version 1, 16 MiB output limits, terminal sanitization, 0600 output creation, symlink/non-regular/hardlink rejection, force semantics, and subprocess interruption/timeout bounds. Runtime dependencies remain empty.
 
-`python -m build` successfully produced:
+Final review also added regressions for accurate normalized ConfigDiff match wording, rejecting HTTP port zero/empty credentials and malformed severity, and counting HealthCtl errors once in human summaries.
 
-- `opsforge-0.1.0b1.tar.gz`
-- `opsforge-0.1.0b1-py3-none-any.whl`
+## Targeted local integration
 
-The wheel was installed with `pip install --no-deps` into a fresh virtual environment from outside the source tree. Metadata resolved as `opsforge 0.1.0b1`, with no runtime dependencies. All ten expected commands were present, and every installed `--help` invocation exited `0`.
+Executed on 2026-09-19 against the hardened runtime:
 
-Representative installed invocations also reached the existing implementations with their documented status semantics:
+- ConfigDiff: equal nested trees with explicitly compared directory symlinks.
+- DiskHound: 2,000-file fixture, `--max-entries 10`, exactly 10 visited entries, one global-limit failure, exit 1, 3,679-byte JSON output.
+- ProcWatch: live validation process, stable initial/final auxiliary evidence.
+- SvcDoctor: active `dbus.service` and observed dependencies; unavailable paths covered deterministically.
+- NetDoctor: successful local loopback listener; connection interface null and IPv4 default-route context separate.
+- LogHound: rotations eight hours apart produced a 28,801-second span; overlapping minute counts summed correctly.
+- HealthCtl certificate candidate/deadline/trust paths: deterministic controlled socket/resolver tests.
 
-| Command | Scenario | Exit |
-| --- | --- | ---: |
-| `portlens` | no listener observed on selected local port | 1 |
-| `diskhound` | bounded temporary directory scan | 0 |
-| `certwatch` | `example.com:443` certificate observation | 0 |
-| `svcdoctor` | active local `dbus.service` observation | 0 |
-| `loghound` | two-line recurring-message sample | 0 |
-| `procwatch` | two-sample observation of PID 1 | 0 |
-| `configdiff` | identical temporary files | 0 |
-| `netdoctor` | refused local TCP endpoint | 1 |
-| `healthctl` | configured root free-space threshold of zero | 0 |
-| `incident-snapshot` | complete local snapshot | 0 |
+No public endpoints were contacted during this pass. Historical CertWatch controlled/public validation is retained in `certwatch/VALIDATION.md`; the new CertWatch change concerns interrupted socket/helper cleanup, not certificate interpretation.
 
-The clean environment then uninstalled `opsforge` successfully and removed its console scripts.
+## Packaging
 
-The local WSL image lacks Ubuntu's `python3.12-venv`/`ensurepip` package, so local `pipx install .` could not create its own managed environment without unavailable administrator access. The artifact itself was therefore validated through an equivalent clean virtual-environment installation. The repository-wide GitHub Actions package job exercises ordinary `venv` creation, wheel installation, all entry points, representative invocations, and uninstallation on a Python image with the required packaging prerequisites.
+Both `opsforge-0.2.0b1-py3-none-any.whl` and `opsforge-0.2.0b1.tar.gz` built successfully from the final runtime. Disposable local CPython 3.12 environments outside the source tree passed metadata/version, empty runtime dependencies, imports, all ten commands and `--help`, nine installed schema-version-1 JSON smoke checks, `pip check`, and removal of every console script after uninstall. The hosted matrix repeated those checks for both artifacts on every supported interpreter from 3.10 through 3.14.
 
-## CertWatch post-fix evidence
+The nine JSON smoke commands are DiskHound, LogHound, ConfigDiff, HealthCtl, ProcWatch, Incident Snapshot, PortLens, NetDoctor, and SvcDoctor. Hosted SvcDoctor packaging smoke uses controlled systemd helper output; the targeted local service check used real systemd. CertWatch receives help/import checks and deterministic TLS tests, not unsolicited public-network packaging smoke.
 
-The previously pending real-world WSL revalidation completed at 2026-09-12T12:45:00Z. CertWatch successfully observed and decoded the public `example.com:443` leaf certificate using Python 3.12.3 and OpenSSL 3.0.13, including the SAN output shape that motivated the parser hardening. It exited `0` because the encoded validity period was current and outside the configured warning window. CA trust and hostname identity were not assessed.
+## Limitations and unvalidated environments
 
-Further details and historical environments remain in [certwatch/VALIDATION.md](certwatch/VALIDATION.md) and [diskhound/VALIDATION.md](diskhound/VALIDATION.md).
+- Kubernetes/container orchestrators, other Linux distributions, alternative libc implementations, different namespace layouts, broad production filesystems, broad scale campaigns, and other systemd/OpenSSL/iproute2 versions are not claimed validated.
+- Native non-WSL manual production-host testing remains unperformed. Native Ubuntu GitHub Actions is a separate automated validation surface.
+- The earlier user-reported WSL privilege comparison does not establish general elevated-permission support; no new privilege escalation or elevated-permission campaign was performed.
+- No formal penetration test, formal security audit, or broad production certification was performed.
+- OS `getaddrinfo()` cannot be hard-cancelled. HTTP/certificate checks use one deadline across subsequent network operations; resolver time consumes that budget, but the resolver itself may overrun it.
+- Certificate revocation is not checked. Portable intermediate expiry inspection and semantic TOML remain deferred under the Python 3.10/standard-library-only boundary.
+- Filesystem, procfs, systemd, and socket evidence is live and non-atomic. PortLens explicitly cannot prove that later procfs metadata belongs to the exact process incarnation reported by `ss`.
+
+These limits are not failed compatibility tests. The Beta gate above is the single release-readiness policy; no additional full manual campaign is requested.

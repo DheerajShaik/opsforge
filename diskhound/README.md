@@ -1,88 +1,34 @@
 # DiskHound
 
-DiskHound is a Beta Linux diagnostic utility that reports capacity context for one explicitly selected directory's filesystem and ranks eligible immediate entries by recursively observed allocated space. It helps an operator choose the next branch to inspect without modifying the filesystem.
-
-## Scope and semantics
-
-DiskHound accepts exactly one directory and performs a single-process, single-threaded, metadata-only scan. It does not read file contents, hash data, clean files, recommend deletion, elevate privileges, or invoke external commands.
-
-Allocated bytes are calculated from Linux inode metadata as:
-
-```text
-st_blocks * 512
-```
-
-Directory inodes, symlink inodes, and metadata-reported allocation for special objects count. DiskHound never intentionally follows an entry observed as a symlink and never intentionally traverses a symlink target. A final-component target symlink is rejected.
-
-The accepted target's `st_dev` defines the scan device. Entries on another device are excluded from allocation and traversal. Cross-device immediate entries are reported separately and do not enter the ranking denominator. This is device awareness, not complete mount-topology awareness: same-device bind mounts may still be traversed.
+DiskHound is a bounded, read-only Linux filesystem diagnostic. It combines filesystem capacity/inode context with allocation-focused ranking, largest-file, age, sparse-file, and extension-group evidence without following symlinks or silently crossing filesystems.
 
 ## Usage
 
-Requirements are Linux and CPython 3.10 through 3.14 with no third-party packages or external commands. The project-level supported and validated environment boundaries are documented in the [root README](../README.md#compatibility-and-support-boundaries).
-
 ```console
 diskhound PATH
-diskhound --help
+diskhound PATH --top 20 --max-depth 8 --max-entries 50000
+diskhound PATH --min-size 10485760 --exclude '*.cache' --age-days 90
+diskhound PATH --cross-filesystems --json
 ```
 
-There is no default target. Absolute paths, relative paths, `.`, explicit `/`, and trailing slashes are accepted when they identify an inspectable directory. The displayed target is absolute and lexically normalized, not claimed to be a canonical physical path.
+`--top` is 1-100 (default 10), `--max-depth` is 0-256 (default 64), and `--max-entries` is 1-1,000,000 (default 100,000). Each directory is independently capped at 100,000 entries. `--min-size` accepts bounded byte quantities. `--exclude` is repeatable up to 32 printable relative-path glob patterns of at most 256 characters. `--age-days` is 0-36,500 (default 30).
 
-## Output
+Traversal stays on the target device unless `--cross-filesystems` is explicit. Final and encountered symlinks are not followed.
 
-DiskHound prints:
+The global entry budget includes enumeration and metadata attempts, including excluded, cross-device, and inaccessible entries. Enumeration retains at most the remaining budget, with one extra directory entry used only to detect truncation. Retained children are sorted before processing; when a directory exceeds the budget, its retained subset depends on filesystem enumeration order. Already observed metadata is retained, further descent stops, and one global entry-limit warning marks the scan partial. An unexamined directory at the budget boundary is conservatively partial even if it might be empty. The per-directory ceiling still applies when the global limit is larger.
 
-- target and scan scope;
-- complete or incomplete observation status;
-- filesystem `Total`, `Used`, `Filesystem free`, `Available to caller`, and caller-oriented `Use%`;
-- target-directory allocation;
-- globally deduplicated Unique observed target allocation;
-- eligible and cross-device-excluded immediate-entry counts;
-- at most ten eligible immediate entries ranked by exact allocated bytes.
+## Evidence and interpretation
 
-Every displayed byte quantity includes an IEC value and its authoritative exact integer bytes, for example `8.4 GiB (9019431321 bytes)`. Exact bytes, not rounded display values, determine totals and ranking.
+The report includes byte capacity and inode use for the target filesystem, target-directory allocation, unique observed allocation with hard-link de-duplication, top immediate branches, largest individual regular files, logical versus allocated bytes, sparse-file count, old-file count, suffix groups, visited/excluded/depth-limited counts, and inaccessible or raced entries.
 
-Filesystem capacity and observed tree allocation are separate observations and need not reconcile. Capacity includes filesystem-wide information that a pathname walk cannot attribute, while tree observations depend on visibility and live inode metadata.
+Ranking uses allocated bytes; `--min-size` filters ranked branches by logical bytes. Sparse means logical size exceeds observed allocation and does not diagnose why. Concentration and age are observations, not deletion advice. Filesystems may report delayed, compressed, shared, reserved, or synthetic allocation differently.
 
-## Hard links
+## Output and exit codes
 
-Within one immediate branch, an inode identified by `(st_dev, st_ino)` counts once. If an inode is reachable through multiple eligible sibling branches, it counts once in each branch; DiskHound does not invent a pathname owner.
+Status is `OBSERVED` or `PARTIAL`. Exit 0 means the bounded scan completed, 1 means useful but incomplete evidence, 2 means an invalid target/invocation, 3 means no trustworthy diagnostic could be produced, and 130 means interrupted. Partial warnings remain on stderr, including with `--quiet`.
 
-Unique observed target allocation includes the target directory once and every successfully observed eligible descendant inode once globally. Consequently, branch totals are not additive and their sum may exceed the global unique total. Neither value represents unique physical storage, exclusive ownership, or reclaimable bytes; CoW, reflinks, compression, and shared extents can further limit physical interpretation.
+`--brief`, schema-version-1 `--json`, `--quiet`, `--output FILE`, and explicit `--force` follow the shared safe-output contract. Human output ends with the standard conclusion line.
 
-## Exit codes
+## Permissions, privacy, and limits
 
-| Code | Meaning |
-| --- | --- |
-| `0` | Diagnostic completed with no known required-observation gaps. |
-| `1` | A useful diagnostic was produced, but known observation or capacity-context gaps exist. |
-| `2` | Invalid invocation or invalid target. |
-| `3` | DiskHound could not produce a useful target ranking. |
-| `130` | Interrupted by SIGINT / Ctrl-C. |
-
-Known descendant failures are reported on stderr, while useful partial results remain on stdout. At most 20 deterministic path-specific warnings are shown; any additional count is reported in one suppression warning. Capacity-context failure has a separate warning and does not prevent an otherwise useful tree scan.
-
-## Live filesystem and permissions
-
-DiskHound does not require root or elevate privileges. Permissions determine visibility. A target-level failure is fatal; descendant failures normally make a useful result incomplete.
-
-The scan is not a filesystem snapshot or a security boundary. Entries, allocation, permissions, mounts, and pathname resolution can change between operations. DiskHound uses no-follow and descriptor-relative operations where practical, but does not promise immunity from every pathname TOCTOU race. An exit code of `0` means no required observation gap was detected, not that the output represents one atomic instant.
-
-Large, deep, wide, remote, or pathological trees may require substantial time, memory, metadata I/O, and page-cache activity. Explicitly scanning a network-backed mount may cause ordinary filesystem-client network traffic.
-
-## Security and privacy
-
-DiskHound is read-only and contains no telemetry, analytics, update checks, application-level network communication, remote inspection, or persistent scan state. It does not open file contents, FIFOs, sockets, or device contents. Filesystem-derived paths and errors are escaped so control characters cannot alter terminal output structure.
-
-Output contains filesystem pathnames and allocation information; treat it as operational metadata when storing or sharing it.
-
-## Tests
-
-Run the standard-library test suite from the repository root:
-
-```console
-python3 -m unittest discover -s diskhound/tests -v
-```
-
-## Current limitations
-
-DiskHound is Beta and not production-ready. Its observations are permission-dependent and non-atomic. `st_blocks` does not establish unique physical allocation on every filesystem, same-device bind mounts are not detected, full mount topology is not interpreted, and results are not promised to equal `df` or `du`.
+DiskHound performs no network activity or mutation and never elevates privileges. Paths, metadata, sizes, ages, and filenames can still be sensitive. Directory trees are live rather than atomic; entries may change or disappear. Mount-namespace visibility and caller permissions define scope. The tool does not decide what is safe to remove, diagnose storage hardware, inspect file content, or remediate capacity.

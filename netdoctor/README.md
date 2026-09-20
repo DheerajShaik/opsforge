@@ -1,89 +1,34 @@
 # NetDoctor
 
-NetDoctor is a Beta Linux network diagnostic utility that reports OS resolver evidence and TCP connection-establishment evidence for one explicitly selected remote endpoint. It answers one narrow question: for this host and TCP port, what address candidates did the local resolver provide, and did a TCP handshake complete to one of them during this invocation?
-
-NetDoctor does not decide whether an application, service, website, API, TLS endpoint, host, or network is healthy. A TCP handshake is transport evidence only. A failed handshake does not identify root cause by itself.
-
-## Requirements
-
-- CPython 3.10 through 3.14
-- standard-library networking only
-- no external commands or third-party packages
-
-The project-level supported and validated environment boundaries are documented in the [root README](../README.md#compatibility-and-support-boundaries).
+NetDoctor explains where one destination-specific connection attempt succeeds or fails across operating-system resolution, route evidence, address family, TCP, and optional TLS. It is not a scanner and never expands a target into ports, hosts, ranges, or subnets.
 
 ## Usage
 
 ```console
 netdoctor HOST PORT
-netdoctor --help
+netdoctor example.com 443 --compare-families --retries 1
+netdoctor example.com 443 --tls
+netdoctor 192.0.2.10 443 --tls --sni api.example.com --json
 ```
 
-`HOST` is either a strict ASCII DNS-style hostname, an IPv4 literal, or an unbracketed IPv6 literal. Single-label hostnames and a final DNS root dot are accepted. Unicode/IDNA input, underscores, whitespace, control/presentation characters, bracketed IPv6, and scoped IPv6 zone identifiers are rejected in V1. IPv6 needs no brackets because `PORT` is a separate positional argument.
+Host is a strict ASCII DNS-style name or unbracketed IPv4/IPv6 literal; port is 1-65535. Per-attempt timeout is 0.1-30 seconds (default 3). Retries are 0-3 additional bounded rounds. `--compare-families` attempts all resolved candidates rather than stopping on the first success. `--sni` requires `--tls` and an ASCII hostname.
 
-`PORT` is an ASCII decimal integer from 1 through 65535. Exactly one host and one port are required. NetDoctor has no configuration file, environment-variable input, target list, range, discovery, or scanning mode in V1.
+## Evidence and network activity
 
-## Resolution model
+NetDoctor times the OS resolver and each TCP attempt, suppresses exact duplicate candidates, and accepts at most 16 distinct IPv4/IPv6 results. It reports candidate/peer endpoints, selected local source IP, IPv4 default-route context, nameservers from bounded `/etc/resolv.conf`, and only the names—not values—of recognized proxy environment variables.
 
-For hostname targets, NetDoctor makes one operating-system `getaddrinfo()` request for TCP stream candidates using `AF_UNSPEC`, suppresses exact duplicate socket candidates, and preserves first-seen resolver order. For numeric IPv4/IPv6 targets it still asks `getaddrinfo()` to construct socket candidates, but requests `AI_NUMERICHOST` so no hostname lookup is requested by NetDoctor.
+The IPv4 default-route gateway/interface is context only: policy routes, IPv6, VPNs, subnet routes, and namespaces can select a different path. It does not establish the successful connection's interface, even for loopback. JSON uses `ipv4_default_route_context`; `selected_interface` remains `null`, and human output calls the connection interface unavailable. No route interface is inferred from a successful TCP connection.
 
-The duration of an OS hostname lookup is not bounded by the TCP connect timeout. NetDoctor accepts at most 16 distinct resolver candidates in V1 after exact duplicate suppression; a larger distinct or structurally unsupported result is treated as an observation failure rather than silently truncated. Resolver records must describe IPv4 or IPv6 TCP stream candidates for the requested port.
+Network/host-unreachable outcomes are classified at the route stage; other failures remain resolution, TCP, or TLS stage evidence. Optional TLS performs one additional targeted handshake to the successful candidate, reports version/cipher/time, intentionally disables certificate trust and identity verification, sends no application data, and explicitly does not assess revocation or application readiness.
 
-A normal hostname-resolution failure is useful diagnostic evidence. NetDoctor reports it without making a TCP connection attempt and exits with code 1. It does not query a chosen DNS server directly, inspect `/etc/resolv.conf`, distinguish stub/caching layers, perform reverse DNS, or claim why resolution failed.
+Socket attempts use explicit timeouts. The platform resolver call itself is not cancellable through Python's standard `getaddrinfo()` API and may exceed the TCP timeout.
 
-## TCP connection model
+## Output and exits
 
-Distinct resolved candidates are attempted sequentially in first-seen resolver order; an exact duplicate socket candidate is not contacted twice. Each candidate gets one three-second TCP connect timeout. NetDoctor stops after the first successful handshake; candidates after that success are not contacted. If every candidate fails, each attempted outcome is reported.
+Status is `CONNECTED` or `UNREACHABLE`; the JSON `observations.stage` identifies resolution, route, TCP, or TLS. Exit 0 means the requested TCP/TLS stage completed, 1 means it did not, 2 means invalid invocation, 3 means malformed/untrustworthy observation or output failure, and 130 means interrupted.
 
-NetDoctor classifies common connect outcomes such as timeout, connection refused, host unreachable, network unreachable, and permission denied. Other connect failures are reported as a generic connection error with the numeric OS error number when available. Numeric error evidence is intentionally preferred over localized operating-system error strings for stable output.
+`--brief`, schema-version-1 `--json`, `--quiet`, safe `--output FILE`, and explicit `--force` follow the common contract. Human output ends with the standard conclusion.
 
-A successful attempt records the local socket endpoint when available and the connected peer endpoint, then immediately closes the TCP connection. NetDoctor sends no application bytes. It performs no TLS handshake, HTTP request, protocol banner read, authentication, or service-specific probe.
+## Privacy and limits
 
-TCP state is live and non-atomic. Resolver results, routes, firewall policy, listener state, NAT behavior, and remote state can change before, during, or immediately after observation.
-
-## Output
-
-Normal output contains fixed `Target`, `Observation`, `Resolution candidates`, `Connection attempts`, and `Interpretation limits` sections. It reports the parsed target, target kind, resolver status, candidate count/order, attempt outcomes, and connected local/peer endpoints when available.
-
-External target text is terminal-safe escaped. Resolver candidate addresses are validated and rendered as canonical numeric IP endpoints. IPv6 endpoints are bracketed in output; a resolver-provided numeric scope identifier is retained when present.
-
-## Exit codes and streams
-
-| Code | Meaning |
-| --- | --- |
-| `0` | A TCP handshake completed to one resolver candidate. |
-| `1` | A useful diagnostic completed, but name resolution yielded no usable candidates or no attempted TCP candidate connected. |
-| `2` | Invalid invocation or invalid/unsupported target. |
-| `3` | No trustworthy structured diagnostic could be produced because of an unexpected resolver/socket API shape, resource/setup failure, defensive bound, or internal failure. |
-| `130` | Interrupted by SIGINT / Ctrl-C. |
-
-Normal connected and useful-negative diagnostics go to stdout. Invocation, fatal observation, interruption, and internal-failure messages go to stderr. Unexpected failures use stable wording without a traceback.
-
-## Safety, privacy, and permissions
-
-NetDoctor uses only the caller's existing networking permissions and never elevates privileges. It is diagnostic-only and performs no configuration, routing, firewall, interface, DNS, process, service, or filesystem modification.
-
-Unlike OpsForge utilities that are purely local/offline, NetDoctor's purpose explicitly requires outbound network activity to the caller-selected endpoint. A hostname invocation can cause ordinary OS resolver traffic, and TCP attempts send transport-layer packets to resolver-provided addresses on the requested port. There is no hidden telemetry, analytics, upload, update check, or unrelated outbound communication.
-
-Resolved IP addresses, the requested hostname/port, local source endpoint, peer endpoint, and connection outcomes are operational metadata. Treat captured output as potentially sensitive before storing or sharing it.
-
-## Relationship to other OpsForge utilities
-
-NetDoctor does not inspect local listening-port ownership; that is PortLens territory. It does not inspect or assess TLS certificates; that is CertWatch territory. It does not become a general service-health framework or configurable monitoring system; those concerns are reserved for later requirements such as HealthCtl.
-
-## Tests
-
-Run the standard-library suite from the repository root:
-
-```console
-python3 -m py_compile netdoctor/netdoctor.py
-python3 -m unittest discover -s netdoctor/tests -v
-```
-
-The suite uses deterministic resolver/socket fakes for failure and edge paths and includes a real local IPv4 loopback TCP-handshake check. It requires no public DNS or Internet endpoint.
-
-## V1 limitations and non-goals
-
-V1 has no ICMP/ping, UDP, Unix sockets, traceroute, path MTU discovery, routing-table inspection, ARP/neighbor inspection, firewall inspection, packet capture, interface inventory, DNS-server selection or direct DNS protocol, reverse DNS, TLS, certificates, HTTP, STARTTLS, application banners, authentication, service semantics, local port ownership, target lists, CIDR/range scanning, concurrent probes, retries, persistence, watch mode, daemon mode, JSON output, configuration file, thresholds, alerting, remediation, root-cause analysis, health/readiness classification, or production-readiness claim.
-
-Those capabilities should be considered only when concrete operational requirements justify expanding this focused transport diagnostic.
+NetDoctor deliberately performs DNS and destination-specific TCP/TLS activity. Hosts, IPs, routes, sources, interfaces, resolver addresses, proxy-variable presence, and timing can be sensitive. It does not ping, traceroute, inspect firewalls/neighbors, capture packets, send HTTP, authenticate, prove application readiness, identify root cause, or remediate.

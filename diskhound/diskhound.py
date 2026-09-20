@@ -4,19 +4,37 @@
 from __future__ import annotations
 
 import argparse
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from decimal import Decimal, ROUND_HALF_EVEN
 import errno
+import fnmatch
 import os
 import stat
 import sys
+import time
 import unicodedata
 from typing import Sequence
+
+from opsforge_common import (
+  OutputError,
+  OutputRecord,
+  add_output_arguments,
+  emit_output,
+  make_conclusion,
+  validate_output_arguments,
+)
 
 
 ALLOCATED_BLOCK_BYTES = 512
 MAX_INDIVIDUAL_WARNINGS = 20
 RESULT_LIMIT = 10
+MAX_TOP = 100
+DEFAULT_MAX_DEPTH = 64
+MAX_DEPTH = 256
+DEFAULT_MAX_ENTRIES = 100_000
+MAX_ENTRIES = 1_000_000
+MAX_EXCLUDES = 32
+MAX_DIRECTORY_ENTRIES = 100_000
 IEC_UNITS = (
   (1 << 50, "PiB"),
   (1 << 40, "TiB"),
@@ -41,6 +59,10 @@ class Capacity:
   free_bytes: int
   available_bytes: int
   use_percent: Decimal | None
+  inode_total: int | None = None
+  inode_used: int | None = None
+  inode_free: int | None = None
+  inode_use_percent: Decimal | None = None
 
 
 @dataclass(frozen=True)
@@ -60,6 +82,51 @@ class ObservedEntry:
 class BranchResult:
   path: str
   allocated_bytes: int
+  logical_bytes: int = 0
+  file_count: int = 0
+
+
+@dataclass(frozen=True)
+class FileResult:
+  path: str
+  logical_bytes: int
+  allocated_bytes: int
+  age_days: int
+  sparse: bool
+
+
+@dataclass(frozen=True)
+class TypeGroup:
+  name: str
+  files: int
+  logical_bytes: int
+  allocated_bytes: int
+
+
+@dataclass(frozen=True)
+class ScanOptions:
+  max_depth: int = DEFAULT_MAX_DEPTH
+  max_entries: int = DEFAULT_MAX_ENTRIES
+  cross_filesystems: bool = False
+  excludes: tuple[str, ...] = ()
+  top: int = RESULT_LIMIT
+  minimum_bytes: int = 0
+  age_days: int = 30
+
+
+@dataclass
+class ScanAccumulator:
+  options: ScanOptions
+  target: str
+  visited_entries: int = 0
+  enumerated_entries: int = 0
+  entry_limit_reached: bool = False
+  excluded_entries: int = 0
+  depth_limited_directories: int = 0
+  old_file_count: int = 0
+  sparse_file_count: int = 0
+  largest_files: list[FileResult] = field(default_factory=list)
+  type_groups: dict[str, list[int]] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -72,6 +139,16 @@ class ScanResult:
   branches: tuple[BranchResult, ...]
   cross_device_immediate: int
   failures: tuple[ObservationFailure, ...]
+  largest_files: tuple[FileResult, ...] = ()
+  type_groups: tuple[TypeGroup, ...] = ()
+  excluded_entries: int = 0
+  depth_limited_directories: int = 0
+  visited_entries: int = 0
+  old_file_count: int = 0
+  sparse_file_count: int = 0
+  max_depth: int = DEFAULT_MAX_DEPTH
+  max_entries: int = DEFAULT_MAX_ENTRIES
+  crossed_filesystems: bool = False
 
   @property
   def incomplete(self) -> bool:
@@ -87,7 +164,35 @@ def build_argument_parser() -> argparse.ArgumentParser:
     ),
   )
   parser.add_argument("path", help="Linux directory to inspect")
+  parser.add_argument("--top", type=parse_bounded_int(1, MAX_TOP, "top"), default=RESULT_LIMIT, metavar="N")
+  parser.add_argument("--max-depth", type=parse_bounded_int(0, MAX_DEPTH, "depth"), default=DEFAULT_MAX_DEPTH, metavar="N")
+  parser.add_argument("--max-entries", type=parse_bounded_int(1, MAX_ENTRIES, "entry limit"), default=DEFAULT_MAX_ENTRIES, metavar="N")
+  parser.add_argument("--min-size", type=parse_size, default=0, metavar="BYTES", help="show ranked items at or above this logical byte size")
+  parser.add_argument("--exclude", action="append", default=[], metavar="PATTERN", help="exclude a relative path glob (repeatable, maximum 32)")
+  parser.add_argument("--age-days", type=parse_bounded_int(0, 36500, "age"), default=30, metavar="DAYS")
+  parser.add_argument("--cross-filesystems", action="store_true", help="allow traversal onto filesystems other than the target filesystem")
+  add_output_arguments(parser)
   return parser
+
+
+def parse_bounded_int(minimum: int, maximum: int, label: str):
+  def parse(value: str) -> int:
+    if not value.isascii() or not value.isdecimal():
+      raise argparse.ArgumentTypeError(f"{label} must be a decimal integer from {minimum} through {maximum}")
+    result = int(value, 10)
+    if not minimum <= result <= maximum:
+      raise argparse.ArgumentTypeError(f"{label} must be from {minimum} through {maximum}")
+    return result
+  return parse
+
+
+def parse_size(value: str) -> int:
+  if not value.isascii() or not value.isdecimal():
+    raise argparse.ArgumentTypeError("size must be a decimal byte count")
+  result = int(value, 10)
+  if not 0 <= result <= (1 << 63) - 1:
+    raise argparse.ArgumentTypeError("size is outside the supported range")
+  return result
 
 
 def normalize_target(path: str) -> str:
@@ -145,7 +250,22 @@ def calculate_capacity(metadata: object) -> Capacity:
   percentage = None
   if denominator > 0:
     percentage = Decimal(used) * Decimal(100) / Decimal(denominator)
-  return Capacity(total, used, free, available, percentage)
+  inode_total = getattr(metadata, "f_files", None)
+  inode_free = getattr(metadata, "f_ffree", None)
+  if not isinstance(inode_total, int) or isinstance(inode_total, bool) or inode_total < 0:
+    inode_total = None
+  if not isinstance(inode_free, int) or isinstance(inode_free, bool) or inode_free < 0:
+    inode_free = None
+  inode_used = None
+  inode_percentage = None
+  if inode_total is not None and inode_free is not None:
+    inode_used = inode_total - inode_free
+    if inode_total > 0:
+      inode_percentage = Decimal(inode_used) * Decimal(100) / Decimal(inode_total)
+  return Capacity(
+    total, used, free, available, percentage,
+    inode_total, inode_used, inode_free, inode_percentage,
+  )
 
 
 def format_bytes(value: int) -> str:
@@ -175,8 +295,12 @@ def _open_directory(path: str) -> int:
 def list_directory(
   path: str,
   expected: os.stat_result | None = None,
+  accumulator: ScanAccumulator | None = None,
 ) -> tuple[list[ObservedEntry], list[ObservationFailure]]:
   """Inspect direct children relative to a no-follow directory descriptor."""
+  if accumulator is not None and accumulator.enumerated_entries >= accumulator.options.max_entries:
+    accumulator.entry_limit_reached = True
+    return [], []
   descriptor = _open_directory(path)
   try:
     opened = os.fstat(descriptor)
@@ -188,6 +312,16 @@ def list_directory(
     failures = []
     with os.scandir(descriptor) as iterator:
       for entry in iterator:
+        if accumulator is not None:
+          if accumulator.enumerated_entries >= accumulator.options.max_entries:
+            accumulator.entry_limit_reached = True
+            break
+          accumulator.enumerated_entries += 1
+        if len(entries) + len(failures) >= MAX_DIRECTORY_ENTRIES:
+          failures.append(ObservationFailure(
+            path, "entry-limit", f"directory exceeded {MAX_DIRECTORY_ENTRIES} entries",
+          ))
+          break
         child_path = os.path.join(path, entry.name)
         try:
           metadata = os.stat(entry.name, dir_fd=descriptor, follow_symlinks=False)
@@ -195,6 +329,7 @@ def list_directory(
           failures.append(ObservationFailure(child_path, "metadata", str(error)))
         else:
           entries.append(ObservedEntry(child_path, metadata))
+    entries.sort(key=lambda item: path_sort_key(item.path))
     return entries, failures
   finally:
     os.close(descriptor)
@@ -204,22 +339,37 @@ def _scan_branch(
   initial: ObservedEntry,
   scan_device: int,
   global_inodes: set[tuple[int, int]],
-) -> tuple[int, int, list[ObservationFailure]]:
+  accumulator: ScanAccumulator | None = None,
+) -> tuple[int, int, list[ObservationFailure], int, int]:
   branch_inodes: set[tuple[int, int]] = set()
   failures: list[ObservationFailure] = []
   total = 0
+  logical_total = 0
+  file_count = 0
   new_global_total = 0
-  pending = [initial]
+  pending = [(initial, 1)]
 
   while pending:
-    entry = pending.pop()
+    entry, depth = pending.pop()
     metadata = entry.metadata
-    if metadata.st_dev != scan_device:
+    if accumulator is not None:
+      if accumulator.visited_entries >= accumulator.options.max_entries:
+        accumulator.entry_limit_reached = True
+        break
+      accumulator.visited_entries += 1
+      relative = os.path.relpath(entry.path, accumulator.target)
+      if any(fnmatch.fnmatchcase(relative, pattern) for pattern in accumulator.options.excludes):
+        accumulator.excluded_entries += 1
+        continue
+    if metadata.st_dev != scan_device and not (
+      accumulator is not None and accumulator.options.cross_filesystems
+    ):
       continue
     identity = (metadata.st_dev, metadata.st_ino)
     if identity in branch_inodes:
       continue
     branch_inodes.add(identity)
+    allocation = 0
     try:
       allocation = allocated_bytes(metadata)
     except ValueError as error:
@@ -230,15 +380,44 @@ def _scan_branch(
         global_inodes.add(identity)
         new_global_total += allocation
 
+    logical_size = getattr(metadata, "st_size", 0)
+    if not isinstance(logical_size, int) or logical_size < 0:
+      logical_size = 0
+    if accumulator is not None and stat.S_ISREG(metadata.st_mode):
+      file_allocation = allocation
+      modified = getattr(metadata, "st_mtime", time.time())
+      age_days = max(0, int((time.time() - modified) // 86400)) if isinstance(modified, (int, float)) else 0
+      sparse = logical_size > file_allocation
+      if sparse:
+        accumulator.sparse_file_count += 1
+      if age_days >= accumulator.options.age_days:
+        accumulator.old_file_count += 1
+      candidate = FileResult(entry.path, logical_size, file_allocation, age_days, sparse)
+      logical_total += logical_size
+      file_count += 1
+      accumulator.largest_files.append(candidate)
+      accumulator.largest_files.sort(key=lambda item: (-item.logical_bytes, path_sort_key(item.path)))
+      del accumulator.largest_files[accumulator.options.top:]
+      suffix = os.path.splitext(entry.path)[1].lower()[:32] or "[no extension]"
+      if suffix not in accumulator.type_groups and len(accumulator.type_groups) >= 128:
+        suffix = "[other]"
+      group = accumulator.type_groups.setdefault(suffix, [0, 0, 0])
+      group[0] += 1
+      group[1] += logical_size
+      group[2] += file_allocation
+
     if stat.S_ISDIR(metadata.st_mode) and not stat.S_ISLNK(metadata.st_mode):
+      if accumulator is not None and depth >= accumulator.options.max_depth:
+        accumulator.depth_limited_directories += 1
+        continue
       try:
-        children, child_failures = list_directory(entry.path, metadata)
+        children, child_failures = list_directory(entry.path, metadata, accumulator)
       except OSError as error:
         failures.append(ObservationFailure(entry.path, "enumeration", str(error)))
       else:
         failures.extend(child_failures)
-        pending.extend(children)
-  return total, new_global_total, failures
+        pending.extend((child, depth + 1) for child in reversed(children))
+  return total, new_global_total, failures, logical_total, file_count
 
 
 def validate_target(path: str) -> tuple[str, os.stat_result]:
@@ -260,10 +439,12 @@ def validate_target(path: str) -> tuple[str, os.stat_result]:
   return target, metadata
 
 
-def scan(path: str) -> ScanResult:
+def scan(path: str, options: ScanOptions | None = None) -> ScanResult:
+  options = ScanOptions() if options is None else options
   target, target_metadata = validate_target(path)
+  accumulator = ScanAccumulator(options, target)
   try:
-    immediate, initial_failures = list_directory(target, target_metadata)
+    immediate, initial_failures = list_directory(target, target_metadata, accumulator)
   except OSError as error:
     raise DiagnosticError(
       f"could not enumerate target {display_safe(target)}: {display_safe(error)}"
@@ -305,19 +486,32 @@ def scan(path: str) -> ScanResult:
   eligible = []
   cross_device = 0
   for entry in immediate:
-    if entry.metadata.st_dev != target_metadata.st_dev:
+    if any(fnmatch.fnmatchcase(os.path.relpath(entry.path, target), pattern) for pattern in options.excludes):
+      accumulator.excluded_entries += 1
+    elif entry.metadata.st_dev != target_metadata.st_dev and not options.cross_filesystems:
       cross_device += 1
     else:
       eligible.append(entry)
 
   branches = []
   for entry in eligible:
-    total, new_global_total, branch_failures = _scan_branch(
-      entry, target_metadata.st_dev, global_inodes,
+    if accumulator.visited_entries >= options.max_entries:
+      accumulator.entry_limit_reached = True
+      break
+    if options.max_depth == 0:
+      accumulator.depth_limited_directories += int(stat.S_ISDIR(entry.metadata.st_mode))
+      continue
+    total, new_global_total, branch_failures, logical_total, file_count = _scan_branch(
+      entry, target_metadata.st_dev, global_inodes, accumulator,
     )
     failures.extend(branch_failures)
-    branches.append(BranchResult(entry.path, total))
+    branches.append(BranchResult(entry.path, total, logical_total, file_count))
     unique_total += new_global_total
+
+  if accumulator.entry_limit_reached:
+    failures.append(ObservationFailure(
+      target, "entry-limit", f"scan stopped at the global {options.max_entries}-entry budget",
+    ))
 
   branches.sort(key=lambda branch: (-branch.allocated_bytes, path_sort_key(branch.path)))
   return ScanResult(
@@ -329,10 +523,25 @@ def scan(path: str) -> ScanResult:
     branches=tuple(branches),
     cross_device_immediate=cross_device,
     failures=tuple(failures),
+    largest_files=tuple(accumulator.largest_files),
+    type_groups=tuple(
+      TypeGroup(name, values[0], values[1], values[2])
+      for name, values in sorted(
+        accumulator.type_groups.items(), key=lambda item: (-item[1][1], item[0]),
+      )
+    ),
+    excluded_entries=accumulator.excluded_entries,
+    depth_limited_directories=accumulator.depth_limited_directories,
+    visited_entries=accumulator.visited_entries,
+    old_file_count=accumulator.old_file_count,
+    sparse_file_count=accumulator.sparse_file_count,
+    max_depth=options.max_depth,
+    max_entries=options.max_entries,
+    crossed_filesystems=options.cross_filesystems,
   )
 
 
-def render_result(result: ScanResult) -> str:
+def render_result(result: ScanResult, *, top: int = RESULT_LIMIT, minimum_bytes: int = 0) -> str:
   failure_count = len(result.failures)
   state = "incomplete" if result.incomplete else "complete"
   lines = [
@@ -353,12 +562,23 @@ def render_result(result: ScanResult) -> str:
       f"  Available to caller: {format_bytes(result.capacity.available_bytes)}",
       f"  Use%:                {format_percent(result.capacity.use_percent)}",
     ])
+    if result.capacity.inode_total is not None:
+      lines.extend([
+        f"  Inodes total:        {result.capacity.inode_total}",
+        f"  Inodes used:         {result.capacity.inode_used}",
+        f"  Inodes free:         {result.capacity.inode_free}",
+        f"  Inode use%:          {format_percent(result.capacity.inode_use_percent)}",
+      ])
 
   target_allocation = (
     format_bytes(result.target_allocated_bytes)
     if result.target_allocated_bytes is not None else "unavailable"
   )
-  displayed = result.branches[:RESULT_LIMIT]
+  eligible_branches = tuple(
+    item for item in result.branches
+    if max(item.logical_bytes, item.allocated_bytes) >= minimum_bytes
+  )
+  displayed = eligible_branches[:top]
   eligible_count = len(result.branches)
   lines.extend([
     "",
@@ -367,6 +587,9 @@ def render_result(result: ScanResult) -> str:
     f"  Unique observed target allocation: {format_bytes(result.unique_allocated_bytes)}",
     f"  Eligible immediate entries: {eligible_count}",
     f"  Cross-device immediate entries excluded: {result.cross_device_immediate}",
+    f"  Excluded entries: {result.excluded_entries}",
+    f"  Visited entries: {result.visited_entries} (limit {result.max_entries})",
+    f"  Depth-limited directories: {result.depth_limited_directories} (maximum depth {result.max_depth})",
     f"  Showing {len(displayed)} of {eligible_count} eligible immediate entries",
   ])
   if displayed:
@@ -375,6 +598,29 @@ def render_result(result: ScanResult) -> str:
       lines.append(f"  {format_bytes(branch.allocated_bytes)}  {display_safe(branch.path)}")
   else:
     lines.extend(["", "  No eligible immediate entries were observed."])
+  files = tuple(item for item in result.largest_files if item.logical_bytes >= minimum_bytes)[:top]
+  lines.extend(["", f"Largest individual files (showing {len(files)}):"])
+  for item in files:
+    sparse = "; sparse" if item.sparse else ""
+    lines.append(
+      f"  {format_bytes(item.logical_bytes)} logical; {format_bytes(item.allocated_bytes)} allocated; "
+      f"age {item.age_days}d{sparse}  {display_safe(item.path)}"
+    )
+  if not files:
+    lines.append("  none observed")
+  lines.extend([
+    "",
+    f"Age/sparse summary: {result.old_file_count} files at or beyond the configured age; "
+    f"{result.sparse_file_count} sparse files",
+    "File types:",
+  ])
+  for group in result.type_groups[:top]:
+    lines.append(
+      f"  {display_safe(group.name)}: {group.files} files; "
+      f"{format_bytes(group.logical_bytes)} logical; {format_bytes(group.allocated_bytes)} allocated"
+    )
+  if not result.type_groups:
+    lines.append("  none observed")
   lines.extend([
     "",
     "Branch totals are path-reachable observations and are not additive when hard links span branches.",
@@ -411,6 +657,37 @@ def inspect(path: str) -> tuple[str, tuple[str, ...], int]:
   return render_result(result), tuple(render_warnings(result)), inspect_result_code(result)
 
 
+def brief_result(result: ScanResult) -> str:
+  use = format_percent(result.capacity.use_percent) if result.capacity is not None else "unavailable"
+  largest = display_safe(result.branches[0].path) if result.branches else "none"
+  return "\n".join([
+    f"Target: {display_safe(result.target)}",
+    f"Filesystem use: {use}",
+    f"Observed allocation: {format_bytes(result.unique_allocated_bytes)}",
+    f"Largest immediate entry: {largest}",
+    f"Observation failures: {len(result.failures)}",
+  ])
+
+
+def result_observations(result: ScanResult) -> dict[str, object]:
+  return {
+    "filesystem_capacity": result.capacity,
+    "target_allocated_bytes": result.target_allocated_bytes,
+    "unique_allocated_bytes": result.unique_allocated_bytes,
+    "branches": result.branches,
+    "largest_files": result.largest_files,
+    "file_types": result.type_groups,
+    "cross_device_immediate_excluded": result.cross_device_immediate,
+    "cross_filesystems": result.crossed_filesystems,
+    "excluded_entries": result.excluded_entries,
+    "depth_limited_directories": result.depth_limited_directories,
+    "visited_entries": result.visited_entries,
+    "old_file_count": result.old_file_count,
+    "sparse_file_count": result.sparse_file_count,
+    "failures": result.failures,
+  }
+
+
 def inspect_result_code(result: ScanResult) -> int:
   return 1 if result.incomplete else 0
 
@@ -418,9 +695,26 @@ def inspect_result_code(result: ScanResult) -> int:
 def main(argv: Sequence[str] | None = None) -> int:
   parser = build_argument_parser()
   arguments = parser.parse_args(argv)
+  validate_output_arguments(parser, arguments)
+  if len(arguments.exclude) > MAX_EXCLUDES:
+    parser.error(f"--exclude may be repeated at most {MAX_EXCLUDES} times")
+  if any(not pattern or len(pattern) > 256 or display_safe(pattern) != pattern for pattern in arguments.exclude):
+    parser.error("exclude patterns must be printable and at most 256 characters")
+  options = ScanOptions(
+    max_depth=arguments.max_depth,
+    max_entries=arguments.max_entries,
+    cross_filesystems=arguments.cross_filesystems,
+    excludes=tuple(arguments.exclude),
+    top=arguments.top,
+    minimum_bytes=arguments.min_size,
+    age_days=arguments.age_days,
+  )
+  started = time.monotonic()
   try:
-    output, warnings, exit_code = inspect(arguments.path)
-    print(output)
+    result = scan(arguments.path, options)
+    output = render_result(result, top=arguments.top, minimum_bytes=arguments.min_size)
+    warnings = tuple(render_warnings(result))
+    exit_code = inspect_result_code(result)
     for warning in warnings:
       print(warning, file=sys.stderr)
   except InvalidTargetError as error:
@@ -434,6 +728,40 @@ def main(argv: Sequence[str] | None = None) -> int:
     return 130
   except Exception:
     print("diskhound: internal execution failure", file=sys.stderr)
+    return 3
+  status = "PARTIAL" if result.incomplete else "OBSERVED"
+  finding = (
+    f"the bounded scan observed {format_bytes(result.unique_allocated_bytes)} of unique allocation"
+    + (f" with {len(result.failures)} observation failures" if result.incomplete else "")
+  )
+  next_action = (
+    "review permissions and rerun the same bounded scope" if result.incomplete
+    else "review the ranked entries before changing or removing data"
+  )
+  conclusion = make_conclusion(status, result.target, finding, next_action)
+  record = OutputRecord(
+    tool="diskhound",
+    status=status,
+    target=result.target,
+    observations=result_observations(result),
+    conclusion=conclusion,
+    next_action=next_action + ".",
+    warnings=warnings,
+    elapsed_seconds=time.monotonic() - started,
+  )
+  try:
+    emit_output(
+      record,
+      detailed=output,
+      brief=brief_result(result),
+      json_mode=arguments.json,
+      brief_mode=arguments.brief,
+      quiet=arguments.quiet,
+      output_path=arguments.output,
+      force=arguments.force,
+    )
+  except OutputError as error:
+    print(f"diskhound: {display_safe(error)}", file=sys.stderr)
     return 3
   return exit_code
 

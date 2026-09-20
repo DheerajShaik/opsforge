@@ -4,18 +4,32 @@
 from __future__ import annotations
 
 import argparse
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import errno
 import ipaddress
+import os
 import re
 import socket
+import ssl
 import sys
+import time
 import unicodedata
 from typing import Callable, Sequence
+
+from opsforge_common import (
+  OutputError,
+  OutputRecord,
+  add_output_arguments,
+  emit_output,
+  make_conclusion,
+  validate_output_arguments,
+)
 
 
 CONNECT_TIMEOUT_SECONDS = 3.0
 MAX_RESOLVER_CANDIDATES = 16
+MAX_RETRIES = 3
+MAX_CONTEXT_BYTES = 64 * 1024
 
 
 class ObservationError(Exception):
@@ -56,6 +70,7 @@ class ConnectionAttempt:
   error_number: int | None = None
   local_endpoint: str | None = None
   peer_endpoint: str | None = None
+  duration_seconds: float = 0.0
 
   @property
   def connected(self) -> bool:
@@ -69,6 +84,17 @@ class DiagnosticResult:
   resolution_detail: str | None
   candidates: tuple[ConnectionCandidate, ...]
   attempts: tuple[ConnectionAttempt, ...]
+  resolution_seconds: float = 0.0
+  connect_timeout: float = CONNECT_TIMEOUT_SECONDS
+  resolver_servers: tuple[str, ...] = ()
+  default_route: str | None = None
+  selected_interface: str | None = None
+  proxy_variables: tuple[str, ...] = ()
+  retries: int = 0
+  tls_status: str | None = None
+  tls_version: str | None = None
+  tls_cipher: str | None = None
+  tls_seconds: float | None = None
 
   @property
   def connected(self) -> bool:
@@ -140,7 +166,29 @@ def build_argument_parser() -> argparse.ArgumentParser:
   )
   parser.add_argument("host", help="ASCII hostname or unbracketed IPv4/IPv6 literal")
   parser.add_argument("port", type=parse_port, help="TCP port from 1 through 65535")
+  parser.add_argument("--timeout", type=parse_timeout, default=CONNECT_TIMEOUT_SECONDS, metavar="SECONDS", help="per-attempt timeout from 0.1 through 30 seconds")
+  parser.add_argument("--retries", type=parse_retries, default=0, metavar="N", help="additional bounded candidate rounds (0-3)")
+  parser.add_argument("--compare-families", action="store_true", help="attempt all resolved IPv4 and IPv6 candidates")
+  parser.add_argument("--tls", action="store_true", help="perform one targeted TLS handshake after TCP connectivity")
+  parser.add_argument("--sni", metavar="HOST", help="explicit TLS SNI name (requires --tls)")
+  add_output_arguments(parser)
   return parser
+
+
+def parse_timeout(value: str) -> float:
+  try:
+    result = float(value)
+  except ValueError as error:
+    raise argparse.ArgumentTypeError("timeout must be from 0.1 through 30 seconds") from error
+  if not 0.1 <= result <= 30.0:
+    raise argparse.ArgumentTypeError("timeout must be from 0.1 through 30 seconds")
+  return result
+
+
+def parse_retries(value: str) -> int:
+  if not value.isascii() or not value.isdecimal() or not 0 <= int(value, 10) <= MAX_RETRIES:
+    raise argparse.ArgumentTypeError(f"retries must be from 0 through {MAX_RETRIES}")
+  return int(value, 10)
 
 
 def display_safe(value: object) -> str:
@@ -313,6 +361,9 @@ def attempt_connections(
   candidates: Sequence[ConnectionCandidate],
   *,
   socket_factory: Callable[[int, int, int], socket.socket] = socket.socket,
+  timeout: float = CONNECT_TIMEOUT_SECONDS,
+  stop_on_success: bool = True,
+  monotonic_fn: Callable[[], float] = time.monotonic,
 ) -> tuple[ConnectionAttempt, ...]:
   attempts = []
   for candidate in candidates:
@@ -322,14 +373,17 @@ def attempt_connections(
       raise ObservationError("could not create a TCP socket for a resolver candidate") from error
     try:
       try:
-        client.settimeout(CONNECT_TIMEOUT_SECONDS)
+        client.settimeout(timeout)
       except (OSError, ValueError) as error:
         raise ObservationError("could not apply the TCP connection timeout") from error
+      attempt_started = monotonic_fn()
       try:
         client.connect(candidate.sockaddr)
       except OSError as error:
         outcome, error_number = classify_connect_error(error)
-        attempts.append(ConnectionAttempt(candidate, outcome, error_number))
+        attempts.append(ConnectionAttempt(
+          candidate, outcome, error_number, duration_seconds=max(0.0, monotonic_fn() - attempt_started),
+        ))
         continue
 
       local_endpoint = None
@@ -348,9 +402,11 @@ def attempt_connections(
           "connected",
           local_endpoint=local_endpoint,
           peer_endpoint=peer_endpoint,
+          duration_seconds=max(0.0, monotonic_fn() - attempt_started),
         )
       )
-      break
+      if stop_on_success:
+        break
     finally:
       try:
         client.close()
@@ -364,12 +420,122 @@ def diagnose(
   *,
   resolver: Callable[..., object] = socket.getaddrinfo,
   socket_factory: Callable[[int, int, int], socket.socket] = socket.socket,
+  timeout: float = CONNECT_TIMEOUT_SECONDS,
+  retries: int = 0,
+  compare_families: bool = False,
+  monotonic_fn: Callable[[], float] = time.monotonic,
 ) -> DiagnosticResult:
+  resolution_started = monotonic_fn()
   candidates, resolution_error = resolve_candidates(target, resolver=resolver)
+  resolution_seconds = max(0.0, monotonic_fn() - resolution_started)
   if resolution_error is not None:
-    return DiagnosticResult(target, "failed", resolution_error, (), ())
-  attempts = attempt_connections(candidates, socket_factory=socket_factory)
-  return DiagnosticResult(target, "resolved", None, candidates, attempts)
+    return DiagnosticResult(target, "failed", resolution_error, (), (), resolution_seconds, timeout)
+  attempts = []
+  for retry in range(retries + 1):
+    attempts.extend(attempt_connections(
+      candidates, socket_factory=socket_factory, timeout=timeout,
+      stop_on_success=not compare_families, monotonic_fn=monotonic_fn,
+    ))
+    if any(item.connected for item in attempts):
+      break
+  return DiagnosticResult(
+    target, "resolved", None, candidates, tuple(attempts), resolution_seconds,
+    timeout, retries=retry,
+  )
+
+
+def read_bounded_text(path: str) -> str | None:
+  flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+  try:
+    descriptor = os.open(path, flags)
+  except OSError:
+    return None
+  try:
+    data = os.read(descriptor, MAX_CONTEXT_BYTES + 1)
+  except OSError:
+    return None
+  finally:
+    os.close(descriptor)
+  if len(data) > MAX_CONTEXT_BYTES:
+    return None
+  return data.decode("ascii", "replace")
+
+
+def resolver_context() -> tuple[str, ...]:
+  text = read_bounded_text("/etc/resolv.conf")
+  if text is None:
+    return ()
+  servers = []
+  for line in text.splitlines():
+    fields = line.split()
+    if len(fields) >= 2 and fields[0] == "nameserver":
+      try:
+        value = str(ipaddress.ip_address(fields[1].split("%", 1)[0]))
+      except ValueError:
+        continue
+      if value not in servers:
+        servers.append(value)
+      if len(servers) >= 8:
+        break
+  return tuple(servers)
+
+
+def default_route_context() -> tuple[str | None, str | None]:
+  text = read_bounded_text("/proc/net/route")
+  if text is None:
+    return None, None
+  for line in text.splitlines()[1:]:
+    fields = line.split()
+    if len(fields) < 4 or fields[1] != "00000000":
+      continue
+    try:
+      flags = int(fields[3], 16)
+      raw = bytes.fromhex(fields[2])
+      gateway = str(ipaddress.IPv4Address(raw[::-1]))
+    except (ValueError, IndexError):
+      continue
+    if flags & 0x1:
+      return fields[0][:64], gateway
+  return None, None
+
+
+def proxy_context(environment: dict[str, str] | None = None) -> tuple[str, ...]:
+  source = os.environ if environment is None else environment
+  names = ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY", "http_proxy", "https_proxy", "all_proxy", "no_proxy")
+  return tuple(name for name in names if source.get(name))
+
+
+def tls_handshake(
+  target: Target,
+  candidate: ConnectionCandidate,
+  *,
+  timeout: float,
+  sni_name: str | None,
+  socket_factory=socket.socket,
+  context_factory=lambda: ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT),
+  monotonic_fn=time.monotonic,
+) -> tuple[str, str | None, str | None, float]:
+  started = monotonic_fn()
+  tcp = socket_factory(candidate.family, candidate.socket_type, candidate.protocol)
+  tls = None
+  try:
+    tcp.settimeout(timeout)
+    tcp.connect(candidate.sockaddr)
+    context = context_factory()
+    context.check_hostname = False
+    context.verify_mode = ssl.CERT_NONE
+    tls = context.wrap_socket(tcp, server_hostname=sni_name)
+    version = tls.version()
+    cipher_value = tls.cipher()
+    cipher = cipher_value[0] if cipher_value else None
+    return "connected", version, cipher, max(0.0, monotonic_fn() - started)
+  except (OSError, ssl.SSLError, TimeoutError) as error:
+    return f"failed: {classify_connect_error(error)[0]}", None, None, max(0.0, monotonic_fn() - started)
+  finally:
+    if tls is not None:
+      tls.close()
+    else:
+      tcp.close()
 
 
 def render_result(result: DiagnosticResult) -> str:
@@ -395,8 +561,14 @@ def render_result(result: DiagnosticResult) -> str:
     f"  {resolution_label}: {result.resolution_status}",
     f"  Resolver candidates: {len(result.candidates)}",
     f"  Candidates attempted: {len(result.attempts)}",
-    f"  Per-candidate connect timeout: {CONNECT_TIMEOUT_SECONDS:.3f} s",
+    f"  Per-candidate connect timeout: {result.connect_timeout:.3f} s",
+    f"  Resolution duration: {result.resolution_seconds:.6f} s",
+    f"  Retry rounds used: {result.retries}",
     f"  Resolution scope: {resolution_scope}",
+    f"  Resolver servers: {', '.join(result.resolver_servers) or '-'}",
+    f"  IPv4 default-route context: {display_safe(result.default_route or 'unavailable')}",
+    f"  Connection interface: {display_safe(result.selected_interface or 'unavailable (not established)')}",
+    f"  Proxy variables present: {', '.join(result.proxy_variables) or 'none'}",
   ]
   if result.resolution_detail is not None:
     lines.append(f"  Resolution detail: {display_safe(result.resolution_detail)}")
@@ -419,16 +591,28 @@ def render_result(result: DiagnosticResult) -> str:
         f"  Attempt {index}",
         f"    Candidate: {attempt.candidate.family_name} {display_safe(attempt.candidate.endpoint)}",
         f"    Outcome: {attempt.outcome}",
+        f"    Duration: {attempt.duration_seconds:.6f} s",
       ))
       if attempt.error_number is not None:
         lines.append(f"    OS error number: {attempt.error_number}")
       if attempt.connected:
         lines.append(
           f"    Local endpoint: {display_safe(attempt.local_endpoint or '-')}"
-        )
+      )
         lines.append(
           f"    Peer endpoint: {display_safe(attempt.peer_endpoint or attempt.candidate.endpoint)}"
         )
+
+  if result.tls_status is not None:
+    lines.extend((
+      "",
+      "TLS stage",
+      f"  Status: {display_safe(result.tls_status)}",
+      f"  Version: {display_safe(result.tls_version or '-')}",
+      f"  Cipher: {display_safe(result.tls_cipher or '-')}",
+      f"  Duration: {result.tls_seconds:.6f} s" if result.tls_seconds is not None else "  Duration: -",
+      "  Certificate trust, hostname identity, revocation, and application readiness were not assessed.",
+    ))
 
   lines.extend((
     "",
@@ -445,9 +629,43 @@ def render_result(result: DiagnosticResult) -> str:
 def main(argv: Sequence[str] | None = None) -> int:
   parser = build_argument_parser()
   arguments = parser.parse_args(argv)
+  validate_output_arguments(parser, arguments)
+  if arguments.sni is not None and not arguments.tls:
+    parser.error("--sni requires --tls")
+  started = time.monotonic()
   try:
     normalized_host, kind = parse_host(arguments.host)
-    result = diagnose(Target(arguments.host, normalized_host, arguments.port, kind))
+    target = Target(arguments.host, normalized_host, arguments.port, kind)
+    sni_name = normalized_host.rstrip(".") if kind == "hostname" else None
+    if arguments.sni is not None:
+      sni_name, sni_kind = parse_host(arguments.sni)
+      if sni_kind != "hostname":
+        raise argparse.ArgumentTypeError("--sni must be an ASCII hostname")
+    result = diagnose(
+      target,
+      timeout=arguments.timeout,
+      retries=arguments.retries,
+      compare_families=arguments.compare_families,
+    )
+    route_interface, gateway = default_route_context()
+    connected_attempt = next((item for item in result.attempts if item.connected), None)
+    tls_status = tls_version = tls_cipher = None
+    tls_seconds = None
+    if arguments.tls and connected_attempt is not None:
+      tls_status, tls_version, tls_cipher, tls_seconds = tls_handshake(
+        target, connected_attempt.candidate, timeout=arguments.timeout, sni_name=sni_name,
+      )
+    result = replace(
+      result,
+      resolver_servers=resolver_context(),
+      default_route=(f"{gateway} via {route_interface}" if gateway and route_interface else None),
+      selected_interface=None,
+      proxy_variables=proxy_context(),
+      tls_status=tls_status,
+      tls_version=tls_version,
+      tls_cipher=tls_cipher,
+      tls_seconds=tls_seconds,
+    )
     output = render_result(result)
   except argparse.ArgumentTypeError as error:
     print_safe(f"netdoctor: {display_safe(error)}", file=sys.stderr)
@@ -461,8 +679,65 @@ def main(argv: Sequence[str] | None = None) -> int:
   except Exception:
     print_safe("netdoctor: internal execution failure", file=sys.stderr)
     return 3
-  print_safe(output, file=sys.stdout)
-  return 0 if result.connected else 1
+  if result.connected and (not arguments.tls or result.tls_status == "connected"):
+    status = "CONNECTED"
+    stage = "TLS" if arguments.tls else "TCP"
+    finding = f"{stage} connection succeeded after {len(result.attempts)} TCP attempt(s)"
+    next_action = "no transport-layer issue was detected; application behavior was not tested"
+  else:
+    status = "UNREACHABLE"
+    if result.resolution_status == "failed":
+      stage = "resolution"
+    elif arguments.tls and result.connected:
+      stage = "TLS"
+    elif result.attempts and all(
+      attempt.outcome in {"network unreachable", "host unreachable"}
+      for attempt in result.attempts
+    ):
+      stage = "route"
+    else:
+      stage = "TCP"
+    finding = f"the targeted connection did not complete at the {stage} stage"
+    next_action = f"review the {stage} evidence and target-specific network policy"
+  conclusion = make_conclusion(status, target.endpoint, finding, next_action)
+  record = OutputRecord(
+    tool="netdoctor",
+    status=status,
+    target=target.endpoint,
+    observations={
+      "stage": stage.lower(),
+      "resolution_status": result.resolution_status,
+      "resolution_detail": result.resolution_detail,
+      "resolution_seconds": result.resolution_seconds,
+      "candidates": result.candidates,
+      "attempts": result.attempts,
+      "resolver_servers": result.resolver_servers,
+      "ipv4_default_route_context": result.default_route,
+      "selected_interface": result.selected_interface,
+      "proxy_variables_present": result.proxy_variables,
+      "tls": {"status": result.tls_status, "version": result.tls_version, "cipher": result.tls_cipher, "seconds": result.tls_seconds},
+    },
+    conclusion=conclusion,
+    next_action=next_action + ".",
+    warnings=(),
+    elapsed_seconds=time.monotonic() - started,
+  )
+  brief = "\n".join([
+    f"Target: {display_safe(target.endpoint)}",
+    f"Resolution: {result.resolution_status} ({result.resolution_seconds:.3f} s)",
+    f"TCP attempts: {len(result.attempts)}",
+    f"Stage: {stage}",
+  ])
+  try:
+    emit_output(
+      record, detailed=output, brief=brief, json_mode=arguments.json,
+      brief_mode=arguments.brief, quiet=arguments.quiet,
+      output_path=arguments.output, force=arguments.force, stdout=sys.stdout,
+    )
+  except OutputError as error:
+    print_safe(f"netdoctor: {display_safe(error)}", file=sys.stderr)
+    return 3
+  return 0 if status == "CONNECTED" else 1
 
 
 if __name__ == "__main__":

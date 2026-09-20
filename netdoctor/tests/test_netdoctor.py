@@ -2,6 +2,7 @@ import contextlib
 import errno
 import importlib.util
 import io
+import json
 from pathlib import Path
 import socket
 import sys
@@ -175,6 +176,26 @@ class CliTests(unittest.TestCase):
     self.assertEqual(code, 1)
     self.assertEqual(stderr.getvalue(), "")
     self.assertIn("r\\xe9solution", stdout.getvalue())
+
+  def test_json_brief_and_quiet(self):
+    resolved = candidate()
+    result = netdoctor.DiagnosticResult(
+      netdoctor.Target("example.com", "example.com", 443, "hostname"),
+      "resolved", None, (resolved,),
+      (netdoctor.ConnectionAttempt(resolved, "connected", duration_seconds=0.01),),
+      resolution_seconds=0.02,
+    )
+    with mock.patch.object(netdoctor, "diagnose", return_value=result), \
+         mock.patch.object(netdoctor, "resolver_context", return_value=("192.0.2.53",)), \
+         mock.patch.object(netdoctor, "default_route_context", return_value=("eth0", "192.0.2.1")), \
+         mock.patch.object(netdoctor, "proxy_context", return_value=()):
+      code, stdout, stderr = self.run_main(["--json", "example.com", "443"])
+      self.assertEqual((code, stderr), (0, ""))
+      payload = json.loads(stdout)
+      self.assertEqual(payload["tool"], "netdoctor")
+      self.assertEqual(payload["observations"]["stage"], "tcp")
+      self.assertIn("Stage: TCP", self.run_main(["--brief", "example.com", "443"])[1])
+      self.assertEqual(self.run_main(["--quiet", "example.com", "443"])[1], "")
 
 
 class TargetTests(unittest.TestCase):
@@ -367,6 +388,17 @@ class ConnectionTests(unittest.TestCase):
     attempts = netdoctor.attempt_connections(candidates, socket_factory=lambda *args: sockets.pop(0))
     self.assertEqual(len(attempts), 2)
     self.assertFalse(any(item.connected for item in attempts))
+
+  def test_attempt_duration_and_all_family_mode(self):
+    sockets = [FakeSocket(), FakeSocket()]
+    times = iter((1.0, 1.1, 2.0, 2.2))
+    attempts = netdoctor.attempt_connections(
+      (candidate("192.0.2.1"), candidate("2001:db8::1", family=socket.AF_INET6)),
+      socket_factory=lambda *args: sockets.pop(0), stop_on_success=False,
+      monotonic_fn=lambda: next(times),
+    )
+    self.assertEqual(len(attempts), 2)
+    self.assertAlmostEqual(attempts[0].duration_seconds, 0.1)
 
 
 class RenderingTests(unittest.TestCase):

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "opsforge"
-version = "0.1.0b1"
+version = "0.2.0b1"
 description = "Focused, diagnostic-first Linux utilities for DevOps and SRE workflows"
 readme = "README.md"
 requires-python = ">=3.10,<3.15"
@@ -46,6 +46,7 @@ incident-snapshot = "incidentsnapshot.incidentsnapshot:main"
 
 [tool.setuptools]
 packages = [
+  "opsforge_common",
   "certwatch",
   "configdiff",
   "diskhound",

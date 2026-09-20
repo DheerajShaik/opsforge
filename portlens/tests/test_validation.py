@@ -21,11 +21,18 @@ class PortValidationTests(unittest.TestCase):
 
   def test_parser_rejects_missing_extra_and_unsupported_arguments(self):
     parser = portlens.build_argument_parser()
-    for arguments in ([], ["8080", "8081"], ["--udp", "8080"]):
+    for arguments in (["8080", "8081"], ["--all", "8080"]):
       with self.subTest(arguments=arguments):
         with self.assertRaises(SystemExit) as context:
           parser.parse_args(arguments)
         self.assertEqual(context.exception.code, 2)
+
+  def test_parser_accepts_all_udp_and_ranges(self):
+    parser = portlens.build_argument_parser()
+    parsed = parser.parse_args(["--udp", "--ipv4", "8000-8010"])
+    self.assertEqual((parsed.port.start, parsed.port.end), (8000, 8010))
+    self.assertTrue(parsed.udp)
+    self.assertTrue(parser.parse_args(["--all"]).all)
 
 
 if __name__ == "__main__":

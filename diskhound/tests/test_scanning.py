@@ -87,6 +87,7 @@ class RealFilesystemScanningTests(unittest.TestCase):
       result = diskhound.scan(directory)
       self.assertEqual(len(result.branches), 1)
       self.assertFalse(result.incomplete)
+      self.assertGreater(result.depth_limited_directories, 0)
     finally:
       for path in reversed(created):
         path.rmdir()
@@ -97,7 +98,7 @@ class MockedTraversalSemanticsTests(unittest.TestCase):
   def run_scan(self, directory_map):
     target = metadata(inode=1, blocks=1, mode=stat.S_IFDIR | 0o755)
 
-    def listing(path, expected=None):
+    def listing(path, expected=None, accumulator=None):
       value = directory_map[path]
       if isinstance(value, BaseException):
         raise value

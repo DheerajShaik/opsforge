@@ -13,12 +13,24 @@ import time
 import unicodedata
 from typing import Callable, Sequence
 
+from opsforge_common import (
+  OutputError,
+  OutputRecord,
+  add_output_arguments,
+  emit_output,
+  make_conclusion,
+  validate_output_arguments,
+)
+
 
 DEFAULT_INTERVAL_SECONDS = 1.0
 MIN_INTERVAL_SECONDS = 0.1
 MAX_INTERVAL_SECONDS = 60.0
 MAX_STAT_BYTES = 64 * 1024
 READ_CHUNK_BYTES = 4096
+MAX_SAMPLES = 100
+MAX_DURATION_SECONDS = 3600.0
+MAX_AUX_ENTRIES = 100_000
 
 
 class InvalidTargetError(Exception):
@@ -62,19 +74,42 @@ class AnalysisResult:
   final: ProcessSample | None
   elapsed_seconds: float | None
   incomplete_warning: str | None = None
+  samples: tuple[ProcessSample, ...] = ()
 
   @property
   def incomplete(self) -> bool:
     return self.final is None or self.incomplete_warning is not None
 
 
+@dataclass(frozen=True)
+class AuxiliarySample:
+  file_descriptors: int | None
+  sockets: int | None
+  read_bytes: int | None
+  write_bytes: int | None
+  voluntary_context_switches: int | None
+  nonvoluntary_context_switches: int | None
+  children: tuple[int, ...]
+  thread_cpu_ticks: tuple[tuple[int, int], ...]
+
+
+@dataclass(frozen=True)
+class ExtendedResult:
+  analysis: AnalysisResult
+  auxiliary_initial: AuxiliarySample | None
+  auxiliary_final: AuxiliarySample | None
+  cgroup: str | None
+  cpu_constraint: str | None
+  memory_constraint: str | None
+  warnings: tuple[str, ...]
+
+
 def parse_pid(value: str) -> int:
-  try:
-    pid = int(value, 10)
-  except ValueError as error:
-    raise argparse.ArgumentTypeError("PID must be a positive decimal integer") from error
-  if pid <= 0:
+  if not value.isascii() or not value.isdecimal():
     raise argparse.ArgumentTypeError("PID must be a positive decimal integer")
+  pid = int(value, 10)
+  if not 1 <= pid <= 2_147_483_647:
+    raise argparse.ArgumentTypeError("PID must be a positive decimal integer in the supported range")
   return pid
 
 
@@ -90,6 +125,22 @@ def parse_interval(value: str) -> float:
       f"interval must be from {MIN_INTERVAL_SECONDS:g} through {MAX_INTERVAL_SECONDS:g} seconds"
     )
   return interval
+
+
+def parse_sample_count(value: str) -> int:
+  if not value.isascii() or not value.isdecimal() or not 2 <= int(value, 10) <= MAX_SAMPLES:
+    raise argparse.ArgumentTypeError(f"sample count must be from 2 through {MAX_SAMPLES}")
+  return int(value, 10)
+
+
+def parse_duration(value: str) -> float:
+  try:
+    duration = float(value)
+  except ValueError as error:
+    raise argparse.ArgumentTypeError("duration must be finite and positive") from error
+  if not math.isfinite(duration) or not MIN_INTERVAL_SECONDS <= duration <= MAX_DURATION_SECONDS:
+    raise argparse.ArgumentTypeError(f"duration must be from {MIN_INTERVAL_SECONDS:g} through {MAX_DURATION_SECONDS:g} seconds")
+  return duration
 
 
 def build_argument_parser() -> argparse.ArgumentParser:
@@ -110,6 +161,11 @@ def build_argument_parser() -> argparse.ArgumentParser:
       f"seconds (default: {DEFAULT_INTERVAL_SECONDS:g})"
     ),
   )
+  sampling = parser.add_mutually_exclusive_group()
+  sampling.add_argument("--samples", type=parse_sample_count, default=2, metavar="N", help="bounded sample count (2-100)")
+  sampling.add_argument("--duration", type=parse_duration, metavar="SECONDS", help="bounded total duration (0.1-3600 seconds)")
+  sampling.add_argument("--continuous", type=parse_sample_count, metavar="COUNT", help="bounded continuous-mode sample count (2-100)")
+  add_output_arguments(parser)
   return parser
 
 
@@ -273,10 +329,11 @@ def capture_sample(
   return parse_stat(data, pid, observed_at)
 
 
-def observe(
+def observe_samples(
   pid: int,
   interval: float = DEFAULT_INTERVAL_SECONDS,
   *,
+  sample_count: int = 2,
   sleep_fn: Callable[[float], None] = time.sleep,
   monotonic_fn: Callable[[], float] = time.monotonic,
 ) -> AnalysisResult:
@@ -291,47 +348,32 @@ def observe(
         f"cannot read initial process state for {pid}: {display_safe(error)}"
       ) from error
 
-    sleep_fn(interval)
-
-    try:
-      final = capture_sample(directory_fd, pid, monotonic_fn=monotonic_fn)
-    except ProcReadError as error:
-      return AnalysisResult(
-        pid=pid,
-        requested_interval=interval,
-        clock_ticks_per_second=clock_ticks,
-        page_size_bytes=page_size,
-        initial=initial,
-        final=None,
-        elapsed_seconds=None,
-        incomplete_warning=f"second sample unavailable: {display_safe(error)}",
-      )
-
-    if final.start_ticks != initial.start_ticks:
-      return AnalysisResult(
-        pid=pid,
-        requested_interval=interval,
-        clock_ticks_per_second=clock_ticks,
-        page_size_bytes=page_size,
-        initial=initial,
-        final=None,
-        elapsed_seconds=None,
-        incomplete_warning="process identity changed between samples",
-      )
-    if (
-      final.user_ticks < initial.user_ticks
-      or final.system_ticks < initial.system_ticks
-    ):
-      return AnalysisResult(
-        pid=pid,
-        requested_interval=interval,
-        clock_ticks_per_second=clock_ticks,
-        page_size_bytes=page_size,
-        initial=initial,
-        final=None,
-        elapsed_seconds=None,
-        incomplete_warning="cumulative CPU counters moved backwards between samples",
-      )
+    samples = [initial]
+    final = None
+    for index in range(1, sample_count):
+      sleep_fn(interval)
+      try:
+        candidate = capture_sample(directory_fd, pid, monotonic_fn=monotonic_fn)
+      except ProcReadError as error:
+        label = "second sample" if index == 1 else f"sample {index + 1}"
+        return AnalysisResult(
+          pid, interval, clock_ticks, page_size, initial, None, None,
+          f"{label} unavailable: {display_safe(error)}", tuple(samples),
+        )
+      previous = samples[-1]
+      if candidate.start_ticks != initial.start_ticks:
+        return AnalysisResult(
+          pid, interval, clock_ticks, page_size, initial, None, None,
+          "process identity changed between samples", tuple(samples),
+        )
+      if candidate.user_ticks < previous.user_ticks or candidate.system_ticks < previous.system_ticks:
+        return AnalysisResult(
+          pid, interval, clock_ticks, page_size, initial, None, None,
+          "cumulative CPU counters moved backwards between samples", tuple(samples),
+        )
+      samples.append(candidate)
+      final = candidate
+    assert final is not None
     elapsed = final.observed_at - initial.observed_at
     if not math.isfinite(elapsed) or elapsed <= 0:
       raise ObservationError("monotonic sample interval is not positive and finite")
@@ -343,9 +385,176 @@ def observe(
       initial=initial,
       final=final,
       elapsed_seconds=elapsed,
+      samples=tuple(samples),
     )
   finally:
     os.close(directory_fd)
+
+
+def observe(
+  pid: int,
+  interval: float = DEFAULT_INTERVAL_SECONDS,
+  *,
+  sleep_fn: Callable[[float], None] = time.sleep,
+  monotonic_fn: Callable[[], float] = time.monotonic,
+) -> AnalysisResult:
+  return observe_samples(
+    pid, interval, sample_count=2, sleep_fn=sleep_fn, monotonic_fn=monotonic_fn,
+  )
+
+
+def _parse_proc_mapping(data: bytes) -> dict[str, int]:
+  values = {}
+  for raw_line in data.decode("ascii", "strict").splitlines():
+    if ":" not in raw_line:
+      continue
+    name, raw_value = raw_line.split(":", 1)
+    token = raw_value.strip().split()[0] if raw_value.strip() else ""
+    if token.isdecimal():
+      values[name] = int(token, 10)
+  return values
+
+
+def _open_proc_subdirectory(directory_fd: int, name: str) -> int:
+  flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0)
+  flags |= getattr(os, "O_NOFOLLOW", 0)
+  return os.open(name, flags, dir_fd=directory_fd)
+
+
+def _bounded_directory_names(directory_fd: int, limit: int) -> list[str] | None:
+  names = []
+  with os.scandir(directory_fd) as entries:
+    for entry in entries:
+      if len(names) >= limit:
+        return None
+      names.append(entry.name)
+  return names
+
+
+def capture_auxiliary(directory_fd: int, pid: int) -> AuxiliarySample:
+  try:
+    io_values = _parse_proc_mapping(read_bounded_proc_file(directory_fd, "io", MAX_STAT_BYTES))
+  except (ProcReadError, UnicodeDecodeError):
+    io_values = {}
+  try:
+    status_values = _parse_proc_mapping(read_bounded_proc_file(directory_fd, "status", MAX_STAT_BYTES))
+  except (ProcReadError, UnicodeDecodeError):
+    status_values = {}
+  fd_count = None
+  socket_count = None
+  try:
+    fd_directory = _open_proc_subdirectory(directory_fd, "fd")
+    try:
+      names = _bounded_directory_names(fd_directory, MAX_AUX_ENTRIES)
+      if names is not None:
+        fd_count = len(names)
+        socket_count = 0
+        for name in names:
+          try:
+            if os.readlink(name, dir_fd=fd_directory).startswith("socket:["):
+              socket_count += 1
+          except OSError:
+            continue
+    finally:
+      os.close(fd_directory)
+  except OSError:
+    pass
+  children = ()
+  try:
+    raw_children = read_bounded_proc_file(directory_fd, f"task/{pid}/children", MAX_STAT_BYTES)
+    children = tuple(int(token, 10) for token in raw_children.decode("ascii").split() if token.isdecimal())[:256]
+  except (ProcReadError, UnicodeDecodeError):
+    pass
+  thread_ticks = []
+  try:
+    task_directory = _open_proc_subdirectory(directory_fd, "task")
+    try:
+      names = _bounded_directory_names(task_directory, 256)
+      for name in sorted((name for name in (names or ()) if name.isdecimal()), key=int):
+        thread_directory = None
+        try:
+          thread_directory = _open_proc_subdirectory(task_directory, name)
+          sample = parse_stat(read_bounded_proc_file(thread_directory, "stat", MAX_STAT_BYTES), int(name), 0.0)
+          thread_ticks.append((int(name), sample.cpu_ticks))
+        except (OSError, ProcReadError):
+          continue
+        finally:
+          if thread_directory is not None:
+            os.close(thread_directory)
+    finally:
+      os.close(task_directory)
+  except OSError:
+    pass
+  return AuxiliarySample(
+    fd_count, socket_count, io_values.get("read_bytes"), io_values.get("write_bytes"),
+    status_values.get("voluntary_ctxt_switches"), status_values.get("nonvoluntary_ctxt_switches"),
+    children, tuple(thread_ticks),
+  )
+
+
+def collect_cgroup_context(directory_fd: int) -> tuple[str | None, str | None, str | None]:
+  try:
+    text = read_bounded_proc_file(directory_fd, "cgroup", MAX_STAT_BYTES).decode("utf-8", "strict")
+  except (ProcReadError, UnicodeDecodeError):
+    return None, None, None
+  path = next((line.split("::", 1)[1] for line in text.splitlines() if line.startswith("0::")), None)
+  if path is None or ".." in path.split("/"):
+    return path, None, None
+  root = os.path.join("/sys/fs/cgroup", path.lstrip("/"))
+  def read_constraint(name: str) -> str | None:
+    try:
+      with open(os.path.join(root, name), "rb") as handle:
+        value = handle.read(257)
+    except (OSError, UnicodeDecodeError):
+      return None
+    if len(value) > 256:
+      return None
+    return display_safe(value.decode("ascii", "strict").strip())
+  return path, read_constraint("cpu.max"), read_constraint("memory.max")
+
+
+def observe_extended(pid: int, interval: float, sample_count: int) -> ExtendedResult:
+  warnings = []
+  initial_aux = None
+  initial_identity = None
+  cgroup = cpu_constraint = memory_constraint = None
+  try:
+    descriptor = open_process_directory(pid)
+    try:
+      initial_identity = capture_sample(descriptor, pid).start_ticks
+      initial_aux = capture_auxiliary(descriptor, pid)
+      cgroup, cpu_constraint, memory_constraint = collect_cgroup_context(descriptor)
+      if capture_sample(descriptor, pid).start_ticks != initial_identity:
+        raise ProcReadError("process identity mismatch during initial auxiliary collection")
+    finally:
+      os.close(descriptor)
+  except (InvalidTargetError, ProcReadError, OSError) as error:
+    initial_aux = None
+    cgroup = cpu_constraint = memory_constraint = None
+    warnings.append(f"initial auxiliary evidence unavailable: {display_safe(error)}")
+  analysis = observe_samples(pid, interval, sample_count=sample_count)
+  if initial_identity is not None and initial_identity != analysis.initial.start_ticks:
+    initial_aux = None
+    cgroup = cpu_constraint = memory_constraint = None
+    warnings.append("initial auxiliary evidence discarded because of process identity mismatch")
+  final_aux = None
+  if not analysis.incomplete:
+    try:
+      descriptor = open_process_directory(pid)
+      try:
+        current = capture_sample(descriptor, pid)
+        if current.start_ticks == analysis.initial.start_ticks:
+          final_aux = capture_auxiliary(descriptor, pid)
+          if capture_sample(descriptor, pid).start_ticks != analysis.initial.start_ticks:
+            raise ProcReadError("process identity mismatch during final auxiliary collection")
+        else:
+          warnings.append("final auxiliary evidence discarded because of process identity mismatch")
+      finally:
+        os.close(descriptor)
+    except (InvalidTargetError, ProcReadError, OSError) as error:
+      final_aux = None
+      warnings.append(f"final auxiliary evidence unavailable: {display_safe(error)}")
+  return ExtendedResult(analysis, initial_aux, final_aux, cgroup, cpu_constraint, memory_constraint, tuple(warnings))
 
 
 def kibibytes(byte_count: int) -> float:
@@ -415,9 +624,52 @@ def render_result(result: AnalysisResult) -> str:
     "Interpretation limits",
     "  These measurements are evidence, not a judgment that the process is healthy, unhealthy, anomalous, leaking memory, or causing an incident.",
     "  CPU utilization is sampled against one logical CPU and may exceed 100% for multithreaded work.",
-    "  No historical baseline, cgroup or quota context, host load, I/O, network, file-descriptor, scheduler-delay, or root-cause analysis is performed.",
+    "  No historical baseline, host load, scheduler-delay, or root-cause analysis is performed.",
     "  Command-line arguments and environment variables are intentionally not read.",
   ))
+  return "\n".join(lines)
+
+
+def _delta(initial: int | None, final: int | None) -> str:
+  if initial is None or final is None:
+    return "unavailable"
+  return f"{initial} -> {final} (delta {final - initial:+d})"
+
+
+def render_extended(result: ExtendedResult) -> str:
+  analysis = result.analysis
+  lines = [render_result(analysis), "Auxiliary evidence"]
+  initial, final = result.auxiliary_initial, result.auxiliary_final
+  if initial is None:
+    lines.append("  unavailable")
+  else:
+    lines.extend([
+      f"  File descriptors: {_delta(initial.file_descriptors, final.file_descriptors if final else None)}",
+      f"  Sockets: {_delta(initial.sockets, final.sockets if final else None)}",
+      f"  Read bytes: {_delta(initial.read_bytes, final.read_bytes if final else None)}",
+      f"  Write bytes: {_delta(initial.write_bytes, final.write_bytes if final else None)}",
+      f"  Voluntary context switches: {_delta(initial.voluntary_context_switches, final.voluntary_context_switches if final else None)}",
+      f"  Nonvoluntary context switches: {_delta(initial.nonvoluntary_context_switches, final.nonvoluntary_context_switches if final else None)}",
+      f"  Child PIDs: {', '.join(map(str, initial.children)) or 'none observed'}",
+      f"  Observed threads: {len(initial.thread_cpu_ticks)}",
+    ])
+    if final is not None:
+      initial_threads = dict(initial.thread_cpu_ticks)
+      deltas = sorted(
+        ((ticks - initial_threads[tid], tid) for tid, ticks in final.thread_cpu_ticks if tid in initial_threads),
+        reverse=True,
+      )[:10]
+      lines.append("  Top per-thread CPU tick deltas: " + (
+        ", ".join(f"{tid}:{ticks:+d}" for ticks, tid in deltas) or "unavailable"
+      ))
+  lines.extend([
+    "Cgroup context",
+    f"  Path: {display_safe(result.cgroup) if result.cgroup else 'unavailable'}",
+    f"  CPU constraint: {display_safe(result.cpu_constraint) if result.cpu_constraint else 'unavailable'}",
+    f"  Memory constraint: {display_safe(result.memory_constraint) if result.memory_constraint else 'unavailable'}",
+  ])
+  if analysis.samples:
+    lines.append(f"Sampling: {len(analysis.samples)} samples were captured")
   return "\n".join(lines)
 
 
@@ -432,8 +684,22 @@ def inspect(pid: int, interval: float) -> tuple[str, str | None, int]:
 def main(argv: Sequence[str] | None = None) -> int:
   parser = build_argument_parser()
   arguments = parser.parse_args(argv)
+  validate_output_arguments(parser, arguments)
+  interval = arguments.interval
+  if arguments.duration is not None:
+    sample_count = min(MAX_SAMPLES, max(2, int(arguments.duration / interval) + 1))
+    interval = arguments.duration / (sample_count - 1)
+  else:
+    sample_count = arguments.continuous or arguments.samples
+  started = time.monotonic()
   try:
-    output, warning, exit_code = inspect(arguments.pid, arguments.interval)
+    extended = observe_extended(arguments.pid, interval, sample_count)
+    result = extended.analysis
+    output = render_extended(extended)
+    warning_items = list(extended.warnings)
+    if result.incomplete_warning is not None:
+      warning_items.insert(0, f"incomplete observation: {result.incomplete_warning}")
+    exit_code = 1 if result.incomplete else 0
   except InvalidTargetError as error:
     print_safe(f"procwatch: {display_safe(error)}", file=sys.stderr)
     return 2
@@ -446,9 +712,67 @@ def main(argv: Sequence[str] | None = None) -> int:
   except Exception:
     print_safe("procwatch: internal execution failure", file=sys.stderr)
     return 3
-  print_safe(output, file=sys.stdout)
-  if warning is not None:
-    print_safe(warning, file=sys.stderr)
+  for warning in warning_items:
+    print_safe(f"procwatch: warning: {warning}", file=sys.stderr)
+  if result.incomplete:
+    status = "PARTIAL"
+    finding = "the requested process could not be sampled completely with stable identity"
+    next_action = "repeat the bounded observation if the same process instance is still running"
+  else:
+    status = "OBSERVED"
+    assert result.final is not None
+    rss_delta = (result.final.rss_pages - result.initial.rss_pages) * result.page_size_bytes
+    fd_delta = None
+    if extended.auxiliary_initial and extended.auxiliary_final:
+      if extended.auxiliary_initial.file_descriptors is not None and extended.auxiliary_final.file_descriptors is not None:
+        fd_delta = extended.auxiliary_final.file_descriptors - extended.auxiliary_initial.file_descriptors
+    finding = f"{sample_count} bounded samples captured; resident memory changed by {signed_kibibytes(rss_delta)}"
+    if fd_delta is not None:
+      finding += f" and file descriptors changed by {fd_delta:+d}"
+    next_action = "correlate observed growth with workload; this sample does not establish a leak"
+  conclusion = make_conclusion(status, f"PID {arguments.pid}", finding, next_action)
+  record = OutputRecord(
+    tool="procwatch",
+    status=status,
+    target=str(arguments.pid),
+    observations={
+      "sample_count": len(result.samples) if result.samples else 1 + int(result.final is not None),
+      "requested_interval_seconds": interval,
+      "observed_interval_seconds": result.elapsed_seconds,
+      "initial": result.initial,
+      "final": result.final,
+      "auxiliary_initial": extended.auxiliary_initial,
+      "auxiliary_final": extended.auxiliary_final,
+      "cgroup": result.cgroup if hasattr(result, "cgroup") else extended.cgroup,
+      "cpu_constraint": extended.cpu_constraint,
+      "memory_constraint": extended.memory_constraint,
+    },
+    conclusion=conclusion,
+    next_action=next_action + ".",
+    warnings=warning_items,
+    elapsed_seconds=time.monotonic() - started,
+  )
+  brief = "\n".join([
+    f"PID: {arguments.pid}",
+    f"Samples: {len(result.samples) if result.samples else 1 + int(result.final is not None)}",
+    f"State: {display_safe(result.initial.state)}" + (f" -> {display_safe(result.final.state)}" if result.final else ""),
+    f"Observation: {'partial' if result.incomplete else 'complete'}",
+  ])
+  try:
+    emit_output(
+      record,
+      detailed=output,
+      brief=brief,
+      json_mode=arguments.json,
+      brief_mode=arguments.brief,
+      quiet=arguments.quiet,
+      output_path=arguments.output,
+      force=arguments.force,
+      stdout=sys.stdout,
+    )
+  except OutputError as error:
+    print_safe(f"procwatch: {display_safe(error)}", file=sys.stderr)
+    return 3
   return exit_code
 
 

@@ -1,82 +1,33 @@
 # SvcDoctor
 
-SvcDoctor is a Beta Linux diagnostic utility that reports the current systemd state and direct execution evidence for one local system service. It reports systemd evidence; it does not determine application root cause, desired state, health, readiness, or remediation.
-
-## Scope and semantics
-
-SvcDoctor queries the local systemd **system manager** about exactly one concrete `.service` unit. Bare names receive `.service`, so `nginx` becomes `nginx.service`. Concrete instances such as `worker@3` and `worker@3.service` are supported. Uninstantiated templates such as `worker@.service`, paths, and non-service units are rejected.
-
-One invocation performs one read-only `systemctl show` query for exactly:
-
-```text
-Id
-LoadState
-ActiveState
-SubState
-Result
-ExecMainCode
-ExecMainStatus
-```
-
-`Id`, `LoadState`, and `ActiveState` are required for a normal diagnostic. Missing or empty supporting evidence is displayed as `-`. `ExecMainCode` and `ExecMainStatus` are separate raw systemd values; SvcDoctor does not decode their application or signal meaning.
-
-SvcDoctor classifies a service as currently failed only when `ActiveState` is exactly `failed`. Exit `0` means only that the observed `ActiveState` was not exactly `failed`; it does **not** mean healthy, ready, correctly configured, or that an inactive service should be running.
-
-`LoadState=not-found` is a missing-unit error. Neither `Result=success` nor the `systemctl` process exit status proves that a service exists or is not failed.
-
-## Requirements
-
-- Linux
-- CPython 3.10 through 3.14
-- a local `systemctl` and systemd system manager
-
-Compatibility has so far been empirically validated only on Ubuntu with systemd 255.4. Broader distribution and systemd-version support is not yet claimed.
-
-The project-level supported and validated environment boundaries are documented in the [root README](../README.md#compatibility-and-support-boundaries).
+SvcDoctor is a read-only diagnostic for one concrete local systemd service. It gathers structured unit, execution, dependency, resource, activation, and bounded recent-journal evidence without changing service state.
 
 ## Usage
 
 ```console
-svcdoctor SERVICE
-svcdoctor --help
-```
-
-Examples:
-
-```console
 svcdoctor nginx
-svcdoctor nginx.service
-svcdoctor worker@3.service
+svcdoctor example@worker.service --journal-lines 50
+svcdoctor ssh.service --brief
 ```
 
-## Output
+Bare names receive `.service`. Globs, template-only units, non-service suffixes, control characters, and option-like targets are rejected. `--journal-lines` is 0-200 and defaults to 20.
 
-Successful output has fixed `Target`, `State`, `Execution evidence`, and `Assessment` sections. The assessment states only whether `ActiveState` equals `failed`.
+## Evidence
 
-## Exit codes
+One bounded `systemctl show` query reports load/active/sub states, result, main/control PID and execution status/code, signal/exit interpretation, restart count/policy, activation timestamps, fragment path, drop-ins, direct Requires/Wants dependencies, CPU/memory/task limits and current use, and selected user/group/dynamic-user context. Up to 32 direct service dependencies are checked for failed state.
 
-| Code | Meaning |
-| --- | --- |
-| `0` | Help, or a successful observation where `ActiveState` is not exactly `failed`. |
-| `1` | A successful observation where `ActiveState` is exactly `failed`. |
-| `2` | Invocation, missing-unit, or observation failure. |
+Recent evidence uses `journalctl --system --unit UNIT --lines N`; lines are escaped and truncated to 512 characters. Subprocess argument arrays are shell-free, have five-second timeouts, and cap stdout and stderr at 64 KiB. Suggested follow-up commands are informational and never executed.
 
-The `systemctl` process return code is not mirrored as SvcDoctor's service-state result.
+Dependency evidence requires one recognized state per queried unit and a consistent command exit status. Confirmed zero failures render as `none observed` and JSON `failed_dependencies: []` with `dependencies_observed: true`. Failed, malformed, or unavailable dependency queries render as `unavailable`, JSON `failed_dependencies: null` and `dependencies_observed: false`, and a warning. Trustworthy main service state and its exit semantics remain available despite optional dependency failure.
 
-## Permissions, safety, and privacy
+SvcDoctor never starts, stops, restarts, reloads, enables, disables, masks, or unmasks a unit. It does not print service environment variables.
 
-SvcDoctor uses the caller's existing privileges and never invokes `sudo`, `su`, or `pkexec`. It is read-only and performs no service control, configuration changes, journal inspection, dependency traversal, remote access, network requests, telemetry, analytics, or update checks. It uses a fixed subprocess argument array without a shell and sanitizes untrusted display values.
+## Output and exits
 
-The local observation command has a five-second timeout. SvcDoctor performs no retries, polling, or fallback queries.
+Status is `ACTIVE`, `INACTIVE`, or `FAILED`. Exit 0 means `ActiveState` was observed and was not `failed`; it does not require the service to be active. Exit 1 means `ActiveState=failed`; exit 2 covers invalid invocation, unavailable tools/manager, permissions, malformed/oversized output, timeout, and output failure; exit 130 means interrupted.
 
-## Live-system limitation
+`--brief`, schema-version-1 `--json`, `--quiet`, safe `--output FILE`, and explicit `--force` follow the common contract. Human output ends with the standard conclusion. Optional journal unavailability is a warning rather than a fabricated empty success.
 
-SvcDoctor reports values returned by one live `systemctl show` query, not an atomic snapshot. A service may change state during or immediately after the query, and supporting execution evidence may describe an earlier execution.
+## Requirements, privacy, and limits
 
-## Tests
-
-Run the standard-library test suite from the repository root:
-
-```console
-python3 -m unittest discover -s svcdoctor/tests -v
-```
+A Linux systemd system manager, `systemctl`, and (for journal evidence) `journalctl` are required. Caller permissions and unit/journal policy determine visibility. Unit names, paths, process IDs, users, cgroups, resource usage, dependencies, and journal lines may be sensitive. Evidence is live and non-atomic; it does not prove readiness, explain root cause, inspect transitive dependency chains, or remediate failure.
