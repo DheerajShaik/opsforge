@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Detect exact byte-content drift between one baseline and one current file."""
+"""Detect bounded file or directory drift under explicit comparison semantics."""
 
 from __future__ import annotations
 
@@ -8,11 +8,12 @@ from dataclasses import dataclass
 import difflib
 import hashlib
 import json
+import math
 import os
+import re
 import stat
 import sys
 import time
-import unicodedata
 from typing import Sequence
 
 from opsforge_common import (
@@ -21,6 +22,8 @@ from opsforge_common import (
   add_output_arguments,
   emit_output,
   make_conclusion,
+  print_safe,
+  sanitize_text as display_safe,
   validate_output_arguments,
 )
 
@@ -28,8 +31,13 @@ from opsforge_common import (
 MAX_FILE_BYTES = 16 * 1024 * 1024
 READ_CHUNK_BYTES = 64 * 1024
 MAX_DIFF_LINES = 1000
+MAX_DIFF_INPUT_LINES = 20_000
+MAX_DIFF_LINE_CHARS = 1000
 MAX_DIRECTORY_FILES = 10_000
 MAX_DIRECTORY_DEPTH = 32
+MAX_DIRECTORY_READ_BYTES = 512 * 1024 * 1024
+DIRECTIVE_COMMENT = re.compile(rb"#(?:include|[0-9])")
+MISSING = ("missing",)
 
 
 class InvalidTargetError(Exception):
@@ -60,6 +68,8 @@ class ComparisonResult:
   metadata_drift: tuple[str, ...] = ()
   diff_lines: tuple[str, ...] = ()
   diff_truncated: bool = False
+  content_drift: bool | None = None
+  details: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -72,6 +82,7 @@ class DirectoryEntry:
   uid: int
   gid: int
   symlink_target: str | None
+  device: int | None = None
 
 
 @dataclass(frozen=True)
@@ -84,6 +95,7 @@ class DirectoryComparison:
   removed: tuple[str, ...]
   changed: tuple[str, ...]
   drift_detected: bool
+  unexamined: tuple[str, ...] = ()
 
 
 def build_argument_parser() -> argparse.ArgumentParser:
@@ -108,7 +120,7 @@ def build_argument_parser() -> argparse.ArgumentParser:
   parser.add_argument("--max-depth", type=bounded_int(0, MAX_DIRECTORY_DEPTH, "depth"), default=16, metavar="N")
   parser.add_argument("--permissions", action="store_true", help="include permission bits in drift classification")
   parser.add_argument("--ownership", action="store_true", help="include numeric owner/group in drift classification")
-  parser.add_argument("--symlinks", action="store_true", help="compare symlink targets in --directory mode")
+  parser.add_argument("--symlinks", action="store_true", help="accepted for compatibility; --directory always compares symlink target text")
   add_output_arguments(parser)
   return parser
 
@@ -121,43 +133,6 @@ def bounded_int(minimum: int, maximum: int, label: str):
   return parse
 
 
-def display_safe(value: object) -> str:
-  """Escape terminal controls, presentation controls, and ambiguous escapes."""
-  rendered = []
-  for character in str(value):
-    codepoint = ord(character)
-    category = unicodedata.category(character)
-    if character == "\\":
-      rendered.append("\\\\")
-    elif 0xDC80 <= codepoint <= 0xDCFF:
-      rendered.append(f"\\x{codepoint - 0xDC00:02x}")
-    elif category in {"Cc", "Cf", "Cs", "Zl", "Zp"}:
-      if codepoint <= 0xFF:
-        rendered.append(f"\\x{codepoint:02x}")
-      elif codepoint <= 0xFFFF:
-        rendered.append(f"\\u{codepoint:04x}")
-      else:
-        rendered.append(f"\\U{codepoint:08x}")
-    else:
-      rendered.append(character)
-  return "".join(rendered)
-
-
-def stream_safe(value: object, stream: object) -> str:
-  text = str(value)
-  encoding = getattr(stream, "encoding", None)
-  if not encoding:
-    return text
-  try:
-    return text.encode(encoding, errors="backslashreplace").decode(encoding)
-  except (LookupError, UnicodeError):
-    return text.encode("ascii", errors="backslashreplace").decode("ascii")
-
-
-def print_safe(value: object, *, file: object) -> None:
-  print(stream_safe(value, file), file=file)
-
-
 def normalized_display_path(path: str) -> str:
   try:
     return os.path.abspath(path)
@@ -168,7 +143,7 @@ def normalized_display_path(path: str) -> str:
 
 
 def _open_flags() -> int:
-  flags = os.O_RDONLY
+  flags = os.O_RDONLY | os.O_NOCTTY
   flags |= getattr(os, "O_CLOEXEC", 0)
   flags |= getattr(os, "O_NOFOLLOW", 0)
   flags |= getattr(os, "O_NONBLOCK", 0)
@@ -176,6 +151,15 @@ def _open_flags() -> int:
 
 
 def open_regular_file(path: str, label: str, *, dir_fd: int | None = None) -> tuple[int, os.stat_result]:
+  # Inspect without opening first: opening some device nodes has side effects even if rejected later.
+  try:
+    inspected = os.stat(path, dir_fd=dir_fd, follow_symlinks=False)
+  except (OSError, ValueError) as error:
+    raise InvalidTargetError(
+      f"cannot open {label} file {display_safe(path)}: {display_safe(error)}"
+    ) from error
+  if not stat.S_ISREG(inspected.st_mode):
+    raise InvalidTargetError(f"{label} path {display_safe(path)} is not a regular file")
   try:
     descriptor = os.open(path, _open_flags(), dir_fd=dir_fd)
   except (OSError, ValueError) as error:
@@ -194,6 +178,8 @@ def open_regular_file(path: str, label: str, *, dir_fd: int | None = None) -> tu
       raise InvalidTargetError(
         f"{label} path {display_safe(path)} is not a regular file"
       )
+    if (metadata.st_dev, metadata.st_ino) != (inspected.st_dev, inspected.st_ino):
+      raise ObservationError(f"{label} file changed while it was being opened")
     if metadata.st_size < 0:
       raise ObservationError(f"{label} file reported an invalid size")
     if metadata.st_size > MAX_FILE_BYTES:
@@ -275,33 +261,6 @@ def make_observation(path: str, data: bytes, metadata: os.stat_result | None = N
   )
 
 
-def compare_files(baseline_path: str, current_path: str) -> ComparisonResult:
-  baseline_fd = None
-  current_fd = None
-  try:
-    baseline_fd, baseline_metadata = open_regular_file(baseline_path, "baseline")
-    current_fd, current_metadata = open_regular_file(current_path, "current")
-
-    baseline_data = read_exact_snapshot(baseline_fd, baseline_metadata, "baseline")
-    current_data = read_exact_snapshot(current_fd, current_metadata, "current")
-
-    verify_unchanged(baseline_fd, baseline_metadata, "baseline")
-    verify_unchanged(current_fd, current_metadata, "current")
-
-    baseline = make_observation(baseline_path, baseline_data, baseline_metadata)
-    current = make_observation(current_path, current_data, current_metadata)
-    return ComparisonResult(
-      baseline=baseline,
-      current=current,
-      drift_detected=baseline_data != current_data,
-    )
-  finally:
-    if current_fd is not None:
-      os.close(current_fd)
-    if baseline_fd is not None:
-      os.close(baseline_fd)
-
-
 def read_file_pair(baseline_path: str, current_path: str) -> tuple[bytes, bytes, FileObservation, FileObservation]:
   baseline_fd = current_fd = None
   try:
@@ -327,9 +286,48 @@ def _strict_json(pairs):
   result = {}
   for key, value in pairs:
     if key in result:
-      raise ValueError(f"duplicate JSON key {key!r}")
+      raise ValueError(f"duplicate JSON key {display_safe(key[:64])!r}")
     result[key] = value
   return result
+
+
+def _reject_constant(name: str) -> object:
+  raise ValueError(f"non-standard JSON constant {name}")
+
+
+def _finite_float(text: str) -> float:
+  value = float(text)
+  if not math.isfinite(value):
+    raise ValueError("JSON number overflows a finite float")
+  return value
+
+
+def load_json(data: bytes) -> object:
+  return json.loads(
+    data.decode("utf-8"), object_pairs_hook=_strict_json,
+    parse_constant=_reject_constant, parse_float=_finite_float,
+  )
+
+
+def canonical_json(value: object) -> object:
+  """Tag JSON values by type so true, 1, and 1.0 never compare equal."""
+  if value is MISSING:
+    return MISSING
+  if value is None:
+    return ("null",)
+  if isinstance(value, bool):
+    return ("bool", value)
+  if isinstance(value, int):
+    return ("int", value)
+  if isinstance(value, float):
+    return ("float", value)
+  if isinstance(value, str):
+    return ("string", value)
+  if isinstance(value, list):
+    return ("array", tuple(canonical_json(item) for item in value))
+  if isinstance(value, dict):
+    return ("object", tuple(sorted((key, canonical_json(item)) for key, item in value.items())))
+  raise ValueError(f"unsupported JSON value type {type(value).__name__}")
 
 
 def _selected_json(value: object, keys: tuple[str, ...]) -> dict[str, object]:
@@ -338,10 +336,15 @@ def _selected_json(value: object, keys: tuple[str, ...]) -> dict[str, object]:
     current = value
     for component in dotted.split("."):
       if not isinstance(current, dict) or component not in current:
-        raise InvalidTargetError(f"selected JSON key is missing: {display_safe(dotted)}")
+        current = MISSING
+        break
       current = current[component]
     selected[dotted] = current
   return selected
+
+
+def _bounded_diff_line(line: str) -> str:
+  return line if len(line) <= MAX_DIFF_LINE_CHARS else line[:MAX_DIFF_LINE_CHARS] + "... [line truncated]"
 
 
 def compare_files_mode(
@@ -356,23 +359,36 @@ def compare_files_mode(
   max_diff_lines: int,
 ) -> ComparisonResult:
   baseline_data, current_data, baseline, current = read_file_pair(baseline_path, current_path)
+  details: list[str] = []
   try:
     if mode == "whitespace":
       left, right = b"".join(baseline_data.split()), b"".join(current_data.split())
     elif mode == "comments":
       def meaningful(data: bytes) -> tuple[bytes, ...]:
-        return tuple(line for line in data.splitlines() if line.strip() and not line.lstrip().startswith((b"#", b";")))
+        kept = []
+        for line in data.splitlines():
+          stripped = line.strip()
+          # sudoers treats #include, #includedir, and #<uid> as directives, not comments.
+          if stripped and (not stripped.startswith((b"#", b";")) or DIRECTIVE_COMMENT.match(stripped)):
+            kept.append(line)
+        return tuple(kept)
       left, right = meaningful(baseline_data), meaningful(current_data)
     elif mode == "json":
-      left = json.loads(baseline_data.decode("utf-8"), object_pairs_hook=_strict_json)
-      right = json.loads(current_data.decode("utf-8"), object_pairs_hook=_strict_json)
+      left_value, right_value = load_json(baseline_data), load_json(current_data)
       if selected_keys:
-        left, right = _selected_json(left, selected_keys), _selected_json(right, selected_keys)
+        left_value, right_value = _selected_json(left_value, selected_keys), _selected_json(right_value, selected_keys)
+        for key in selected_keys:
+          missing = [side for side, values in (("baseline", left_value), ("current", right_value)) if values[key] is MISSING]
+          if missing:
+            details.append(f"selected key {display_safe(key)} is absent in {' and '.join(missing)}")
+      left, right = canonical_json(left_value), canonical_json(right_value)
     elif mode == "metadata":
       left = (baseline.size, baseline.mode, baseline.uid, baseline.gid)
       right = (current.size, current.mode, current.uid, current.gid)
     else:
       left, right = baseline_data, current_data
+  except RecursionError as error:
+    raise InvalidTargetError(f"cannot apply {mode} comparison: JSON nesting is too deep") from error
   except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
     raise InvalidTargetError(f"cannot apply {mode} comparison: {display_safe(error)}") from error
   metadata_drift = []
@@ -380,31 +396,70 @@ def compare_files_mode(
     metadata_drift.append("permissions")
   if ownership and (baseline.uid, baseline.gid) != (current.uid, current.gid):
     metadata_drift.append("ownership")
-  drift = left != right or bool(metadata_drift)
+  content_drift = left != right
+  drift = content_drift or bool(metadata_drift)
   diff_lines = ()
   diff_truncated = False
-  if unified:
+  if unified and content_drift:
     try:
       baseline_text = baseline_data.decode("utf-8", "strict").splitlines()
       current_text = current_data.decode("utf-8", "strict").splitlines()
     except UnicodeDecodeError as error:
       raise InvalidTargetError("--unified requires UTF-8 text inputs") from error
-    generated = difflib.unified_diff(
-      baseline_text, current_text, fromfile=baseline.path, tofile=current.path, lineterm="",
-    )
+    if max(len(baseline_text), len(current_text)) > MAX_DIFF_INPUT_LINES:
+      details.append(f"unified diff skipped: an input exceeds {MAX_DIFF_INPUT_LINES} lines")
+      generated = iter(())
+    else:
+      generated = difflib.unified_diff(
+        baseline_text, current_text, fromfile=baseline.path, tofile=current.path, lineterm="",
+      )
     collected = []
     for index, next_line in enumerate(generated):
       if index >= max_diff_lines:
         diff_truncated = True
         break
-      collected.append(next_line)
+      collected.append(_bounded_diff_line(next_line))
     diff_lines = tuple(collected)
   return ComparisonResult(
     baseline, current, drift, mode, tuple(metadata_drift), diff_lines, diff_truncated,
+    content_drift, tuple(details),
   )
 
 
-def collect_directory(path: str, *, max_files: int, max_depth: int, symlinks: bool) -> tuple[str, tuple[DirectoryEntry, ...]]:
+def hash_exact_snapshot(descriptor: int, initial_metadata: os.stat_result, label: str) -> str:
+  """Stream-hash exactly the initially observed size, failing if the file grows or shrinks."""
+  digest = hashlib.sha256()
+  remaining = initial_metadata.st_size
+  try:
+    while remaining:
+      chunk = os.read(descriptor, min(READ_CHUNK_BYTES, remaining))
+      if not chunk:
+        raise ObservationError(f"{label} file changed while it was being read")
+      digest.update(chunk)
+      remaining -= len(chunk)
+    if os.read(descriptor, 1):
+      raise ObservationError(f"{label} file changed while it was being read")
+  except OSError as error:
+    raise ObservationError(f"cannot read {label} file: {display_safe(error)}") from error
+  return digest.hexdigest()
+
+
+def _special_kind(mode: int) -> str:
+  if stat.S_ISFIFO(mode):
+    return "fifo"
+  if stat.S_ISSOCK(mode):
+    return "socket"
+  if stat.S_ISCHR(mode):
+    return "char-device"
+  if stat.S_ISBLK(mode):
+    return "block-device"
+  return "special"
+
+
+def collect_directory(
+  path: str, *, max_files: int, max_depth: int,
+) -> tuple[str, tuple[DirectoryEntry, ...], DirectoryEntry, tuple[str, ...], tuple[str, ...]]:
+  """Return (root, entries, root entry, depth-limited directories, other-filesystem directories)."""
   root = normalized_display_path(path)
   try:
     root_metadata = os.lstat(root)
@@ -418,15 +473,27 @@ def collect_directory(path: str, *, max_files: int, max_depth: int, symlinks: bo
   except OSError as error:
     raise InvalidTargetError(f"cannot open directory {display_safe(root)}: {display_safe(error)}") from error
   entries = []
+  depth_limited: list[str] = []
+  other_filesystems: list[str] = []
   observed = 0
+  read_budget = MAX_DIRECTORY_READ_BYTES
 
   def verify_directory(descriptor: int, expected: os.stat_result) -> None:
     opened = os.fstat(descriptor)
     if not stat.S_ISDIR(opened.st_mode) or (opened.st_dev, opened.st_ino) != (expected.st_dev, expected.st_ino):
       raise ObservationError("directory identity changed during comparison")
 
+  def has_entries(name: str, descriptor: int, expected: os.stat_result) -> bool:
+    child_fd = os.open(name, flags, dir_fd=descriptor)
+    try:
+      verify_directory(child_fd, expected)
+      with os.scandir(child_fd) as iterator:
+        return next(iterator, None) is not None
+    finally:
+      os.close(child_fd)
+
   def visit(descriptor: int, prefix: str, depth: int) -> None:
-    nonlocal observed
+    nonlocal observed, read_budget
     children = []
     with os.scandir(descriptor) as iterator:
       for child in iterator:
@@ -437,40 +504,42 @@ def collect_directory(path: str, *, max_files: int, max_depth: int, symlinks: bo
         children.append((child.name, metadata))
     for name, metadata in sorted(children, key=lambda item: os.fsencode(item[0])):
       relative = os.path.join(prefix, name)
-      if metadata.st_dev != root_metadata.st_dev:
-        continue
+      mode, uid, gid = stat.S_IMODE(metadata.st_mode), metadata.st_uid, metadata.st_gid
       if stat.S_ISLNK(metadata.st_mode):
-        target = None
-        if symlinks:
-          target = os.readlink(name, dir_fd=descriptor)
-          current = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
-          if metadata_identity(current) != metadata_identity(metadata):
-            raise ObservationError(f"symlink changed during comparison: {display_safe(relative)}")
-        entries.append(DirectoryEntry(relative, "symlink", 0, None, stat.S_IMODE(metadata.st_mode), metadata.st_uid, metadata.st_gid, target))
+        target = os.readlink(name, dir_fd=descriptor)
+        current = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
+        if metadata_identity(current) != metadata_identity(metadata):
+          raise ObservationError(f"symlink changed during comparison: {display_safe(relative)}")
+        entries.append(DirectoryEntry(relative, "symlink", metadata.st_size, None, mode, uid, gid, target))
       elif stat.S_ISDIR(metadata.st_mode):
-        entries.append(DirectoryEntry(relative, "directory", 0, None, stat.S_IMODE(metadata.st_mode), metadata.st_uid, metadata.st_gid, None))
-        if depth < max_depth:
+        entries.append(DirectoryEntry(relative, "directory", 0, None, mode, uid, gid, None))
+        if metadata.st_dev != root_metadata.st_dev:
+          other_filesystems.append(relative)
+        elif depth < max_depth:
           child_fd = os.open(name, flags, dir_fd=descriptor)
           try:
             verify_directory(child_fd, metadata)
             visit(child_fd, relative, depth + 1)
           finally:
             os.close(child_fd)
+        elif has_entries(name, descriptor, metadata):
+          depth_limited.append(relative)
       elif stat.S_ISREG(metadata.st_mode):
         file_fd, opened = open_regular_file(name, "directory entry", dir_fd=descriptor)
         try:
           if metadata_identity(opened) != metadata_identity(metadata):
             raise ObservationError(f"file changed during comparison: {display_safe(relative)}")
-          data = read_exact_snapshot(file_fd, opened, "directory entry")
+          read_budget -= opened.st_size
+          if read_budget < 0:
+            raise ObservationError(f"directory comparison exceeded the {MAX_DIRECTORY_READ_BYTES}-byte read budget")
+          digest = hash_exact_snapshot(file_fd, opened, "directory entry")
           verify_unchanged(file_fd, opened, "directory entry")
         finally:
           os.close(file_fd)
-        entries.append(DirectoryEntry(
-          relative, "file", len(data), hashlib.sha256(data).hexdigest(),
-          stat.S_IMODE(opened.st_mode), opened.st_uid, opened.st_gid, None,
-        ))
+        entries.append(DirectoryEntry(relative, "file", opened.st_size, digest, mode, opened.st_uid, opened.st_gid, None))
       else:
-        entries.append(DirectoryEntry(relative, "special", 0, None, stat.S_IMODE(metadata.st_mode), metadata.st_uid, metadata.st_gid, None))
+        device = metadata.st_rdev if stat.S_ISCHR(metadata.st_mode) or stat.S_ISBLK(metadata.st_mode) else None
+        entries.append(DirectoryEntry(relative, _special_kind(metadata.st_mode), 0, None, mode, uid, gid, None, device))
   try:
     verify_directory(root_fd, root_metadata)
     visit(root_fd, "", 0)
@@ -478,7 +547,13 @@ def collect_directory(path: str, *, max_files: int, max_depth: int, symlinks: bo
     raise ObservationError(f"cannot observe directory {display_safe(root)}: {display_safe(error)}") from error
   finally:
     os.close(root_fd)
-  return root, tuple(sorted(entries, key=lambda item: os.fsencode(item.relative_path)))
+  root_entry = DirectoryEntry(
+    ".", "directory", 0, None, stat.S_IMODE(root_metadata.st_mode), root_metadata.st_uid, root_metadata.st_gid, None,
+  )
+  return (
+    root, tuple(sorted(entries, key=lambda item: os.fsencode(item.relative_path))), root_entry,
+    tuple(depth_limited), tuple(other_filesystems),
+  )
 
 
 def compare_directories(
@@ -489,43 +564,56 @@ def compare_directories(
   max_depth: int,
   permissions: bool,
   ownership: bool,
-  symlinks: bool,
 ) -> DirectoryComparison:
-  baseline, baseline_entries = collect_directory(baseline_path, max_files=max_files, max_depth=max_depth, symlinks=symlinks)
-  current, current_entries = collect_directory(current_path, max_files=max_files, max_depth=max_depth, symlinks=symlinks)
-  left = {entry.relative_path: entry for entry in baseline_entries}
-  right = {entry.relative_path: entry for entry in current_entries}
+  baseline, baseline_entries, baseline_root, baseline_limited, baseline_other = collect_directory(
+    baseline_path, max_files=max_files, max_depth=max_depth,
+  )
+  current, current_entries, current_root, current_limited, current_other = collect_directory(
+    current_path, max_files=max_files, max_depth=max_depth,
+  )
+  left = {entry.relative_path: entry for entry in (baseline_root, *baseline_entries)}
+  right = {entry.relative_path: entry for entry in (current_root, *current_entries)}
   added = tuple(sorted(set(right) - set(left), key=os.fsencode))
   removed = tuple(sorted(set(left) - set(right), key=os.fsencode))
   changed = []
   for name in sorted(set(left) & set(right), key=os.fsencode):
     a, b = left[name], right[name]
-    content_key_a = (a.kind, a.size, a.sha256, a.symlink_target if symlinks else None)
-    content_key_b = (b.kind, b.size, b.sha256, b.symlink_target if symlinks else None)
+    content_key_a = (a.kind, a.size, a.sha256, a.symlink_target, a.device)
+    content_key_b = (b.kind, b.size, b.sha256, b.symlink_target, b.device)
     if content_key_a != content_key_b or (permissions and a.mode != b.mode) or (ownership and (a.uid, a.gid) != (b.uid, b.gid)):
       changed.append(name)
+  unexamined = tuple(sorted(
+    {f"{item} (below --max-depth)" for item in (*baseline_limited, *current_limited)}
+    | {f"{item} (other filesystem)" for item in (*baseline_other, *current_other)},
+    key=os.fsencode,
+  ))
   return DirectoryComparison(
     baseline, current, baseline_entries, current_entries, added, removed,
-    tuple(changed), bool(added or removed or changed),
+    tuple(changed), bool(added or removed or changed), unexamined,
   )
 
 
 def render_report(result: ComparisonResult) -> str:
-  status = "CONTENT DRIFT DETECTED" if result.drift_detected else "NO CONTENT DRIFT"
-  evidence = (
-    "Observed current bytes differ from the observed baseline bytes."
-    if result.drift_detected
-    else "Observed current bytes are exactly identical to the observed baseline bytes."
-  )
-  if result.mode != "exact":
-    status = "DRIFT DETECTED" if result.drift_detected else "NO DRIFT"
+  content_drift = result.drift_detected if result.content_drift is None else result.content_drift
+  if result.mode == "exact":
+    status = "CONTENT DRIFT DETECTED" if content_drift else "NO CONTENT DRIFT"
     evidence = (
-      f"Observed inputs {'differ' if result.drift_detected else 'match'} under {result.mode} comparison "
-      "and selected metadata checks; this does not establish exact byte equality."
+      "Observed current bytes differ from the observed baseline bytes."
+      if content_drift
+      else "Observed current bytes are exactly identical to the observed baseline bytes."
     )
+  else:
+    status = "CONTENT DRIFT DETECTED" if content_drift else "NO CONTENT DRIFT"
+    evidence = (
+      f"Observed inputs {'differ' if content_drift else 'match'} under {result.mode} comparison; "
+      "this does not establish exact byte equality."
+    )
+  if result.metadata_drift:
+    status = f"{status}; METADATA DRIFT DETECTED"
+  header = "exact configuration-content comparison" if result.mode == "exact" else f"{result.mode} configuration comparison"
   return "\n".join(
     [
-      "ConfigDiff: exact configuration-content comparison",
+      f"ConfigDiff: {header}",
       "",
       "Baseline",
       f"  Path: {display_safe(result.baseline.path)}",
@@ -542,6 +630,7 @@ def render_report(result: ComparisonResult) -> str:
       f"  Status: {status}",
       f"  Evidence: {evidence}",
       f"  Metadata differences: {', '.join(result.metadata_drift) or 'none selected/observed'}",
+      *(f"  Detail: {item}" for item in result.details),
       *( ["", "Unified diff (explicit content rendering; sensitive values may be present):", *[
         f"  {display_safe(line)}" for line in result.diff_lines
       ], *( ["  ... diff truncated at the configured line limit"] if result.diff_truncated else [] )] if result.diff_lines else [] ),
@@ -553,33 +642,36 @@ def render_report(result: ComparisonResult) -> str:
   )
 
 
+def directory_status(result: DirectoryComparison) -> str:
+  if result.drift_detected:
+    return "DIRECTORY DRIFT DETECTED"
+  return "INCOMPLETE (no drift among examined entries)" if result.unexamined else "NO DIRECTORY DRIFT"
+
+
 def render_directory_report(result: DirectoryComparison) -> str:
   return "\n".join([
     "ConfigDiff: bounded directory comparison",
     f"Baseline: {display_safe(result.baseline)} ({len(result.baseline_entries)} entries)",
     f"Current: {display_safe(result.current)} ({len(result.current_entries)} entries)",
-    f"Status: {'DIRECTORY DRIFT DETECTED' if result.drift_detected else 'NO DIRECTORY DRIFT'}",
+    f"Status: {directory_status(result)}",
     f"Added ({len(result.added)}): {', '.join(map(display_safe, result.added)) or 'none'}",
     f"Removed ({len(result.removed)}): {', '.join(map(display_safe, result.removed)) or 'none'}",
     f"Changed ({len(result.changed)}): {', '.join(map(display_safe, result.changed)) or 'none'}",
+    f"Not examined ({len(result.unexamined)}): {', '.join(map(display_safe, result.unexamined)) or 'none'}",
+    "The root directory is compared as '.'; symlink targets are compared as text and never followed.",
     "Content is represented by SHA-256 metadata and is not rendered.",
   ])
-
-
-def inspect(baseline_path: str, current_path: str) -> tuple[str, int]:
-  result = compare_files(baseline_path, current_path)
-  return render_report(result), 1 if result.drift_detected else 0
 
 
 def main(argv: Sequence[str] | None = None) -> int:
   parser = build_argument_parser()
   arguments = parser.parse_args(argv)
   validate_output_arguments(parser, arguments)
-  if arguments.keys and not arguments.json_semantic:
+  if arguments.keys is not None and not arguments.json_semantic:
     parser.error("--keys requires --json-semantic")
-  if arguments.directory and (arguments.unified or arguments.json_semantic or arguments.ignore_comments or arguments.ignore_whitespace or arguments.metadata_only or arguments.keys):
+  if arguments.directory and (arguments.unified or arguments.json_semantic or arguments.ignore_comments or arguments.ignore_whitespace or arguments.metadata_only or arguments.keys is not None):
     parser.error("--directory cannot be combined with file content comparison modes")
-  selected_keys = tuple(item for item in (arguments.keys.split(",") if arguments.keys else ()) if item)
+  selected_keys = tuple(item.strip() for item in arguments.keys.split(",")) if arguments.keys is not None else ()
   if len(selected_keys) > 64 or any(len(item) > 256 or not item for item in selected_keys):
     parser.error("--keys accepts at most 64 non-empty dotted keys of at most 256 characters")
   mode = (
@@ -597,13 +689,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         max_depth=arguments.max_depth,
         permissions=arguments.permissions,
         ownership=arguments.ownership,
-        symlinks=arguments.symlinks,
       )
       report = render_directory_report(result)
       drift = result.drift_detected
+      incomplete = bool(result.unexamined) and not drift
       observations = {
         "comparison_mode": "directory", "added": result.added,
         "removed": result.removed, "changed": result.changed,
+        "unexamined": result.unexamined,
         "baseline_entries": len(result.baseline_entries),
         "current_entries": len(result.current_entries),
       }
@@ -617,17 +710,20 @@ def main(argv: Sequence[str] | None = None) -> int:
       )
       report = render_report(result)
       drift = result.drift_detected
+      incomplete = False
       observations = {
         "comparison_mode": mode,
         "baseline": result.baseline,
         "current": result.current,
+        "content_drift": result.content_drift,
         "metadata_drift": result.metadata_drift,
+        "details": result.details,
         "selected_keys": selected_keys,
         "unified_diff_lines": len(result.diff_lines),
         "unified_diff_truncated": result.diff_truncated,
       }
       target = f"{result.baseline.path} -> {result.current.path}"
-    exit_code = 1 if drift else 0
+    exit_code = 1 if drift else 3 if incomplete else 0
   except InvalidTargetError as error:
     print_safe(f"configdiff: {error}", file=sys.stderr)
     return 2
@@ -641,9 +737,16 @@ def main(argv: Sequence[str] | None = None) -> int:
     print_safe("configdiff: internal execution failure", file=sys.stderr)
     return 3
 
-  status = "DRIFT" if drift else "UNCHANGED"
-  finding = "the selected comparison detected differences" if drift else "the selected comparison detected no differences"
-  next_action = "review explicit diff or metadata evidence before applying changes" if drift else "no drift was observed under the selected comparison semantics"
+  status = "DRIFT" if drift else "INCOMPLETE" if incomplete else "UNCHANGED"
+  if drift:
+    finding = "the selected comparison detected differences"
+    next_action = "review explicit diff or metadata evidence before applying changes"
+  elif incomplete:
+    finding = f"no differences were found among examined entries, but {len(result.unexamined)} director(ies) were not examined"
+    next_action = "raise --max-depth or compare the unexamined directories separately before concluding there is no drift"
+  else:
+    finding = "the selected comparison detected no differences"
+    next_action = "no drift was observed under the selected comparison semantics"
   conclusion = make_conclusion(status, target, finding, next_action)
   warnings = ("Unified diff output may contain sensitive configuration values.",) if arguments.unified else ()
   if arguments.unified:

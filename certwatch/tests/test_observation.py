@@ -27,7 +27,7 @@ class ObservationTests(unittest.TestCase):
   def bad(*a): raise socket.gaierror()
   with self.assertRaisesRegex(c.CertWatchError,'resolution failed'): c.resolve_candidates(self.target(),bad)
  def test_tcp_fallback_and_close(self):
-  socks=[Sock(OSError()),Sock()]; got=c._connect(c.resolve_candidates(self.target(),lambda *a:self.records()),lambda *a:socks.pop(0)); self.assertFalse(got.closed)
+  socks=[Sock(OSError()),Sock()]; got,_=c._connect(c.resolve_candidates(self.target(),lambda *a:self.records()),lambda *a:socks.pop(0)); self.assertFalse(got.closed)
  def test_all_timeout(self):
   socks=[Sock(socket.timeout()),Sock(socket.timeout())]
   with self.assertRaisesRegex(c.CertWatchError,'timed out'): c._connect(c.resolve_candidates(self.target(),lambda *a:self.records()),lambda *a:socks.pop(0))

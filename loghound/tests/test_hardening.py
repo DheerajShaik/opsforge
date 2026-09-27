@@ -1,3 +1,4 @@
+import os
 from pathlib import Path
 import tempfile
 import unittest
@@ -83,3 +84,17 @@ class RotatedTimingTests(unittest.TestCase):
     self.assertEqual(result.stack_trace_groups, 1)
     self.assertEqual(result.stack_trace_lines, 2)
     self.assertEqual(dict(result.severity_counts)['info'], 3)
+
+  def test_bad_or_duplicate_rotation_does_not_discard_primary(self):
+    with tempfile.TemporaryDirectory() as temp:
+      path = str(Path(temp) / 'app.log')
+      Path(path).write_text(self.lines('10:00:00', '10:00:01'), encoding='utf-8')
+      Path(path + '.1').write_bytes(b'\x1f\x8bcompressed')
+      os.link(path, path + '.2')
+      result = loghound.analyze_sources(path, loghound.AnalysisOptions(), 3)
+    self.assertEqual((result.analyzable_lines, result.sources), (2, (path,)))
+    reasons = dict(result.unavailable_sources)
+    self.assertIn('compressed', reasons[path + '.1'])
+    self.assertIn('same file as', reasons[path + '.2'])
+    self.assertIn(path + '.3', reasons)
+    self.assertEqual(result.incomplete_warning.count('rotated source'), 3)

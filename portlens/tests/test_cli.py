@@ -3,6 +3,8 @@ import io
 import json
 import os
 from pathlib import Path
+import selectors
+import socket
 import stat
 import subprocess
 import sys
@@ -14,22 +16,18 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import portlens
 
 
-class CliTests(unittest.TestCase):
-  def test_exited_helper_still_terminates_descendants_and_reaps(self):
-    process = mock.Mock(pid=12345)
-    process.poll.return_value = 0
-    with mock.patch.object(portlens.os, 'killpg') as killpg:
-      portlens._stop_process(process)
-    killpg.assert_called_once_with(12345, portlens.signal.SIGKILL)
-    process.wait.assert_called_once_with(timeout=1.0)
+def inspection(report, observations, code, warnings=(), shared=0):
+  return portlens.Inspection(report, observations, code, warnings, shared)
 
+
+class CliTests(unittest.TestCase):
   def test_enrichment_caveat_in_human_and_json_output(self):
     self.assertIn('non-atomic', portlens.render_result(8080, []))
-    with mock.patch.object(portlens, 'inspect_selection', return_value=('report', [], 1)):
+    with mock.patch.object(portlens, 'inspect_selection', return_value=inspection('report', [], 1)):
       code, stdout, stderr = self.run_main(['8080', '--json'])
     self.assertEqual(code, 1)
     result = json.loads(stdout)
-    self.assertIn('socket/PID association from ss', result['observations']['process_enrichment'])
+    self.assertIn('socket inode', result['observations']['process_enrichment'])
     self.assertIn('PID reuse', result['warnings'][0])
 
   def run_main(self, arguments):
@@ -48,7 +46,7 @@ class CliTests(unittest.TestCase):
         self.assertEqual(context.exception.code, 0)
         self.assertIn("TCP listeners or UDP sockets", stdout.getvalue())
 
-  @mock.patch.object(portlens, "inspect_selection", return_value=("matched output", [
+  @mock.patch.object(portlens, "inspect_selection", return_value=inspection("matched output", [
     portlens.DisplayObservation("tcp", "LISTEN", "ipv4", "127.0.0.1", 8080, "1", "u", "p")
   ], 0))
   def test_match_path(self, inspect):
@@ -56,13 +54,13 @@ class CliTests(unittest.TestCase):
     self.assertEqual((code, stderr), (0, ""))
     self.assertIn("matched output\nConclusion: [FOUND]", stdout)
 
-  @mock.patch.object(portlens, "inspect_selection", return_value=("no match output", [], 1))
+  @mock.patch.object(portlens, "inspect_selection", return_value=inspection("no match output", [], 1))
   def test_no_match_path(self, inspect):
     code, stdout, stderr = self.run_main(["8080"])
     self.assertEqual((code, stderr), (1, ""))
     self.assertIn("no match output\nConclusion: [NOT_FOUND]", stdout)
 
-  @mock.patch.object(portlens, "inspect_selection", return_value=("detail", [], 1))
+  @mock.patch.object(portlens, "inspect_selection", return_value=inspection("detail", [], 1))
   def test_json_is_json_only(self, inspect):
     code, stdout, stderr = self.run_main(["--json", "8080"])
     self.assertEqual((code, stderr), (1, ""))
@@ -70,7 +68,7 @@ class CliTests(unittest.TestCase):
     self.assertEqual(payload["tool"], "portlens")
     self.assertEqual(payload["status"], "NOT_FOUND")
 
-  @mock.patch.object(portlens, "inspect_selection", return_value=("detail", [], 1))
+  @mock.patch.object(portlens, "inspect_selection", return_value=inspection("detail", [], 1))
   def test_brief_and_quiet(self, inspect):
     code, stdout, _ = self.run_main(["--brief", "8080"])
     self.assertEqual(code, 1)
@@ -111,15 +109,19 @@ class CliTests(unittest.TestCase):
     self.assertEqual((code, stdout), (2, ""))
     self.assertIn("malformed socket row", stderr)
 
-  def test_fixed_family_queries_do_not_include_port(self):
+  def test_fixed_family_queries_filter_ports_in_the_kernel(self):
     calls = []
     def runner(executable, arguments):
       calls.append((executable, tuple(arguments)))
       return ""
     self.assertEqual(portlens.discover_sockets("/usr/bin/ss", runner), [])
+    portlens.discover_sockets("/usr/bin/ss", runner, families=("ipv4",), selection=portlens.PortSelection(53, 53))
+    portlens.discover_sockets("/usr/bin/ss", runner, families=("ipv4",), selection=portlens.PortSelection(8000, 8100))
     self.assertEqual(calls, [
-      ("/usr/bin/ss", ("-H", "-4", "-ltnp")),
-      ("/usr/bin/ss", ("-H", "-6", "-ltnp")),
+      ("/usr/bin/ss", ("-H", "-4", "-ltne")),
+      ("/usr/bin/ss", ("-H", "-6", "-ltne")),
+      ("/usr/bin/ss", ("-H", "-4", "-ltne", "sport", "=", ":53")),
+      ("/usr/bin/ss", ("-H", "-4", "-ltne", "(", "sport", ">=", ":8000", "and", "sport", "<=", ":8100", ")")),
     ])
 
   def test_udp_query_is_protocol_specific(self):
@@ -130,22 +132,87 @@ class CliTests(unittest.TestCase):
       protocol="udp",
       families=("ipv4",),
     )
-    self.assertEqual(calls, [("-H", "-4", "-lunp")])
+    self.assertEqual(calls, [("-H", "-4", "-lune")])
 
-  @mock.patch.object(portlens, "find_ss", return_value="/usr/bin/ss")
-  @mock.patch.object(portlens, "discover_sockets")
-  def test_inspect_filters_exact_port_and_preserves_duplicate_rows(self, discover, find_ss):
+  def selected(self, rows, owners=None, **options):
+    values = dict(all_ports=False, protocol="tcp", families=("ipv4", "ipv6"), pid=None, process=None)
+    values.update(options)
+    details = portlens.ProcessDetails("u", "python3", "1000", "python3", "/")
+    with mock.patch.object(portlens, "find_ss", return_value="/usr/bin/ss"), \
+         mock.patch.object(portlens, "discover_sockets", return_value=rows), \
+         mock.patch.object(portlens, "find_socket_owners", return_value=(owners or {}, {})), \
+         mock.patch.object(portlens, "process_details", return_value=details):
+      return portlens.inspect_selection(values.pop("selection", portlens.PortSelection(8080, 8080)), **values)
+
+  def test_inspect_filters_exact_port_and_preserves_duplicate_rows(self):
     matching = portlens.SocketObservation("tcp", "LISTEN", "ipv4", "127.0.0.1", 8080)
-    discover.return_value = [matching, matching, portlens.SocketObservation(
-      "tcp", "LISTEN", "ipv4", "127.0.0.1", 18080,
-    )]
-    output, code = portlens.inspect(8080)
-    self.assertEqual(code, 0)
-    self.assertIn("Found 2 matching sockets.", output)
-    self.assertIn("Likely shared/reused bind groups: 1", output)
-    self.assertNotIn("18080", output)
+    result = self.selected([matching, matching, portlens.SocketObservation("tcp", "LISTEN", "ipv4", "127.0.0.1", 18080)])
+    self.assertEqual(result.exit_code, 0)
+    self.assertIn("Found 2 matching sockets.", result.report)
+    self.assertIn("Likely shared/reused bind groups: 1", result.report)
+    self.assertNotIn("18080", result.report)
 
-  @mock.patch.object(portlens.subprocess, "Popen")
+  def test_owners_come_only_from_inode_matches(self):
+    row = portlens.SocketObservation("tcp", "LISTEN", "ipv4", "127.0.0.1", 8080, inode=77)
+    other = portlens.SocketObservation("tcp", "LISTEN", "ipv4", "127.0.0.1", 8080, inode=78)
+    result = self.selected([row, other], owners={77: (portlens.ProcessReference(354, 3),)})
+    self.assertEqual([item.pid for item in result.observations], ["354", "-"])
+    self.assertEqual(self.selected([row], owners={77: (portlens.ProcessReference(354, 3),)}, pid=1).exit_code, 1)
+
+  def test_shared_bind_count_ignores_owner_filters(self):
+    rows = [
+      portlens.SocketObservation("udp", "UNCONN", "ipv4", "0.0.0.0", 8080, inode=1),
+      portlens.SocketObservation("udp", "UNCONN", "ipv4", "0.0.0.0", 8080, inode=2),
+    ]
+    result = self.selected(rows, owners={1: (portlens.ProcessReference(10, 3),), 2: (portlens.ProcessReference(20, 4),)}, pid=10, protocol="udp")
+    self.assertEqual((len(result.observations), result.shared_groups), (1, 1))
+
+  def test_ipv4_selection_includes_dual_stack_wildcards(self):
+    rows = [
+      portlens.SocketObservation("tcp", "LISTEN", "ipv6", "*", 8080),
+      portlens.SocketObservation("tcp", "LISTEN", "ipv6", "::", 8080),
+      portlens.SocketObservation("tcp", "LISTEN", "ipv6", "::ffff:127.0.0.1", 8080),
+    ]
+    result = self.selected(rows, families=("ipv4",))
+    self.assertEqual(sorted(item.local_address for item in result.observations), ["*", "::ffff:127.0.0.1"])
+
+  def test_long_process_names_match_truncated_comm(self):
+    row = portlens.SocketObservation("tcp", "LISTEN", "ipv4", "127.0.0.53", 8080, inode=5)
+    owners = {5: (portlens.ProcessReference(7, 3),)}
+    details = portlens.ProcessDetails("systemd-resolve", "systemd-resolve", "991", "-", "/")
+    with mock.patch.object(portlens, "find_ss", return_value="/usr/bin/ss"), \
+         mock.patch.object(portlens, "discover_sockets", return_value=[row]), \
+         mock.patch.object(portlens, "find_socket_owners", return_value=(owners, {})), \
+         mock.patch.object(portlens, "process_details", return_value=details):
+      result = portlens.inspect_selection(
+        portlens.PortSelection(8080, 8080), all_ports=False, protocol="tcp",
+        families=("ipv4",), pid=None, process="systemd-resolved",
+      )
+    self.assertEqual(result.exit_code, 0)
+    self.assertTrue(portlens.process_name_matches("a,b", "a,b", "-"))
+    self.assertFalse(portlens.process_name_matches("a", "a,b", "-"))
+
+  def test_watch_reports_every_snapshot_and_any_match(self):
+    found = portlens.DisplayObservation("tcp", "LISTEN", "ipv4", "127.0.0.1", 8080, "1", "u", "p")
+    results = [inspection("first", [found], 0), inspection("second", [], 1)]
+    with mock.patch.object(portlens, "inspect_selection", side_effect=results), mock.patch.object(portlens.time, "sleep"):
+      code, stdout, _ = self.run_main(["8080", "--watch", "2"])
+    self.assertEqual(code, 0)
+    self.assertIn("Snapshot 1 of 2\nfirst", stdout)
+    self.assertIn("Snapshot 2 of 2\nsecond", stdout)
+    self.assertIn("[FOUND]", stdout)
+    self.assertIn("1 of 2 snapshots matched", stdout)
+
+  def test_real_socket_owner_is_found_by_inode(self):
+    with socket.socket() as listener:
+      listener.bind(("127.0.0.1", 0))
+      listener.listen()
+      inode = os.fstat(listener.fileno()).st_ino
+      owners, counts = portlens.find_socket_owners({inode})
+      self.assertIn(portlens.ProcessReference(os.getpid(), listener.fileno()), owners[inode])
+      self.assertGreaterEqual(counts[os.getpid()], 1)
+
+  @mock.patch("subprocess.Popen")
   def test_subprocess_uses_argument_array_without_shell(self, popen):
     stdout_read, stdout_write = os.pipe()
     stderr_read, stderr_write = os.pipe()
@@ -185,8 +252,8 @@ class CliTests(unittest.TestCase):
         child = real_popen(*args, **kwargs)
         children.append(child)
         return child
-      with mock.patch.object(portlens.subprocess, "Popen", side_effect=capture), mock.patch.object(
-        portlens.selectors.DefaultSelector, "select", side_effect=KeyboardInterrupt,
+      with mock.patch.object(subprocess, "Popen", side_effect=capture), mock.patch.object(
+        selectors.DefaultSelector, "select", side_effect=KeyboardInterrupt,
       ), self.assertRaises(KeyboardInterrupt):
         portlens.run_ss_query(str(executable), ())
       self.assertEqual(len(children), 1)

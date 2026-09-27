@@ -61,9 +61,9 @@ Python 3.10 is the minimum because the existing implementation uses syntax intro
 
 - The complete v0.2 pre-release suite and installed-command checks are recorded in [VALIDATION.md](VALIDATION.md).
 - Existing focused GitHub Actions run on Ubuntu Linux; the Beta release workflow adds explicit CPython 3.10–3.14 coverage.
-- [DiskHound's validation record](diskhound/VALIDATION.md) documents automated and live WSL2 filesystem scenarios.
-- [CertWatch's validation record](certwatch/VALIDATION.md) documents Ubuntu 24.04, CPython 3.12–3.14, OpenSSL 3.0.13/3.5.5, controlled loopback validation, and the completed post-fix public-endpoint revalidation.
-- SvcDoctor records empirical Ubuntu validation with systemd 255.4 in its utility documentation.
+- [DiskHound's validation record](diskhound/VALIDATION.md) documents automated and live WSL2 filesystem scenarios for its v0.1 behavior.
+- [CertWatch's validation record](certwatch/VALIDATION.md) documents Ubuntu 24.04, CPython 3.12–3.14, OpenSSL 3.0.13/3.5.5, controlled loopback validation, and the completed post-fix public-endpoint revalidation for its v0.1 behavior.
+- SvcDoctor has no separate validation record; it was exercised with systemd 255.4 in the WSL2 campaign recorded in [VALIDATION.md](VALIDATION.md).
 
 The complete Beta packaging and regression evidence is recorded in [VALIDATION.md](VALIDATION.md).
 

@@ -1,41 +1,50 @@
 #!/usr/bin/env python3
-"""Inspect TCP listening sockets for one local port."""
+"""Inspect TCP listeners and UDP sockets for local ports."""
 
 from __future__ import annotations
 
 import argparse
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+import ipaddress
 import os
 import pwd
-import re
-import selectors
-import signal
-import shutil
-import subprocess
 import sys
 import time
-import unicodedata
-from typing import Callable, Sequence
+from typing import Callable, NamedTuple, Sequence
 
 from opsforge_common import (
   OutputError,
   OutputRecord,
   add_output_arguments,
   emit_output,
+  has_unsafe_characters,
   make_conclusion,
+  sanitize_text,
   validate_output_arguments,
 )
+from opsforge_common.process import (
+  ProcessOutputLimitError,
+  ProcessSpawnError,
+  ProcessTimeoutError,
+  resolve_executable,
+  run_bounded,
+)
+from opsforge_common.procfs import unified_cgroup_path
 
 
 UNAVAILABLE = "-"
-SS_COMMANDS = (("ipv4", ("-H", "-4", "-ltnp")), ("ipv6", ("-H", "-6", "-ltnp")))
-PROCESS_REFERENCE = re.compile(r'\("((?:\\.|[^"\\])*)",pid=(\d+)(?:,fd=(\d+))?')
 MAX_WATCH_COUNT = 100
 MAX_WATCH_INTERVAL = 60.0
 MAX_PROC_FIELD_BYTES = 4096
 MAX_PROC_ENTRIES = 100_000
 MAX_SS_STREAM_BYTES = 8 * 1024 * 1024
 SS_TIMEOUT_SECONDS = 30.0
+COMM_BYTES = 15
+MAX_REPORTED_WARNINGS = 20
+ENRICHMENT_NOTE = (
+  "socket owners are matched by socket inode through /proc/PID/fd, never by ss process-name text; "
+  "process metadata is live, non-atomic, and best-effort, and PID reuse can make it refer to another process"
+)
 
 
 class PortLensError(Exception):
@@ -45,7 +54,6 @@ class PortLensError(Exception):
 @dataclass(frozen=True)
 class ProcessReference:
   pid: int
-  ss_name: str
   fd: int | None = None
 
 
@@ -57,6 +65,8 @@ class SocketObservation:
   local_address: str
   local_port: int
   processes: tuple[ProcessReference, ...] = ()
+  interface: str | None = None
+  inode: int | None = None
 
 
 @dataclass(frozen=True)
@@ -75,6 +85,15 @@ class DisplayObservation:
   cgroup: str = UNAVAILABLE
   socket_fds: str = UNAVAILABLE
   exposure: str = UNAVAILABLE
+  interface: str = UNAVAILABLE
+
+
+class Inspection(NamedTuple):
+  report: str
+  observations: list[DisplayObservation]
+  exit_code: int
+  warnings: tuple[str, ...] = ()
+  shared_groups: int = 0
 
 
 @dataclass(frozen=True)
@@ -171,8 +190,8 @@ def build_argument_parser() -> argparse.ArgumentParser:
   return parser
 
 
-def parse_endpoint(endpoint: str, *, allow_wildcard_port: bool = False) -> tuple[str, int | None]:
-  """Parse an ss local endpoint without splitting IPv6 address colons."""
+def split_endpoint(endpoint: str, *, allow_wildcard_port: bool = False) -> tuple[str, str | None, int | None]:
+  """Parse an ss endpoint such as [fe80::1]%eth0:546 into address, bound interface, and port."""
   address, separator, port_text = endpoint.rpartition(":")
   if not separator or not address:
     raise PortLensError(f"cannot parse local endpoint {endpoint!r}")
@@ -184,162 +203,117 @@ def parse_endpoint(endpoint: str, *, allow_wildcard_port: bool = False) -> tuple
     port = int(port_text, 10)
     if not 0 <= port <= 65535:
       raise PortLensError(f"local endpoint has invalid port {port_text!r}")
-  if address.startswith("[") or address.endswith("]"):
-    if not (address.startswith("[") and address.endswith("]")):
+  interface = None
+  if address.startswith("["):
+    closing = address.find("]")
+    suffix = address[closing + 1:]
+    if closing < 0 or (suffix and not suffix.startswith("%")):
       raise PortLensError(f"cannot parse local endpoint {endpoint!r}")
-    address = address[1:-1]
-  if not address:
+    interface = suffix[1:] if suffix else None
+    address = address[1:closing]
+  elif address.endswith("]"):
     raise PortLensError(f"cannot parse local endpoint {endpoint!r}")
+  elif "%" in address:
+    address, _, interface = address.partition("%")
+  if not address or interface == "":
+    raise PortLensError(f"cannot parse local endpoint {endpoint!r}")
+  if address != "*":
+    try:
+      ipaddress.ip_address(address)
+    except ValueError as error:
+      raise PortLensError(f"cannot parse local endpoint {endpoint!r}") from error
+  return address, interface, port
+
+
+def parse_endpoint(endpoint: str, *, allow_wildcard_port: bool = False) -> tuple[str, int | None]:
+  """Parse an ss endpoint without splitting IPv6 address colons."""
+  address, _, port = split_endpoint(endpoint, allow_wildcard_port=allow_wildcard_port)
   return address, port
 
 
-def _unescape_ss_name(value: str) -> str:
-  """Decode only simple ss backslash escapes; never evaluate the value."""
-  return re.sub(r"\\(.)", r"\1", value)
-
-
-def parse_process_references(metadata: str) -> tuple[ProcessReference, ...]:
-  """Return every parseable process reference; malformed metadata is optional."""
-  references = []
-  for name, pid_text, fd_text in PROCESS_REFERENCE.findall(metadata):
-    references.append(ProcessReference(
-      pid=int(pid_text, 10),
-      ss_name=_unescape_ss_name(name),
-      fd=int(fd_text, 10) if fd_text else None,
-    ))
-  return tuple(references)
-
-
 def parse_ss_row(row: str, family: str, protocol: str = "tcp") -> SocketObservation:
-  """Parse one headerless ss TCP listening row conservatively."""
+  """Parse one headerless `ss -e` row; ownership is resolved later from the socket inode."""
   if family not in {"ipv4", "ipv6"}:
     raise PortLensError(f"unsupported address family {family!r}")
+  if protocol not in {"tcp", "udp"}:
+    raise PortLensError(f"unsupported protocol {protocol!r}")
   fields = row.split(None, 5)
   if len(fields) < 5:
     raise PortLensError("ss returned a malformed socket row")
   state, receive_queue, send_queue, local_endpoint, peer_endpoint = fields[:5]
   if protocol == "tcp" and state != "LISTEN":
     raise PortLensError(f"ss returned unexpected TCP state {state!r}")
-  if protocol not in {"tcp", "udp"}:
-    raise PortLensError(f"unsupported protocol {protocol!r}")
   if not receive_queue.isdecimal() or not send_queue.isdecimal():
     raise PortLensError("ss returned malformed TCP queue values")
-  parse_endpoint(peer_endpoint, allow_wildcard_port=True)
-  local_address, local_port = parse_endpoint(local_endpoint)
-  if local_port is None:
-    raise PortLensError("ss returned a local endpoint without a numeric port")
-  metadata = fields[5] if len(fields) == 6 else ""
+  split_endpoint(peer_endpoint, allow_wildcard_port=True)
+  local_address, interface, local_port = split_endpoint(local_endpoint)
+  inode = None
+  # The kernel-reported inode precedes free-form fields such as cgroup paths.
+  for token in (fields[5] if len(fields) == 6 else "").split():
+    if token.startswith("ino:"):
+      value = token[4:]
+      inode = int(value, 10) if value.isascii() and value.isdecimal() else None
+      break
   return SocketObservation(
     protocol=protocol,
     state=state,
     family=family,
     local_address=local_address,
     local_port=local_port,
-    processes=parse_process_references(metadata),
+    interface=interface,
+    inode=inode,
   )
 
 
-def parse_ss_output(output: str, family: str, protocol: str = "tcp") -> list[SocketObservation]:
+def parse_ss_output(
+  output: str, family: str, protocol: str = "tcp", malformed: list[str] | None = None,
+) -> list[SocketObservation]:
+  """Parse ss rows; with MALFORMED, collect unparseable rows as warnings instead of failing."""
   observations = []
-  for line in output.splitlines():
+  for line in output.split("\n"):
     if not line.strip():
       continue
-    observations.append(parse_ss_row(line, family, protocol))
+    try:
+      observations.append(parse_ss_row(line, family, protocol))
+    except PortLensError as error:
+      if malformed is None:
+        raise
+      malformed.append(f"skipped an unparseable ss row: {error}")
   return observations
 
 
 def find_ss() -> str:
-  executable = shutil.which("ss")
+  executable = resolve_executable("ss")
   if executable is None:
-    raise PortLensError("required command 'ss' was not found")
+    raise PortLensError("required command 'ss' was not found in a trusted PATH directory")
   return executable
-
-
-def _stop_process(process: subprocess.Popen[bytes]) -> None:
-  """Best-effort termination and bounded reaping for every exceptional path."""
-  killed_group = False
-  pid = getattr(process, "pid", None)
-  try:
-    running = process.poll() is None
-  except OSError:
-    running = False
-  # A helper may exit while descendants still hold its output pipes open.
-  if isinstance(pid, int):
-    try:
-      os.killpg(pid, signal.SIGKILL)
-      killed_group = True
-    except OSError:
-      pass
-  if running and not killed_group:
-    try:
-      if process.poll() is None:
-        process.kill()
-    except OSError:
-      pass
-  try:
-    process.wait(timeout=1.0)
-  except (OSError, subprocess.TimeoutExpired):
-    pass
 
 
 def run_ss_query(executable: str, arguments: Sequence[str]) -> str:
   try:
-    process = subprocess.Popen(
-      [executable, *arguments],
-      stdout=subprocess.PIPE,
-      stderr=subprocess.PIPE,
-      start_new_session=True,
+    result = run_bounded(
+      [executable, *arguments], timeout=SS_TIMEOUT_SECONDS, max_output_bytes=MAX_SS_STREAM_BYTES,
     )
-  except OSError as error:
-    raise PortLensError(f"could not execute 'ss': {error}") from error
-  if process.stdout is None or process.stderr is None:
-    _stop_process(process)
-    raise PortLensError("could not execute 'ss'")
-  streams = {process.stdout: bytearray(), process.stderr: bytearray()}
-  selector = selectors.DefaultSelector()
-  deadline = time.monotonic() + SS_TIMEOUT_SECONDS
-  try:
-    selector.register(process.stdout, selectors.EVENT_READ)
-    selector.register(process.stderr, selectors.EVENT_READ)
-    while selector.get_map():
-      remaining = deadline - time.monotonic()
-      if remaining <= 0:
-        raise PortLensError("'ss' timed out")
-      events = selector.select(remaining)
-      if not events:
-        raise PortLensError("'ss' timed out")
-      for key, _ in events:
-        chunk = os.read(key.fileobj.fileno(), 64 * 1024)
-        if not chunk:
-          selector.unregister(key.fileobj)
-          continue
-        streams[key.fileobj].extend(chunk)
-        if len(streams[key.fileobj]) > MAX_SS_STREAM_BYTES:
-          raise PortLensError("'ss' output exceeded the 8 MiB limit")
-    remaining = deadline - time.monotonic()
-    if remaining <= 0:
-      raise PortLensError("'ss' timed out")
-    try:
-      returncode = process.wait(timeout=remaining)
-    except subprocess.TimeoutExpired as error:
-      raise PortLensError("'ss' timed out") from error
-  except BaseException:
-    _stop_process(process)
-    raise
-  finally:
-    selector.close()
-    process.stdout.close()
-    process.stderr.close()
-  try:
-    stdout = bytes(streams[process.stdout]).decode("utf-8", "strict")
-    stderr = bytes(streams[process.stderr]).decode("utf-8", "replace")
-  except UnicodeDecodeError as error:
-    raise PortLensError("'ss' returned non-UTF-8 output") from error
-  if returncode != 0:
-    detail = sanitize_display(stderr.strip())[:200]
+  except ProcessTimeoutError as error:
+    raise PortLensError("'ss' timed out") from error
+  except ProcessOutputLimitError as error:
+    raise PortLensError("'ss' output exceeded the 8 MiB limit") from error
+  except ProcessSpawnError as error:
+    raise PortLensError(f"could not execute 'ss': {sanitize_text(error)}") from error
+  if result.returncode != 0:
+    detail = sanitize_text(result.stderr.decode("utf-8", "replace").strip())[:200]
     suffix = f": {detail}" if detail else ""
-    raise PortLensError(f"'ss' exited with status {returncode}{suffix}")
-  return stdout
+    raise PortLensError(f"'ss' exited with status {result.returncode}{suffix}")
+  return result.stdout.decode("utf-8", "surrogateescape")
+
+
+def port_filter(selection: PortSelection | None) -> tuple[str, ...]:
+  """Build an ss kernel-side filter from already validated integer ports."""
+  if selection is None:
+    return ()
+  if selection.start == selection.end:
+    return ("sport", "=", f":{selection.start}")
+  return ("(", "sport", ">=", f":{selection.start}", "and", "sport", "<=", f":{selection.end}", ")")
 
 
 def discover_sockets(
@@ -348,34 +322,84 @@ def discover_sockets(
   *,
   protocol: str = "tcp",
   families: Sequence[str] = ("ipv4", "ipv6"),
+  selection: PortSelection | None = None,
+  warnings: list[str] | None = None,
 ) -> list[SocketObservation]:
   observations = []
-  flag = "-lunp" if protocol == "udp" else "-ltnp"
+  flag = "-lune" if protocol == "udp" else "-ltne"
   for family in families:
     family_flag = "-4" if family == "ipv4" else "-6"
-    arguments = ("-H", family_flag, flag)
-    observations.extend(parse_ss_output(runner(executable, arguments), family, protocol))
+    arguments = ("-H", family_flag, flag, *port_filter(selection))
+    observations.extend(parse_ss_output(runner(executable, arguments), family, protocol, warnings))
   return observations
 
 
-def enrich_process(reference: ProcessReference) -> tuple[str, str]:
+def find_socket_owners(
+  inodes: set[int], proc_root: str = "/proc",
+) -> tuple[dict[int, tuple[ProcessReference, ...]], dict[int, int | None]]:
+  """Map socket inodes to (PID, FD) owners and count FDs by reading /proc/PID/fd links, as ss -p does."""
+  if not inodes:
+    return {}, {}
+  targets = {f"socket:[{inode}]": inode for inode in inodes}
+  owners: dict[int, list[ProcessReference]] = {}
+  counts: dict[int, int | None] = {}
+  try:
+    processes = os.scandir(proc_root)
+  except OSError:
+    return {}, {}
+  with processes:
+    for process_entry in processes:
+      if not process_entry.name.isascii() or not process_entry.name.isdecimal():
+        continue
+      pid = int(process_entry.name, 10)
+      count: int | None = 0
+      found = False
+      try:
+        with os.scandir(f"{proc_root}/{process_entry.name}/fd") as descriptors:
+          for count, descriptor in enumerate(descriptors, 1):
+            if count > MAX_PROC_ENTRIES:
+              count = None
+              break
+            try:
+              inode = targets.get(os.readlink(descriptor.path))
+            except OSError:
+              continue
+            if inode is not None and descriptor.name.isdecimal():
+              owners.setdefault(inode, []).append(ProcessReference(pid, int(descriptor.name, 10)))
+              found = True
+      except OSError:
+        continue
+      if found:
+        counts[pid] = count
+  return {inode: tuple(references) for inode, references in owners.items()}, counts
+
+
+@dataclass(frozen=True)
+class ProcessDetails:
+  user: str
+  process: str
+  uid: str
+  executable: str
+  cgroup: str
+
+
+def _user_name(uid: int, cache: dict[int, str]) -> str:
+  if uid not in cache:
+    try:
+      cache[uid] = pwd.getpwuid(uid).pw_name
+    except KeyError:
+      cache[uid] = str(uid)
+  return cache[uid]
+
+
+def enrich_process(reference: ProcessReference, user_cache: dict[int, str] | None = None) -> tuple[str, str]:
   proc_path = f"/proc/{reference.pid}"
+  process = _read_proc_text(f"{proc_path}/comm")
   try:
     uid = os.stat(proc_path).st_uid
   except OSError:
-    user = UNAVAILABLE
-  else:
-    try:
-      user = pwd.getpwuid(uid).pw_name
-    except KeyError:
-      user = str(uid)
-
-  process = _read_proc_text(f"{proc_path}/comm")
-  if process == UNAVAILABLE:
-    process = reference.ss_name or UNAVAILABLE
-  if not process:
-    process = reference.ss_name or UNAVAILABLE
-  return user, process
+    return UNAVAILABLE, process
+  return _user_name(uid, {} if user_cache is None else user_cache), process
 
 
 def _read_proc_text(path: str) -> str:
@@ -389,105 +413,98 @@ def _read_proc_text(path: str) -> str:
   return data.decode("utf-8", "replace").strip() or UNAVAILABLE
 
 
-def process_details(reference: ProcessReference) -> tuple[str, str, str, str, str, str, str]:
-  """Collect live, non-atomic metadata; ss alone supplies the socket/PID association."""
-  user, process = enrich_process(reference)
-  proc_path = f"/proc/{reference.pid}"
+def process_details(pid: int, user_cache: dict[int, str] | None = None) -> ProcessDetails:
+  """Collect live, non-atomic metadata for one socket-owning PID."""
+  proc_path = f"/proc/{pid}"
   try:
-    uid = str(os.stat(proc_path).st_uid)
+    uid_number = os.stat(proc_path).st_uid
   except OSError:
-    uid = UNAVAILABLE
+    uid = user = UNAVAILABLE
+  else:
+    uid = str(uid_number)
+    user = _user_name(uid_number, {} if user_cache is None else user_cache)
+  process = _read_proc_text(f"{proc_path}/comm")
   try:
     executable = os.path.basename(os.readlink(f"{proc_path}/exe")) or UNAVAILABLE
   except OSError:
     executable = UNAVAILABLE
-  try:
-    with os.scandir(f"{proc_path}/fd") as entries:
-      count = 0
-      for count, _ in enumerate(entries, 1):
-        if count > MAX_PROC_ENTRIES:
-          raise OverflowError
-    fd_count = str(count)
-  except (OSError, OverflowError):
-    fd_count = UNAVAILABLE
   cgroup_text = _read_proc_text(f"{proc_path}/cgroup")
-  if cgroup_text != UNAVAILABLE:
-    first = cgroup_text.splitlines()[0]
-    cgroup = first.rsplit(":", 1)[-1][:256] or "/"
+  cgroup = UNAVAILABLE if cgroup_text == UNAVAILABLE else (unified_cgroup_path(cgroup_text) or UNAVAILABLE)[:256]
+  return ProcessDetails(user, process, uid, executable, cgroup)
+
+
+def classify_bind(address: str, interface: str | None = None) -> str:
+  if address == "*":
+    scope = "wildcard (all local IPv4 and IPv6 interfaces in this namespace)"
   else:
-    cgroup = UNAVAILABLE
-  fd = str(reference.fd) if reference.fd is not None else UNAVAILABLE
-  return user, process, uid, executable, fd_count, cgroup, fd
+    try:
+      parsed = ipaddress.ip_address(address)
+    except ValueError:
+      parsed = None
+    mapped = getattr(parsed, "ipv4_mapped", None)
+    if mapped is not None:
+      parsed = mapped
+    if parsed is None:
+      scope = "specific local address"
+    elif parsed.is_unspecified:
+      scope = "wildcard (all local interfaces in this namespace)"
+    elif parsed.is_loopback:
+      scope = "loopback only"
+    elif parsed.is_link_local:
+      scope = "link-local address"
+    else:
+      scope = "specific local address"
+  return f"{scope}; bound to interface {interface}" if interface else scope
 
 
-def classify_bind(address: str) -> str:
-  if address in {"0.0.0.0", "::", "*"}:
-    return "wildcard (all local interfaces in this namespace)"
-  if address == "127.0.0.1" or address == "::1" or address.startswith("127."):
-    return "loopback only"
-  return "specific local address"
-
-
-def to_display(observation: SocketObservation) -> DisplayObservation:
+def to_display(
+  observation: SocketObservation,
+  details: Callable[[int], ProcessDetails] | None = None,
+  fd_counts: dict[int, int | None] | None = None,
+) -> DisplayObservation:
+  exposure = classify_bind(observation.local_address, observation.interface)
+  interface = observation.interface or UNAVAILABLE
   if not observation.processes:
     return DisplayObservation(
       observation.protocol, observation.state, observation.family,
       observation.local_address, observation.local_port,
       UNAVAILABLE, UNAVAILABLE, UNAVAILABLE,
-      exposure=classify_bind(observation.local_address),
+      exposure=exposure, interface=interface,
     )
-  users = []
-  names = []
-  uids = []
-  executables = []
-  fd_counts = []
-  cgroups = []
-  socket_fds = []
-  for reference in observation.processes:
-    user, name, uid, executable, fd_count, cgroup, socket_fd = process_details(reference)
-    users.append(user)
-    names.append(name)
-    uids.append(uid)
-    executables.append(executable)
-    fd_counts.append(fd_count)
-    cgroups.append(cgroup)
-    socket_fds.append(socket_fd)
+  lookup = details or process_details
+  counts = fd_counts or {}
+  owners = [(reference, lookup(reference.pid)) for reference in observation.processes]
+
+  def joined(values: Sequence[str]) -> str:
+    return ",".join(values)
+
   return DisplayObservation(
     observation.protocol,
     observation.state,
     observation.family,
     observation.local_address,
     observation.local_port,
-    ",".join(str(reference.pid) for reference in observation.processes),
-    ",".join(users),
-    ",".join(names),
-    ",".join(uids),
-    ",".join(executables),
-    ",".join(fd_counts),
-    ",".join(cgroups),
-    ",".join(socket_fds),
-    classify_bind(observation.local_address),
+    joined([str(reference.pid) for reference, _ in owners]),
+    joined([info.user for _, info in owners]),
+    joined([info.process for _, info in owners]),
+    joined([info.uid for _, info in owners]),
+    joined([info.executable for _, info in owners]),
+    joined([UNAVAILABLE if counts.get(reference.pid) is None else str(counts[reference.pid]) for reference, _ in owners]),
+    joined([info.cgroup for _, info in owners]),
+    joined([str(reference.fd) if reference.fd is not None else UNAVAILABLE for reference, _ in owners]),
+    exposure,
+    interface,
   )
 
 
-def sanitize_display(value: object) -> str:
-  text = str(value)
-  rendered = []
-  for character in text:
-    codepoint = ord(character)
-    category = unicodedata.category(character)
-    if character == "\\":
-      rendered.append("\\\\")
-    elif category in {"Cc", "Cf", "Cs", "Zl", "Zp"}:
-      if codepoint <= 0xFF:
-        rendered.append(f"\\x{codepoint:02x}")
-      elif codepoint <= 0xFFFF:
-        rendered.append(f"\\u{codepoint:04x}")
-      else:
-        rendered.append(f"\\U{codepoint:08x}")
-    else:
-      rendered.append(character)
-  return "".join(rendered)
+def _address_sort_key(address: str) -> tuple[int, int]:
+  if address == "*":
+    return (0, 0)
+  try:
+    parsed = ipaddress.ip_address(address)
+  except ValueError:
+    return (9, 0)
+  return (parsed.version, int(parsed))
 
 
 def sort_observations(observations: Sequence[DisplayObservation]) -> list[DisplayObservation]:
@@ -495,16 +512,27 @@ def sort_observations(observations: Sequence[DisplayObservation]) -> list[Displa
 
   def key(item: DisplayObservation) -> tuple[object, ...]:
     pid_key = (1, 0) if item.pid == UNAVAILABLE else (0, int(item.pid.split(",", 1)[0]))
-    return (family_order[item.family], item.local_address, pid_key, item.process)
+    return (family_order[item.family], _address_sort_key(item.local_address), item.local_port, pid_key, item.process)
 
   return sorted(observations, key=key)
 
 
-def render_result(port: int | str, observations: Sequence[DisplayObservation], *, protocol: str = "tcp") -> str:
+def _display_address(item: DisplayObservation) -> str:
+  return item.local_address if item.interface == UNAVAILABLE else f"{item.local_address}%{item.interface}"
+
+
+def render_result(
+  port: int | str,
+  observations: Sequence[DisplayObservation],
+  *,
+  protocol: str = "tcp",
+  shared: int | None = None,
+  warnings: Sequence[str] = (),
+) -> str:
   lines = [
     f"PortLens: local port {port}",
     f"Scope: {protocol.upper()} local sockets visible in the current network namespace",
-    "Process enrichment: live, non-atomic, best-effort; PID reuse can make later /proc metadata refer to another process. Socket/PID associations come from ss.",
+    f"Process enrichment: {ENRICHMENT_NOTE}.",
     "",
   ]
   if not observations:
@@ -512,44 +540,56 @@ def render_result(port: int | str, observations: Sequence[DisplayObservation], *
       f"No matching {protocol.upper()} socket was observed.",
       "This result does not prove that the port is available or bindable.",
     ])
-    return "\n".join(lines)
-
-  count = len(observations)
-  noun = "socket" if count == 1 else "sockets"
-  lines.extend([f"Found {count} matching {noun}.", ""])
-  headings = ("PROTO", "STATE", "FAMILY", "LOCAL ADDRESS", "PORT", "PID", "USER", "PROCESS", "EXPOSURE")
-  rows = [headings]
-  for item in observations:
-    rows.append(tuple(sanitize_display(value) for value in (
-      item.protocol, item.state, item.family, item.local_address, item.local_port,
-      item.pid, item.user, item.process, item.exposure,
-    )))
-  widths = [max(len(row[index]) for row in rows) for index in range(len(headings))]
-  for row in rows:
-    lines.append("  ".join(value.ljust(widths[index]) for index, value in enumerate(row)).rstrip())
-  shared = likely_shared_bind_count(observations)
-  lines.extend((
-    "",
-    f"Likely shared/reused bind groups: {shared}",
-    "Multiple rows on one protocol/family/address/port can reflect socket reuse or multiple owners; it does not by itself prove a conflict.",
-  ))
+  else:
+    count = len(observations)
+    noun = "socket" if count == 1 else "sockets"
+    lines.extend([f"Found {count} matching {noun}.", ""])
+    headings = ("PROTO", "STATE", "FAMILY", "LOCAL ADDRESS", "PORT", "PID", "USER", "PROCESS", "EXPOSURE")
+    rows = [headings]
+    for item in observations:
+      rows.append(tuple(sanitize_text(value) for value in (
+        item.protocol, item.state, item.family, _display_address(item), item.local_port,
+        item.pid, item.user, item.process, item.exposure,
+      )))
+    widths = [max(len(row[index]) for row in rows) for index in range(len(headings))]
+    for row in rows:
+      lines.append("  ".join(value.ljust(widths[index]) for index, value in enumerate(row)).rstrip())
+    lines.extend((
+      "",
+      f"Likely shared/reused bind groups: {likely_shared_bind_count(observations) if shared is None else shared}",
+      "Multiple rows on one protocol/family/address/port can reflect socket reuse or multiple owners; it does not by itself prove a conflict.",
+    ))
+  if warnings:
+    lines.extend(("", "Warnings:"))
+    lines.extend(f"  {sanitize_text(item)}" for item in warnings[:MAX_REPORTED_WARNINGS])
   return "\n".join(lines)
 
 
 def likely_shared_bind_count(observations: Sequence[DisplayObservation]) -> int:
-  counts: dict[tuple[str, str, str, int], int] = {}
+  counts: dict[tuple[str, str, str, str, int], int] = {}
   for item in observations:
-    key = (item.protocol, item.family, item.local_address, item.local_port)
+    key = (item.protocol, item.family, item.local_address, item.interface, item.local_port)
     counts[key] = counts.get(key, 0) + 1
   return sum(count > 1 for count in counts.values())
 
 
-def inspect(port: int) -> tuple[str, int]:
-  executable = find_ss()
-  observations = discover_sockets(executable)
-  matches = [observation for observation in observations if observation.local_port == port]
-  displayed = sort_observations([to_display(observation) for observation in matches])
-  return render_result(port, displayed), 0 if displayed else 1
+def accepts_ipv4(address: str) -> bool:
+  """Return whether an IPv6-family ss row can also accept IPv4 connections (dual-stack or mapped)."""
+  if address == "*":
+    return True
+  try:
+    parsed = ipaddress.ip_address(address)
+  except ValueError:
+    return False
+  return getattr(parsed, "ipv4_mapped", None) is not None
+
+
+def process_name_matches(requested: str, comm: str, executable: str) -> bool:
+  """Match a name against /proc comm, which the kernel truncates to 15 bytes, or the executable name."""
+  if requested in (comm, executable):
+    return True
+  encoded = requested.encode("utf-8", "surrogateescape")
+  return len(encoded) > COMM_BYTES and comm == encoded[:COMM_BYTES].decode("utf-8", "replace")
 
 
 def inspect_selection(
@@ -560,22 +600,50 @@ def inspect_selection(
   families: Sequence[str],
   pid: int | None,
   process: str | None,
-) -> tuple[str, list[DisplayObservation], int]:
+) -> Inspection:
   executable = find_ss()
-  observed = discover_sockets(executable, protocol=protocol, families=families)
+  warnings: list[str] = []
+  ipv4_only = tuple(families) == ("ipv4",)
+  # Dual-stack IPv6 wildcard sockets accept IPv4 but appear only in `ss -6` output.
+  query_families = ("ipv4", "ipv6") if ipv4_only else tuple(families)
+  scope = None if all_ports else selection
+  observed = discover_sockets(executable, protocol=protocol, families=query_families, selection=scope, warnings=warnings)
+  in_scope = [
+    item for item in observed
+    if (scope is None or scope.contains(item.local_port))
+    and (not ipv4_only or item.family == "ipv4" or accepts_ipv4(item.local_address))
+  ]
+  owners, fd_counts = find_socket_owners({item.inode for item in in_scope if item.inode is not None})
+  without_inode = sum(item.inode is None for item in in_scope)
+  if without_inode:
+    warnings.append(f"{without_inode} ss row(s) lacked a socket inode, so their owners are unavailable")
+  user_cache: dict[int, str] = {}
+  details_cache: dict[int, ProcessDetails] = {}
+
+  def details(owner_pid: int) -> ProcessDetails:
+    if owner_pid not in details_cache:
+      details_cache[owner_pid] = process_details(owner_pid, user_cache)
+    return details_cache[owner_pid]
+
+  rows = []
+  for item in in_scope:
+    item = replace(item, processes=owners.get(item.inode, ()) if item.inode is not None else ())
+    rows.append((item, to_display(item, details, fd_counts)))
+  shared = likely_shared_bind_count([display for _, display in rows])
   matches = []
-  for item in observed:
-    if not all_ports and selection is not None and not selection.contains(item.local_port):
-      continue
+  for item, display in rows:
     if pid is not None and all(reference.pid != pid for reference in item.processes):
       continue
-    display = to_display(item)
-    if process is not None and process not in display.process.split(","):
+    if process is not None and not any(
+      process_name_matches(process, details(reference.pid).process, details(reference.pid).executable)
+      for reference in item.processes
+    ):
       continue
     matches.append(display)
   displayed = sort_observations(matches)
   label = "all" if all_ports else selection.label() if selection is not None else "-"
-  return render_result(label, displayed, protocol=protocol), displayed, 0 if displayed else 1
+  report = render_result(label, displayed, protocol=protocol, shared=shared, warnings=warnings)
+  return Inspection(report, displayed, 0 if displayed else 1, tuple(warnings), shared)
 
 
 def observation_dict(item: DisplayObservation) -> dict[str, object]:
@@ -584,6 +652,7 @@ def observation_dict(item: DisplayObservation) -> dict[str, object]:
     "state": item.state,
     "family": item.family,
     "local_address": item.local_address,
+    "interface": None if item.interface == UNAVAILABLE else item.interface,
     "local_port": item.local_port,
     "pid": None if item.pid == UNAVAILABLE else item.pid,
     "uid": None if item.uid == UNAVAILABLE else item.uid,
@@ -602,31 +671,27 @@ def main(argv: Sequence[str] | None = None) -> int:
   arguments = parser.parse_args(argv)
   validate_output_arguments(parser, arguments)
   if arguments.process is not None:
-    if not arguments.process or len(arguments.process) > 128 or sanitize_display(arguments.process) != arguments.process:
+    if not arguments.process or len(arguments.process) > 128 or has_unsafe_characters(arguments.process):
       parser.error("--process must be a printable process name of at most 128 characters")
   protocol = "udp" if arguments.udp else "tcp"
   families = ("ipv4",) if arguments.ipv4 else ("ipv6",) if arguments.ipv6 else ("ipv4", "ipv6")
   watch_count = arguments.watch or 1
   started = time.monotonic()
+  inspections: list[Inspection] = []
   try:
-    output = ""
-    displayed: list[DisplayObservation] = []
-    exit_code = 1
-    snapshots = []
     for index in range(watch_count):
-      output, displayed, exit_code = inspect_selection(
+      inspections.append(inspect_selection(
         arguments.port,
         all_ports=arguments.all,
         protocol=protocol,
         families=families,
         pid=arguments.pid,
         process=arguments.process,
-      )
-      snapshots.append([observation_dict(item) for item in displayed])
+      ))
       if index + 1 < watch_count:
         time.sleep(arguments.watch_interval)
   except PortLensError as error:
-    print(f"portlens: {sanitize_display(error)}", file=sys.stderr)
+    print(f"portlens: {sanitize_text(error)}", file=sys.stderr)
     return 2
   except KeyboardInterrupt:
     print("portlens: interrupted", file=sys.stderr)
@@ -636,33 +701,51 @@ def main(argv: Sequence[str] | None = None) -> int:
     return 2
   elapsed = time.monotonic() - started
   target = "all local ports" if arguments.all else f"local port {arguments.port.label()}"
+  matched = [inspection for inspection in inspections if inspection.observations]
+  latest = matched[-1] if matched else inspections[-1]
+  displayed = latest.observations
+  if watch_count == 1:
+    output = latest.report
+  else:
+    output = "\n\n".join(
+      f"Snapshot {number} of {watch_count}\n{inspection.report}"
+      for number, inspection in enumerate(inspections, 1)
+    )
   if displayed:
     status = "FOUND"
-    shared = likely_shared_bind_count(displayed)
+    shared = latest.shared_groups
     finding = f"{len(displayed)} matching {protocol.upper()} socket{'s were' if len(displayed) != 1 else ' was'} observed"
+    if watch_count > 1:
+      finding += f" in the latest matching snapshot ({len(matched)} of {watch_count} snapshots matched)"
     finding += f" with {shared} likely shared/reused bind group(s)." if shared else "."
     next_action = "review bind exposure and owning-process evidence"
   else:
     status = "NOT_FOUND"
-    finding = f"no matching {protocol.upper()} socket was observed."
+    finding = f"no matching {protocol.upper()} socket was observed" + (f" in any of {watch_count} snapshots." if watch_count > 1 else ".")
     next_action = "do not infer that the port is bindable from this observation alone"
   conclusion = make_conclusion(status, target, finding, next_action)
   brief = f"Target: {target}\nObserved sockets: {len(displayed)}"
+  if watch_count > 1:
+    brief += f"\nSnapshots with matches: {len(matched)} of {watch_count}"
+  warnings = ["Process metadata is live, non-atomic, and best-effort; PID reuse or procfs permissions can invalidate enrichment."]
+  for inspection in inspections:
+    warnings.extend(item for item in inspection.warnings if item not in warnings)
   record = OutputRecord(
     tool="portlens",
     status=status,
     target=target,
     observations={
-      "process_enrichment": "live, non-atomic, best-effort; socket/PID association from ss; later /proc metadata may belong to a reused PID",
+      "process_enrichment": ENRICHMENT_NOTE,
       "protocol": protocol,
       "families": list(families),
       "watch_count": watch_count,
-      "likely_shared_bind_groups": likely_shared_bind_count(displayed),
-      "snapshots": snapshots,
+      "snapshots_with_matches": len(matched),
+      "likely_shared_bind_groups": latest.shared_groups,
+      "snapshots": [[observation_dict(item) for item in inspection.observations] for inspection in inspections],
     },
     conclusion=conclusion,
     next_action=next_action + ".",
-    warnings=("Process metadata is live, non-atomic, and best-effort; PID reuse or procfs permissions can invalidate enrichment.",),
+    warnings=tuple(warnings[:MAX_REPORTED_WARNINGS + 1]),
     elapsed_seconds=elapsed,
   )
   try:
@@ -677,9 +760,9 @@ def main(argv: Sequence[str] | None = None) -> int:
       force=arguments.force,
     )
   except OutputError as error:
-    print(f"portlens: {sanitize_display(error)}", file=sys.stderr)
+    print(f"portlens: {sanitize_text(error)}", file=sys.stderr)
     return 2
-  return exit_code
+  return 0 if matched else 1
 
 
 if __name__ == "__main__":

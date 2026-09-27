@@ -4,6 +4,26 @@ Notable changes to OpsForge will be recorded here.
 
 ## Unreleased
 
+### Fixed
+
+- Shared output: `--force` replaces files atomically through a private temporary file, a reader closing stdout early (for example `| head`) no longer causes a traceback, non-finite numbers are emitted as JSON `null` so output stays standard JSON, and an empty `--output` path is refused.
+- Shared helpers: terminal escaping, bounded subprocesses with trusted helper resolution and a minimal environment, regular-file opening, procfs parsing, and systemd unit-name normalization now have one implementation in `opsforge_common` instead of drifting per-tool copies.
+- PortLens attributes socket owners by socket inode from `/proc/PID/fd` instead of trusting `ss -p` process text, and handles scoped IPv6 binds, dual-stack IPv4 matches, newline or non-UTF-8 process names, kernel-truncated names, and unparseable `ss` rows.
+- DiskHound reports directories cut off by `--max-depth` as `PARTIAL` with reasons instead of omitting them silently, and counts skipped cross-device entries.
+- ConfigDiff semantic JSON compares typed values (`true` no longer equals `1`); directory mode compares the root directory and symlink targets and reports unexamined directories; non-regular files are checked before opening; unified diffs are bounded.
+- CertWatch checks identity against the SNI name actually sent, adds a `CRITICAL` state, ranks states so drift never hides expiry, and reports a failed target even when it is the only one.
+- NetDoctor classifies TLS errors, reads a symlinked `/etc/resolv.conf`, ignores reject/unreachable default routes, and moves to the next candidate when a socket cannot be created.
+- SvcDoctor reports failed, load-error, crash-looping, unsuccessfully stopped, and dependency-failed units as failures (exit 1); reads the journal by unit `Id` so aliases reach the real unit and keeps the newest lines; and checks dependencies of every unit type, including `Requisite` and `BindsTo`.
+- HealthCtl rejects fields that belong to another check type, maps `systemctl is-active` statuses to `PASS`/`FAIL`/`ERROR` exactly, reports dependents of a non-passing check as `SKIPPED`, reports expired certificates as critical failures, isolates one check's crash from the rest of the run, backs off between retries, and no longer double-counts errors.
+- LogHound parses RFC 3164 syslog and common ISO 8601 timestamp variants, so recurrence works on syslog-style files; `--window-seconds` reports undated lines instead of silently filtering them; syslog PIDs, ports, IPv6 addresses, JSON-quoted labels, and any UUID version are normalized; explicit log levels win over keywords and `failed=0` is not an error; stack traces group across source, caret, exception, and cause lines and JDK 9+ frames; NUL bytes and overlong lines, a failed rotation, or a crafted timestamp no longer abort analysis; memory is bounded at 100,000 distinct patterns.
+- ProcWatch keeps earlier samples when a later one fails, stops at zombie or dead states, labels thread and child caps as truncated, and reads the tightest cgroup limits up the hierarchy from the real cgroup2 mount.
+- Incident Snapshot reads socket tables up to 16 MiB, truncates capped lists with totals instead of discarding sections, keeps IPv4 evidence on hosts without IPv6, reports only unconnected UDP sockets as bound, and counts processes whose `stat` could not be parsed.
+
+### Changed
+
+- New states: SvcDoctor adds `LOAD-ERROR`, `RESTARTING`, `DEGRADED`, and `DEPENDENCY-FAILED` (exit 1); ConfigDiff adds `INCOMPLETE` (exit 3); CertWatch adds `CRITICAL`; HealthCtl adds `SKIPPED`. Conditions that previously looked healthy can now return a non-zero exit.
+- LogHound JSON patterns carry a bounded `key` excerpt with `key_truncated`, `key_length`, and `key_digest` instead of the full line, and LogHound results that include truncated lines, removed NUL bytes, undated lines under a window, or pattern limits are `PARTIAL` (exit 1).
+- CI workflows use least-privilege permissions, `persist-credentials: false`, and pinned build tooling; the release workflow runs the unit tests from the extracted sdist; Dependabot tracks GitHub Actions. Tests ship in the sdist but not the wheel.
 ## 0.2.0-beta.1 - 2026-09-13
 
 ### Common output and safety

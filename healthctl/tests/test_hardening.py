@@ -37,24 +37,21 @@ class CertificateBoundsTests(unittest.TestCase):
          mock.patch.object(healthctl, 'evaluate_config', return_value=(result,)), \
          contextlib.redirect_stdout(stdout):
       self.assertEqual(healthctl.main(['health.json', '--json']), 3)
-    self.assertIn('1 critical/error results', json.loads(stdout.getvalue())['conclusion'])
+    document = json.loads(stdout.getvalue())
+    self.assertIn('1 critical/error results', document['conclusion'])
+    self.assertEqual(
+      document['observations']['summary'],
+      {'pass': 0, 'fail_warn': 0, 'fail_critical': 0, 'error': 1, 'skipped': 0},
+    )
 
-  def test_exited_helper_still_terminates_descendants_and_reaps(self):
-    process = mock.Mock(pid=12345)
-    process.poll.return_value = 0
-    with mock.patch.object(healthctl.os, 'killpg') as killpg:
-      healthctl._stop_process_group(process)
-    killpg.assert_called_once_with(12345, healthctl.signal.SIGKILL)
-    process.wait.assert_called_once_with(timeout=1.0)
-
-  def check(self, host='example.test'):
-    return healthctl.GenericCheck('cert', 'certificate_expiry', f'{host}:443', 1.0,
+  def check(self, host='example.test', severity='CRITICAL'):
+    return healthctl.GenericCheck('cert', 'certificate_expiry', f'{host}:443', 1.0, severity=severity,
       options=(('host', host), ('port', 443), ('warn_days', 30), ('critical_days', 7)))
 
   def records(self, count=2):
     return [(socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, '', (f'192.0.2.{i + 1}', 443)) for i in range(count)]
 
-  def run_check(self, *, days=60, clients=None, records=None, tls_error=None, clock=None, host='example.test'):
+  def run_check(self, *, days=60, clients=None, records=None, tls_error=None, clock=None, host='example.test', severity='CRITICAL'):
     clients = clients or [ManagedSocket()]
     tls = ManagedSocket()
     context = mock.Mock()
@@ -63,14 +60,20 @@ class CertificateBoundsTests(unittest.TestCase):
     with mock.patch.object(healthctl.socket, 'getaddrinfo', return_value=records or self.records()) as resolver, \
          mock.patch.object(healthctl.socket, 'socket', side_effect=clients) as factory, \
          mock.patch.object(healthctl.socket, 'create_connection', side_effect=AssertionError('unbounded helper forbidden')), \
-         mock.patch.object(healthctl.ssl, 'create_default_context', return_value=context) as trust, \
+         mock.patch.object(healthctl, 'default_tls_context', return_value=context) as trust, \
          mock.patch.object(healthctl.ssl, 'cert_time_to_seconds', return_value=days * 86400), \
          mock.patch.object(healthctl.time, 'time', return_value=0), \
          mock.patch.object(healthctl.time, 'monotonic', side_effect=clock, return_value=0):
-      result = healthctl.run_generic_check(self.check(host))
+      result = healthctl.run_generic_check(self.check(host, severity))
     self.assertIn('revocation not checked', result.evidence)
     trust.assert_called_once_with()
     return result, factory, context, resolver, tls
+
+  def verification_error(self, code, message):
+    error = ssl.SSLCertVerificationError(1, f'[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: {message}')
+    error.verify_code = code
+    error.verify_message = message
+    return error
 
   def test_valid_certificate_uses_bounded_candidates_and_sni(self):
     client = ManagedSocket()
@@ -87,20 +90,39 @@ class CertificateBoundsTests(unittest.TestCase):
     self.assertEqual(factory.call_count, 2)
     self.assertTrue(all(client.closed for client in clients))
 
-  def test_candidate_cap_refuses_before_any_connect(self):
+  def test_candidate_cap_keeps_first_16_candidates(self):
     result, factory, _, _, _ = self.run_check(records=self.records(healthctl.MAX_RESOLVER_CANDIDATES + 1))
+    self.assertEqual(result.status, 'PASS')
+    self.assertEqual(factory.call_count, 1)
+    self.assertIn('only the first 16', result.evidence)
+    clients = [ManagedSocket(OSError('refused')) for _ in range(healthctl.MAX_RESOLVER_CANDIDATES + 1)]
+    result, factory, _, _, _ = self.run_check(clients=clients, records=self.records(healthctl.MAX_RESOLVER_CANDIDATES + 1))
     self.assertEqual(result.status, 'ERROR')
-    factory.assert_not_called()
+    self.assertEqual(factory.call_count, healthctl.MAX_RESOLVER_CANDIDATES)
 
   def test_tls_trust_failure(self):
     client = ManagedSocket()
     result, _, _, _, _ = self.run_check(clients=[client], tls_error=ssl.SSLCertVerificationError('untrusted'))
-    self.assertEqual(result.status, 'ERROR')
+    self.assertEqual((result.status, result.severity), ('FAIL', 'CRITICAL'))
     self.assertTrue(client.closed)
 
   def test_hostname_mismatch(self):
-    result, _, _, _, _ = self.run_check(tls_error=ssl.CertificateError('hostname mismatch'))
-    self.assertEqual(result.status, 'ERROR')
+    error = self.verification_error(62, "Hostname mismatch, certificate is not valid for 'example.test'.")
+    result, _, _, _, _ = self.run_check(tls_error=error, severity='WARN')
+    self.assertEqual((result.status, result.severity), ('FAIL', 'WARN'))
+    self.assertIn("certificate verification failed (Hostname mismatch", result.evidence)
+
+  def test_expired_or_not_yet_valid_certificate_is_critical_failure(self):
+    for code, message in ((10, 'certificate has expired'), (9, 'certificate is not yet valid')):
+      with self.subTest(code=code):
+        result, _, _, _, _ = self.run_check(tls_error=self.verification_error(code, message), severity='WARN')
+        self.assertEqual((result.status, result.severity), ('FAIL', 'CRITICAL'))
+        self.assertIn(f'{message} ({message})', result.evidence)
+
+  def test_tls_protocol_failure_is_error_with_class_name(self):
+    result, _, _, _, _ = self.run_check(tls_error=ssl.SSLError(1, 'wrong version number'), severity='WARN')
+    self.assertEqual((result.status, result.severity), ('ERROR', 'CRITICAL'))
+    self.assertIn('(SSLError)', result.evidence)
 
   def test_total_deadline_stops_before_next_candidate(self):
     client = ManagedSocket(OSError('timeout'))

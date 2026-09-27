@@ -9,16 +9,12 @@ from datetime import datetime, timezone
 from decimal import Decimal, ROUND_HALF_UP, localcontext
 import errno
 import ipaddress
-import json
 import os
 import re
-import signal
-import socket
 import stat
-import subprocess
+import struct
 import sys
 import time
-import unicodedata
 from typing import Callable, Sequence
 
 from opsforge_common import (
@@ -27,8 +23,19 @@ from opsforge_common import (
   add_output_arguments,
   emit_output,
   make_conclusion,
+  sanitize_text as display_safe,
+  stream_safe,
   validate_output_arguments,
 )
+from opsforge_common.process import (
+  ProcessOutputLimitError,
+  ProcessSpawnError,
+  ProcessTimeoutError,
+  child_environment,
+  resolve_executable,
+  run_bounded,
+)
+from opsforge_common.procfs import parse_ipv4_default_routes, parse_ipv6_default_routes, split_stat
 
 
 UPTIME_PATH = "/proc/uptime"
@@ -50,9 +57,11 @@ READ_CHUNK_BYTES = 4096
 MAX_INTERFACES = 128
 MAX_ROUTES = 256
 MAX_LISTENERS = 512
+MAX_FAILED_SERVICES = 64
 MAX_PROCESSES = 32768
 MAX_TOP = 20
-SECTION_MAX_BYTES = 128 * 1024
+DEFAULT_TOP = 5
+KERNEL_TABLE_MAX_BYTES = 16 * 1024 * 1024
 DECIMAL_RE = re.compile(rb"[0-9]{1,20}(?:\.[0-9]{1,9})?\Z", re.ASCII)
 INTEGER_RE = re.compile(rb"[0-9]{1,20}\Z", re.ASCII)
 MEMINFO_RE = re.compile(rb"([A-Za-z][A-Za-z0-9_()]*):[ \t]*([^\r\n]*)\Z", re.ASCII)
@@ -126,6 +135,20 @@ class SectionObservation:
   status: str
   value: object | None = None
   reason: str | None = None
+  truncated: bool = False
+  total_seen: int | None = None
+  notes: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class Collected:
+  """Section evidence with its bounds; partial names a gap in otherwise useful evidence."""
+
+  value: object
+  truncated: bool = False
+  total_seen: int | None = None
+  notes: tuple[str, ...] = ()
+  partial: str | None = None
 
 
 @dataclass(frozen=True)
@@ -159,8 +182,8 @@ def build_argument_parser() -> argparse.ArgumentParser:
     help="collection profile (default: basic)",
   )
   parser.add_argument(
-    "--top", type=parse_top, default=5, metavar="N",
-    help=f"maximum processes per ranking (1-{MAX_TOP}; default: 5)",
+    "--top", type=parse_top, metavar="N",
+    help=f"maximum processes per ranking for the process and full profiles (1-{MAX_TOP}; default: {DEFAULT_TOP})",
   )
   add_output_arguments(parser)
   return parser
@@ -170,37 +193,6 @@ def parse_top(value: str) -> int:
   if not value.isascii() or not value.isdecimal() or not 1 <= int(value, 10) <= MAX_TOP:
     raise argparse.ArgumentTypeError(f"top must be from 1 through {MAX_TOP}")
   return int(value, 10)
-
-
-def display_safe(value: object) -> str:
-  """Escape controls and presentation characters in externally derived text."""
-  rendered = []
-  for character in str(value):
-    codepoint = ord(character)
-    category = unicodedata.category(character)
-    if character == "\\":
-      rendered.append("\\\\")
-    elif category in {"Cc", "Cf", "Cs", "Zl", "Zp"}:
-      if codepoint <= 0xFF:
-        rendered.append(f"\\x{codepoint:02x}")
-      elif codepoint <= 0xFFFF:
-        rendered.append(f"\\u{codepoint:04x}")
-      else:
-        rendered.append(f"\\U{codepoint:08x}")
-    else:
-      rendered.append(character)
-  return "".join(rendered)
-
-
-def stream_safe(value: object, stream: object) -> str:
-  text = str(value)
-  encoding = getattr(stream, "encoding", None)
-  if not encoding:
-    return text
-  try:
-    return text.encode(encoding, errors="backslashreplace").decode(encoding)
-  except (LookupError, UnicodeError):
-    return text.encode("ascii", errors="backslashreplace").decode("ascii")
 
 
 def write_safe(value: object, *, file: object) -> None:
@@ -231,46 +223,41 @@ def _open_flags() -> int:
   return flags
 
 
-def read_bounded_ascii(path: str, limit: int) -> bytes:
-  """Read at most limit + 1 bytes from an allowlisted procfs regular file."""
+def read_bounded_bytes(path: str, limit: int) -> bytes:
+  """Like read_bounded_ascii, but any bytes are accepted and OSError reaches the caller."""
+  descriptor = os.open(path, _open_flags())
   try:
-    descriptor = os.open(path, _open_flags())
-  except OSError as error:
-    raise SectionUnavailable(_reason_for_os_error(error)) from error
-  try:
-    try:
-      metadata = os.fstat(descriptor)
-    except OSError as error:
-      raise SectionUnavailable(_reason_for_os_error(error)) from error
+    metadata = os.fstat(descriptor)
     if not stat.S_ISREG(metadata.st_mode):
       raise SectionUnavailable("unsupported data shape")
 
     chunks = []
     observed = 0
     while observed <= limit:
-      try:
-        chunk = os.read(descriptor, min(READ_CHUNK_BYTES, limit + 1 - observed))
-      except OSError as error:
-        raise SectionUnavailable(_reason_for_os_error(error)) from error
+      chunk = os.read(descriptor, min(READ_CHUNK_BYTES, limit + 1 - observed))
       if not chunk:
         break
       chunks.append(chunk)
       observed += len(chunk)
     if observed > limit:
       raise SectionUnavailable("source exceeds V1 byte limit")
-    data = b"".join(chunks)
-    if b"\x00" in data:
-      raise SectionUnavailable("malformed data")
-    try:
-      data.decode("ascii")
-    except UnicodeDecodeError as error:
-      raise SectionUnavailable("malformed data") from error
-    return data
+    return b"".join(chunks)
   finally:
     try:
       os.close(descriptor)
     except OSError:
       pass
+
+
+def read_bounded_ascii(path: str, limit: int) -> bytes:
+  """Read at most limit + 1 bytes from an allowlisted procfs regular file."""
+  try:
+    data = read_bounded_bytes(path, limit)
+  except OSError as error:
+    raise SectionUnavailable(_reason_for_os_error(error)) from error
+  if b"\x00" in data or not data.isascii():
+    raise SectionUnavailable("malformed data")
+  return data
 
 
 def _parse_decimal(token: bytes) -> Decimal:
@@ -280,10 +267,7 @@ def _parse_decimal(token: bytes) -> Decimal:
     ):
       raise SectionUnavailable("numeric value exceeds V1 limit")
     raise SectionUnavailable("malformed data")
-  value = Decimal(token.decode("ascii"))
-  if not value.is_finite() or value < 0:
-    raise SectionUnavailable("malformed data")
-  return value
+  return Decimal(token.decode("ascii"))
 
 
 def parse_uptime(data: bytes) -> Decimal:
@@ -369,10 +353,11 @@ def collect_runtime(reader: Callable[[str, int], bytes] = read_bounded_ascii) ->
     loads = parse_loadavg(reader(LOADAVG_PATH, LOADAVG_MAX_BYTES))
   except SectionUnavailable as error:
     raise ObservationError("runtime", error.reason) from error
-  cpu_count = os.cpu_count()
-  if not isinstance(cpu_count, int) or isinstance(cpu_count, bool) or cpu_count < 1:
-    cpu_count = None
-  return RuntimeObservation(uptime, *loads, cpu_count)
+  try:
+    cpu_count = len(os.sched_getaffinity(0))
+  except (AttributeError, OSError):
+    cpu_count = os.cpu_count()
+  return RuntimeObservation(uptime, *loads, cpu_count or None)
 
 
 def collect_memory(reader: Callable[[str, int], bytes] = read_bounded_ascii) -> MemoryObservation:
@@ -428,10 +413,9 @@ def collect_pressure(reader: Callable[[str, int], bytes] = read_bounded_ascii) -
         key, separator, raw = field.partition("=")
         if not separator or key not in {"avg10", "avg60", "avg300", "total"}:
           raise SectionUnavailable("malformed pressure data")
-        try:
-          parsed[key] = int(raw) if key == "total" else float(raw)
-        except ValueError as error:
-          raise SectionUnavailable("malformed pressure data") from error
+        if (INTEGER_RE if key == "total" else DECIMAL_RE).fullmatch(raw.encode("ascii")) is None:
+          raise SectionUnavailable("malformed pressure data")
+        parsed[key] = int(raw) if key == "total" else float(raw)
       if set(parsed) != {"avg10", "avg60", "avg300", "total"}:
         raise SectionUnavailable("malformed pressure data")
       metrics[scope] = parsed
@@ -454,22 +438,18 @@ def collect_inode_summary(statvfs_provider: Callable[[str], object] = os.statvfs
 def _safe_interface_name(name: str) -> str:
   if not name or len(name) > 64 or name in {".", ".."} or "/" in name or "\x00" in name:
     raise SectionUnavailable("unsupported interface name")
-  return display_safe(name)
+  return name
 
 
-def collect_interfaces(reader: Callable[[str, int], bytes] = read_bounded_ascii) -> tuple[dict[str, object], ...]:
+def collect_interfaces(reader: Callable[[str, int], bytes] = read_bounded_ascii) -> Collected:
   try:
     with os.scandir("/sys/class/net") as entries:
-      names = []
-      for entry in entries:
-        if len(names) >= MAX_INTERFACES:
-          raise SectionUnavailable("interface count exceeds limit")
-        names.append(entry.name)
-      names.sort()
+      # Plain files such as bonding_masters sit beside the interface links.
+      names = sorted(entry.name for entry in entries if entry.is_dir())
   except OSError as error:
     raise SectionUnavailable(_reason_for_os_error(error)) from error
   observations = []
-  for raw_name in names:
+  for raw_name in names[:MAX_INTERFACES]:
     name = _safe_interface_name(raw_name)
     try:
       state = reader(f"/sys/class/net/{raw_name}/operstate", 64).decode("ascii").strip()
@@ -481,89 +461,86 @@ def collect_interfaces(reader: Callable[[str, int], bytes] = read_bounded_ascii)
       observations.append({"name": name, "state": state, "mtu": int(mtu_raw)})
     except SectionUnavailable as error:
       observations.append({"name": name, "status": "unavailable", "reason": error.reason})
-  return tuple(observations)
+  return Collected(tuple(observations), truncated=len(names) > MAX_INTERFACES, total_seen=len(names))
 
 
-def _ipv4_from_proc_hex(raw: str) -> str:
-  if re.fullmatch(r"[0-9A-Fa-f]{8}", raw) is None:
-    raise SectionUnavailable("malformed route data")
-  return str(ipaddress.IPv4Address(bytes.fromhex(raw)[::-1]))
+def _read_ipv6_table(reader: Callable[[str, int], bytes], path: str) -> bytes | None:
+  """Return None when the table is absent because the kernel has no IPv6 (for example ipv6.disable=1)."""
+  try:
+    return reader(path, KERNEL_TABLE_MAX_BYTES)
+  except SectionUnavailable as error:
+    if error.reason == "source unavailable":
+      return None
+    raise
 
 
-def collect_routes(reader: Callable[[str, int], bytes] = read_bounded_ascii) -> tuple[dict[str, str], ...]:
-  routes = []
-  data = reader(ROUTE_PATH, SECTION_MAX_BYTES).decode("ascii")
-  lines = data.splitlines()
-  if len(lines) > MAX_ROUTES + 1:
-    raise SectionUnavailable("route count exceeds limit")
-  for line in lines[1:]:
-    fields = line.split()
-    if len(fields) < 8:
-      raise SectionUnavailable("malformed route data")
-    if fields[1] == "00000000" and fields[7] == "00000000":
-      routes.append({"family": "IPv4", "interface": display_safe(_safe_interface_name(fields[0])), "gateway": _ipv4_from_proc_hex(fields[2])})
-  ipv6_data = reader(IPV6_ROUTE_PATH, SECTION_MAX_BYTES).decode("ascii")
-  ipv6_lines = ipv6_data.splitlines()
-  if len(ipv6_lines) > MAX_ROUTES:
-    raise SectionUnavailable("route count exceeds limit")
-  for line in ipv6_lines:
-    fields = line.split()
-    if len(fields) < 10:
-      raise SectionUnavailable("malformed IPv6 route data")
-    if fields[0] == "0" * 32 and fields[1] == "00":
-      try:
-        gateway = str(ipaddress.IPv6Address(bytes.fromhex(fields[4])))
-      except (ValueError, ipaddress.AddressValueError) as error:
-        raise SectionUnavailable("malformed IPv6 route data") from error
-      routes.append({"family": "IPv6", "interface": display_safe(_safe_interface_name(fields[-1])), "gateway": gateway})
+def collect_routes(reader: Callable[[str, int], bytes] = read_bounded_ascii) -> Collected:
+  routes = [("IPv4", route) for route in parse_ipv4_default_routes(reader(ROUTE_PATH, KERNEL_TABLE_MAX_BYTES).decode("ascii"))]
+  notes = []
+  ipv6_data = _read_ipv6_table(reader, IPV6_ROUTE_PATH)
+  if ipv6_data is None:
+    notes.append(f"IPv6 not present: {IPV6_ROUTE_PATH} is absent")
+  else:
+    routes.extend(("IPv6", route) for route in parse_ipv6_default_routes(ipv6_data.decode("ascii")))
   unique_routes = []
   seen_routes = set()
-  for route in routes:
-    identity = (route["family"], route["interface"], route["gateway"])
+  for family, route in routes:
+    identity = (family, route.interface, route.gateway)
     if identity not in seen_routes:
       seen_routes.add(identity)
-      unique_routes.append(route)
-  return tuple(unique_routes[:MAX_ROUTES])
+      unique_routes.append({"family": family, "interface": route.interface, "gateway": route.gateway})
+  return Collected(
+    tuple(unique_routes[:MAX_ROUTES]), truncated=len(unique_routes) > MAX_ROUTES,
+    total_seen=len(unique_routes), notes=tuple(notes),
+  )
 
 
 def _bind_scope(raw_address: str, family: str) -> str:
-  if set(raw_address) == {"0"}:
+  if re.fullmatch(r"[0-9A-Fa-f]{8}" if family == "IPv4" else r"[0-9A-Fa-f]{32}", raw_address) is None:
+    raise SectionUnavailable("malformed socket table")
+  # procfs prints each 32-bit address word as a host-byte-order integer.
+  words = [int(raw_address[index:index + 8], 16) for index in range(0, len(raw_address), 8)]
+  packed = struct.pack(f"={len(words)}I", *words)
+  address = ipaddress.IPv4Address(packed) if family == "IPv4" else ipaddress.IPv6Address(packed)
+  if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped is not None:
+    address = address.ipv4_mapped
+  if address.is_unspecified:
     return "wildcard"
-  if family == "IPv4" and raw_address.upper() == "0100007F":
-    return "loopback"
-  if family == "IPv6" and raw_address.upper() == "00000000000000000000000001000000":
-    return "loopback"
-  return "specific"
+  return "loopback" if address.is_loopback else "specific"
 
 
-def collect_listeners(reader: Callable[[str, int], bytes] = read_bounded_ascii) -> tuple[dict[str, object], ...]:
-  listeners = []
+def collect_listeners(reader: Callable[[str, int], bytes] = read_bounded_ascii) -> Collected:
+  unique = set()
+  notes = []
   for protocol, path in SOCKET_PATHS:
-    lines = reader(path, SECTION_MAX_BYTES).decode("ascii").splitlines()
-    for line in lines[1:]:
+    family = "IPv6" if protocol.endswith("6") else "IPv4"
+    data = _read_ipv6_table(reader, path) if family == "IPv6" else reader(path, KERNEL_TABLE_MAX_BYTES)
+    if data is None:
+      notes.append(f"IPv6 not present: {path} is absent")
+      continue
+    # TCP 0A is LISTEN; UDP 07 is an unconnected socket (01 would be a connected client).
+    wanted_state = "0A" if protocol.startswith("tcp") else "07"
+    for line in data.decode("ascii").splitlines()[1:]:
       fields = line.split()
       if len(fields) < 4:
         raise SectionUnavailable("malformed socket table")
-      if protocol.startswith("tcp") and fields[3] != "0A":
+      if fields[3] != wanted_state:
         continue
       raw_address, separator, raw_port = fields[1].rpartition(":")
       if not separator or re.fullmatch(r"[0-9A-Fa-f]{4}", raw_port) is None:
         raise SectionUnavailable("malformed socket table")
-      family = "IPv6" if protocol.endswith("6") else "IPv4"
-      listeners.append({"protocol": protocol.rstrip("6").upper(), "family": family, "port": int(raw_port, 16), "bind_scope": _bind_scope(raw_address, family)})
-      if len(listeners) > MAX_LISTENERS:
-        raise SectionUnavailable("listener count exceeds limit")
-  unique = {
-    (str(item["protocol"]), str(item["family"]), int(item["port"]), str(item["bind_scope"]))
-    for item in listeners
-  }
-  return tuple(
-    {"protocol": protocol, "family": family, "port": port, "bind_scope": scope}
-    for protocol, family, port, scope in sorted(unique, key=lambda item: (item[0], item[2], item[1], item[3]))
+      unique.add((protocol.rstrip("6").upper(), family, int(raw_port, 16), _bind_scope(raw_address, family)))
+  ordered = sorted(unique, key=lambda item: (item[0], item[2], item[1], item[3]))
+  return Collected(
+    tuple(
+      {"protocol": protocol, "family": family, "port": port, "bind_scope": scope}
+      for protocol, family, port, scope in ordered[:MAX_LISTENERS]
+    ),
+    truncated=len(ordered) > MAX_LISTENERS, total_seen=len(ordered), notes=tuple(notes),
   )
 
 
-def collect_process_rankings(top: int, reader: Callable[[str, int], bytes] = read_bounded_ascii) -> dict[str, object]:
+def collect_process_rankings(top: int, reader: Callable[[str, int], bytes] = read_bounded_bytes) -> Collected:
   try:
     with os.scandir("/proc") as entries:
       pids = []
@@ -580,98 +557,62 @@ def collect_process_rankings(top: int, reader: Callable[[str, int], bytes] = rea
   if not isinstance(page_size, int) or page_size <= 0:
     raise SectionUnavailable("page size unavailable")
   records = []
+  vanished = 0
+  skipped: dict[str, int] = {}
   for raw_pid in pids:
     try:
-      data = reader(f"/proc/{raw_pid}/stat", 4096).decode("ascii").strip()
-      boundary = data.rfind(") ")
-      opening = data.find("(")
-      if opening < 1 or boundary <= opening:
-        raise SectionUnavailable("malformed process stat")
-      pid = int(data[:opening].strip())
-      name = display_safe(data[opening + 1:boundary][:128])
-      fields = data[boundary + 2:].split()
+      pid, comm, fields = split_stat(reader(f"/proc/{raw_pid}/stat", 4096))
       if len(fields) < 22:
-        raise SectionUnavailable("malformed process stat")
-      cpu_ticks = int(fields[11]) + int(fields[12])
-      rss_bytes = max(0, int(fields[21])) * page_size
-      records.append({"pid": pid, "name": name, "cpu_ticks_since_start": cpu_ticks, "rss_bytes": rss_bytes})
-    except (SectionUnavailable, OSError, ValueError):
+        raise ValueError("malformed process stat")
+      records.append({
+        "pid": pid, "name": comm[:128].decode("utf-8", errors="surrogateescape"),
+        "cpu_ticks_since_start": int(fields[11]) + int(fields[12]),
+        "rss_bytes": max(0, int(fields[21])) * page_size,
+      })
       continue
-  return {
+    except (FileNotFoundError, ProcessLookupError):
+      vanished += 1
+      continue
+    except OSError as error:
+      reason = _reason_for_os_error(error)
+    except SectionUnavailable as error:
+      reason = error.reason
+    except ValueError:
+      reason = "malformed process stat"
+    skipped[reason] = skipped.get(reason, 0) + 1
+  value = {
     "observed_processes": len(records),
+    "vanished_processes": vanished,
+    "skipped_processes": sum(skipped.values()),
+    "skip_reasons": dict(sorted(skipped.items())),
     "top_cpu": tuple(sorted(records, key=lambda item: (-int(item["cpu_ticks_since_start"]), int(item["pid"])))[:top]),
     "top_memory": tuple(sorted(records, key=lambda item: (-int(item["rss_bytes"]), int(item["pid"])))[:top]),
   }
-
-
-def _stop_process_group(process: subprocess.Popen[bytes]) -> None:
-  try:
-    running = process.poll() is None
-  except OSError:
-    running = False
-  try:
-    os.killpg(process.pid, signal.SIGKILL)
-  except OSError:
-    if running:
-      try:
-        process.kill()
-      except OSError:
-        pass
-  try:
-    process.wait(timeout=1.0)
-  except (OSError, subprocess.SubprocessError):
-    pass
+  if not skipped:
+    return Collected(value)
+  detail = ", ".join(f"{reason} ({count})" for reason, count in sorted(skipped.items()))
+  return Collected(value, partial=f"{value['skipped_processes']} process(es) could not be read: {detail}")
 
 
 def run_bounded_command(arguments: Sequence[str], *, timeout: float, limit: int) -> tuple[int, bytes]:
+  executable = resolve_executable(arguments[0])
+  if executable is None:
+    raise SectionUnavailable("command unavailable")
   try:
-    process = subprocess.Popen(
-      list(arguments), stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL,
-      env={**os.environ, "LC_ALL": "C", "SYSTEMD_PAGER": "", "SYSTEMD_COLORS": "0"},
-      start_new_session=True,
+    result = run_bounded(
+      [executable, *arguments[1:]], timeout=timeout, max_output_bytes=limit,
+      environment=child_environment(SYSTEMD_PAGER="", SYSTEMD_COLORS="0"),
     )
-  except OSError as error:
-    raise SectionUnavailable("command unavailable") from error
-  assert process.stdout is not None
-  descriptor = process.stdout.fileno()
-  deadline = time.monotonic() + timeout
-  chunks = []
-  observed = 0
-  try:
-    os.set_blocking(descriptor, False)
-    while True:
-      if time.monotonic() >= deadline:
-        raise SectionUnavailable("command timed out")
-      try:
-        chunk = os.read(descriptor, min(8192, limit + 1 - observed))
-      except BlockingIOError:
-        if process.poll() is not None:
-          chunk = os.read(descriptor, min(8192, limit + 1 - observed))
-        else:
-          time.sleep(0.01)
-          continue
-      if chunk:
-        chunks.append(chunk)
-        observed += len(chunk)
-        if observed > limit:
-          raise SectionUnavailable("command output exceeds limit")
-        continue
-      if process.poll() is not None:
-        break
-      time.sleep(0.01)
-    remaining = max(0.01, deadline - time.monotonic())
-    return process.wait(timeout=remaining), b"".join(chunks)
-  except subprocess.TimeoutExpired as error:
-    _stop_process_group(process)
+  except ProcessTimeoutError as error:
     raise SectionUnavailable("command timed out") from error
-  except BaseException:
-    _stop_process_group(process)
-    raise
-  finally:
-    process.stdout.close()
+  except ProcessOutputLimitError as error:
+    raise SectionUnavailable("command output exceeds limit") from error
+  except ProcessSpawnError as error:
+    raise SectionUnavailable("command unavailable") from error
+  return result.returncode, result.stdout
 
 
-def collect_failed_services() -> tuple[str, ...]:
+def collect_failed_services() -> Collected:
   try:
     return_code, stdout = run_bounded_command(
       ["systemctl", "--failed", "--no-legend", "--plain", "--no-pager", "--type=service"],
@@ -682,17 +623,16 @@ def collect_failed_services() -> tuple[str, ...]:
   if return_code != 0:
     raise SectionUnavailable("systemd observation failed")
   services = []
-  try:
-    lines = stdout.decode("utf-8", errors="strict").splitlines()
-  except UnicodeDecodeError as error:
-    raise SectionUnavailable("malformed systemd response") from error
-  for line in lines[:64]:
+  # Only field 0 is kept; descriptions may hold any bytes, including Unicode line separators.
+  for line in stdout.decode("utf-8", errors="replace").split("\n"):
     fields = line.split()
     if fields:
       if len(fields) < 4 or not fields[0].endswith(".service") or fields[2] != "failed":
         raise SectionUnavailable("malformed systemd response")
-      services.append(display_safe(fields[0][:256]))
-  return tuple(services)
+      services.append(fields[0][:256])
+  return Collected(
+    tuple(services[:MAX_FAILED_SERVICES]), truncated=len(services) > MAX_FAILED_SERVICES, total_seen=len(services),
+  )
 
 
 def collect_kernel_evidence(reader: Callable[[str, int], bytes] = read_bounded_ascii) -> dict[str, int]:
@@ -701,7 +641,7 @@ def collect_kernel_evidence(reader: Callable[[str, int], bytes] = read_bounded_a
     raise SectionUnavailable("malformed kernel taint state")
   wanted = {"ctxt", "processes", "procs_running", "procs_blocked"}
   metrics: dict[str, int] = {"tainted": int(tainted)}
-  for line in reader(PROC_STAT_PATH, SECTION_MAX_BYTES).decode("ascii").splitlines():
+  for line in reader(PROC_STAT_PATH, KERNEL_TABLE_MAX_BYTES).decode("ascii").splitlines():
     fields = line.split()
     if fields and fields[0] in wanted and len(fields) == 2 and fields[1].isdecimal():
       metrics[fields[0]] = int(fields[1])
@@ -712,11 +652,17 @@ def collect_kernel_evidence(reader: Callable[[str, int], bytes] = read_bounded_a
 
 def _optional_section(name: str, collector: Callable[[], object]) -> SectionObservation:
   try:
-    return SectionObservation(name, "observed", collector())
+    result = collector()
   except SectionUnavailable as error:
     return SectionObservation(name, "unavailable", reason=error.reason)
-  except OSError:
+  except Exception:
     return SectionObservation(name, "error", reason="observation failed")
+  if not isinstance(result, Collected):
+    result = Collected(result)
+  return SectionObservation(
+    name, "partial" if result.partial else "observed", result.value, result.partial,
+    result.truncated, result.total_seen, result.notes,
+  )
 
 
 def _utc_value(value: object) -> datetime:
@@ -734,8 +680,9 @@ def _monotonic_value(value: object) -> int:
 def collect_snapshot(
   *,
   profile: str = "basic",
-  top: int = 5,
+  top: int = DEFAULT_TOP,
   reader: Callable[[str, int], bytes] = read_bounded_ascii,
+  stat_reader: Callable[[str, int], bytes] = read_bounded_bytes,
   uname_provider: Callable[[], object] = os.uname,
   statvfs_provider: Callable[[str], object] = os.statvfs,
   utc_clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
@@ -766,7 +713,7 @@ def collect_snapshot(
       _optional_section("Listening ports", lambda: collect_listeners(reader)),
     ))
   if profile in {"process", "full"}:
-    sections.append(_optional_section("Process rankings", lambda: collect_process_rankings(top, reader)))
+    sections.append(_optional_section("Process rankings", lambda: collect_process_rankings(top, stat_reader)))
   if profile == "full":
     sections.extend((
       _optional_section("Failed systemd services", collect_failed_services),
@@ -820,6 +767,43 @@ def format_percentage(numerator: int, denominator: int) -> str:
     context.prec = 100
     value = Decimal(numerator) * Decimal(100) / Decimal(denominator)
   return f"{_quantized(value, '0.1')}%"
+
+
+def _evidence_text(value: object) -> str:
+  """Render one evidence value on a single line, escaping each string exactly once."""
+  if isinstance(value, str):
+    text = display_safe(value)
+    if text and not any(character.isspace() or character in '"=,()' for character in text):
+      return text
+    return '"' + text.replace('"', '\\"') + '"'
+  if value is None:
+    return "none"
+  if isinstance(value, bool):
+    return "true" if value else "false"
+  if isinstance(value, dict):
+    pairs = []
+    for key, item in value.items():
+      text = _evidence_text(item)
+      pairs.append(f"{_evidence_text(key)}=({text})" if isinstance(item, dict) else f"{_evidence_text(key)}={text}")
+    return " ".join(pairs) or "none"
+  if isinstance(value, (list, tuple)):
+    return ", ".join(_evidence_text(item) for item in value) or "none"
+  return str(value)
+
+
+def _evidence_lines(value: object) -> list[str]:
+  if isinstance(value, dict):
+    lines = []
+    for key, item in value.items():
+      if isinstance(item, (list, tuple)) and item:
+        lines.append(f"{_evidence_text(key)}:")
+        lines.extend(f"  - {_evidence_text(entry)}" for entry in item)
+      else:
+        lines.append(f"{_evidence_text(key)}: {_evidence_text(item)}")
+    return lines
+  if isinstance(value, (list, tuple)):
+    return [f"- {_evidence_text(item)}" for item in value] or ["none"]
+  return [_evidence_text(value)]
 
 
 def render_report(snapshot: SnapshotResult) -> str:
@@ -881,9 +865,14 @@ def render_report(snapshot: SnapshotResult) -> str:
     sections.append(f"Root filesystem\n  Status: unavailable\n  Reason: {snapshot.filesystem.reason}")
   for observation in snapshot.sections:
     lines = [display_safe(observation.name), f"  Status: {observation.status}"]
-    if observation.status == "observed":
-      rendered = json.dumps(observation.value, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
-      lines.append(f"  Evidence: {display_safe(rendered)}")
+    if observation.status in {"observed", "partial"}:
+      if observation.reason:
+        lines.append(f"  Reason: {display_safe(observation.reason)}")
+      lines.append("  Evidence:")
+      lines.extend(f"    {line}" for line in _evidence_lines(observation.value))
+      if observation.truncated:
+        lines.append(f"  Truncated: first {len(observation.value)} of {observation.total_seen} shown")
+      lines.extend(f"  Note: {display_safe(note)}" for note in observation.notes)
     else:
       lines.append(f"  Reason: {display_safe(observation.reason or 'observation unavailable')}")
     sections.append("\n".join(lines))
@@ -926,15 +915,17 @@ def main(argv: Sequence[str] | None = None) -> int:
   parser = build_argument_parser()
   args = parser.parse_args(argv)
   validate_output_arguments(parser, args)
+  if args.top is not None and args.profile not in {"process", "full"}:
+    parser.error("--top requires --profile process or full")
   started = time.monotonic()
   try:
-    snapshot = collect_snapshot(profile=args.profile, top=args.top)
+    snapshot = collect_snapshot(profile=args.profile, top=DEFAULT_TOP if args.top is None else args.top)
     report = render_report(snapshot)
     exit_code = snapshot_exit_code(snapshot)
     unavailable = sum(section.status != "observed" for section in snapshot.sections)
     unavailable += int(not snapshot.memory.observed) + int(not snapshot.filesystem.observed)
     status = "WARN" if unavailable else "OK"
-    finding = f"{snapshot.profile} profile collected with {unavailable} unavailable or error section(s)"
+    finding = f"{snapshot.profile} profile collected with {unavailable} unavailable, partial, or error section(s)"
     next_action = "review collection warnings and gather only the missing evidence needed" if unavailable else "correlate this bounded snapshot with incident-specific evidence"
     conclusion = make_conclusion(status, snapshot.profile, finding, next_action)
     record_warnings = []
@@ -954,7 +945,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     brief = "\n".join((
       f"Profile: {snapshot.profile}",
       f"Sections: {5 + len(snapshot.sections)}",
-      f"Unavailable/error: {unavailable}",
+      f"Unavailable/partial/error: {unavailable}",
     ))
     emit_output(
       record, detailed=report, brief=brief, json_mode=args.json,
@@ -962,7 +953,7 @@ def main(argv: Sequence[str] | None = None) -> int:
       output_path=args.output, force=args.force, stdout=sys.stdout,
     )
     if exit_code == 1 and not args.quiet:
-      write_safe("incidentsnapshot: snapshot incomplete; see Collection warnings\n", file=sys.stderr)
+      write_best_effort("incidentsnapshot: snapshot incomplete; see Collection warnings\n", file=sys.stderr)
     return exit_code
   except UnsupportedPlatform:
     write_best_effort("incidentsnapshot: unsupported platform: Linux is required\n", file=sys.stderr)

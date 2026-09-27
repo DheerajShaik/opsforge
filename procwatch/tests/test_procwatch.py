@@ -7,6 +7,8 @@ import os
 from pathlib import Path
 import stat
 import sys
+import tempfile
+import threading
 import unittest
 from unittest import mock
 
@@ -74,7 +76,7 @@ def extended(*, incomplete=None, command="worker"):
     123, 1.0, 100, 4096, initial, final,
     None if incomplete else 1.0, incomplete, (initial,) if incomplete else (initial, final),
   )
-  return procwatch.ExtendedResult(analysis, None, None, None, None, None, ())
+  return procwatch.ExtendedResult(analysis, None, None, None, ())
 
 
 class CliTests(unittest.TestCase):
@@ -87,13 +89,33 @@ class CliTests(unittest.TestCase):
 
   def test_help_is_stdout_and_does_not_inspect(self):
     for option in ("-h", "--help"):
-      with self.subTest(option=option), mock.patch.object(procwatch, "inspect") as inspect:
+      with self.subTest(option=option), mock.patch.object(procwatch, "observe_extended") as observe:
         stdout = io.StringIO()
         with contextlib.redirect_stdout(stdout), self.assertRaises(SystemExit) as caught:
           procwatch.main([option])
         self.assertEqual(caught.exception.code, 0)
         self.assertIn("bounded CPU and memory evidence", stdout.getvalue())
-        inspect.assert_not_called()
+        observe.assert_not_called()
+
+  def test_argument_errors_are_terminal_safe(self):
+    stderr = io.StringIO()
+    with contextlib.redirect_stderr(stderr), self.assertRaises(SystemExit) as caught:
+      procwatch.main(["1", "\x1b[31m"])
+    self.assertEqual(caught.exception.code, 2)
+    self.assertNotIn("\x1b", stderr.getvalue())
+    self.assertIn("\\x1b", stderr.getvalue())
+
+  def test_duration_keeps_interval_within_supported_range(self):
+    for argv, expected in (
+      (["--duration", "0.3", "--interval", "0.1"], (1, 0.1, 4)),
+      (["--duration", "0.1"], (1, 0.1, 2)),
+      (["--duration", "3600", "--interval", "60"], (1, 60.0, 61)),
+      (["--duration", "3600", "--interval", "0.1"], (1, 36.363636, 100)),
+    ):
+      with self.subTest(argv=argv), \
+           mock.patch.object(procwatch, "observe_extended", return_value=extended()) as observe:
+        self.run_main(["--quiet", *argv, "1"])
+        observe.assert_called_once_with(*expected)
 
   def test_invalid_pid_and_interval_exit_two(self):
     arguments = (
@@ -161,6 +183,24 @@ class CliTests(unittest.TestCase):
       observe.assert_called_with(1, 1.0, 4)
       self.assertIn("Samples:", self.run_main(["--brief", "1"])[1])
       self.assertEqual(self.run_main(["--quiet", "1"])[1], "")
+
+  def test_late_failure_reports_partial_with_captured_samples(self):
+    first = sample(observed_at=10.0)
+    second = sample(user_ticks=150, rss_pages=110, observed_at=11.0)
+    analysis = procwatch.AnalysisResult(
+      123, 1.0, 100, 4096, first, second, 1.0,
+      "sample 3 unavailable: gone; results cover samples 1-2 (1.000 s)", (first, second), 3,
+    )
+    result = procwatch.ExtendedResult(analysis, None, None, None, ())
+    with mock.patch.object(procwatch, "observe_extended", return_value=result):
+      code, stdout, stderr = self.run_main(["--json", "--samples", "3", "1"])
+    document = json.loads(stdout)
+    self.assertEqual((code, document["status"]), (1, "PARTIAL"))
+    self.assertEqual(document["observations"]["sample_count"], 2)
+    self.assertEqual(document["observations"]["rss_delta_bytes"], 10 * 4096)
+    self.assertEqual(document["observations"]["cpu_utilization_percent"], 50.0)
+    self.assertIn("2 of 3 bounded samples captured", document["conclusion"])
+    self.assertIn("results cover samples 1-2", stderr)
 
 
 class StatParsingTests(unittest.TestCase):
@@ -274,14 +314,33 @@ class ProcAccessTests(unittest.TestCase):
 
 
 class ObservationTests(unittest.TestCase):
-  def observe_with_samples(self, samples):
+  def observe_with_samples(self, samples, sample_count=2):
     with mock.patch.object(procwatch, "system_parameter", side_effect=[100, 4096]), \
          mock.patch.object(procwatch, "open_process_directory", return_value=9), \
          mock.patch.object(procwatch, "capture_sample", side_effect=samples), \
          mock.patch.object(procwatch.os, "close") as closed:
-      result = procwatch.observe(123, 0.5, sleep_fn=lambda value: self.assertEqual(value, 0.5))
+      result = procwatch.observe_samples(
+        123, 0.5, sample_count=sample_count, sleep_fn=lambda value: self.assertEqual(value, 0.5),
+      )
     closed.assert_called_once_with(9)
     return result
+
+  def test_late_failure_keeps_earlier_samples(self):
+    first = sample(observed_at=10.0)
+    second = sample(user_ticks=120, observed_at=10.5)
+    result = self.observe_with_samples([first, second, procwatch.ProcReadError("gone")], sample_count=3)
+    self.assertTrue(result.incomplete)
+    self.assertEqual((result.final, result.elapsed_seconds, result.captured_samples), (second, 0.5, 2))
+    self.assertIn("sample 3 unavailable", result.incomplete_warning)
+    self.assertIn("results cover samples 1-2", result.incomplete_warning)
+
+  def test_exited_process_is_incomplete(self):
+    result = self.observe_with_samples([sample(state="Z")])
+    self.assertIsNone(result.final)
+    self.assertIn("already exited", result.incomplete_warning)
+    result = self.observe_with_samples([sample(observed_at=10.0), sample(state="X", observed_at=10.5)])
+    self.assertIsNone(result.final)
+    self.assertIn("process exited (state X)", result.incomplete_warning)
 
   def test_complete_observation_keeps_same_identity(self):
     initial = sample(observed_at=10.0)
@@ -317,7 +376,7 @@ class ObservationTests(unittest.TestCase):
          mock.patch.object(procwatch, "capture_sample", side_effect=procwatch.ProcReadError("gone")), \
          mock.patch.object(procwatch.os, "close"):
       with self.assertRaises(procwatch.InvalidTargetError):
-        procwatch.observe(123, 1.0, sleep_fn=lambda _: None)
+        procwatch.observe_samples(123, 1.0, sleep_fn=lambda _: None)
 
   def test_nonpositive_or_nonfinite_measured_interval_is_fatal(self):
     initial = sample(observed_at=10.0)
@@ -329,8 +388,82 @@ class ObservationTests(unittest.TestCase):
     with mock.patch.object(procwatch.os, "sysconf", side_effect=OSError("unsupported")), \
          mock.patch.object(procwatch, "open_process_directory") as opened:
       with self.assertRaises(procwatch.ObservationError):
-        procwatch.observe(123, 1.0, sleep_fn=lambda _: None)
+        procwatch.observe_samples(123, 1.0, sleep_fn=lambda _: None)
     opened.assert_not_called()
+
+
+class AuxiliaryTests(unittest.TestCase):
+  def test_status_counters_survive_undecodable_name(self):
+    values = procwatch._parse_proc_mapping(b"Name:\tw\xe9\nvoluntary_ctxt_switches:\t5\nbad:\t\xd9\xa1\n")
+    self.assertEqual(values, {"voluntary_ctxt_switches": 5})
+
+  @unittest.skipUnless(sys.platform.startswith("linux"), "requires Linux /proc")
+  def test_thread_cap_is_reported_as_truncated(self):
+    release = threading.Event()
+    worker = threading.Thread(target=release.wait)
+    worker.start()
+    try:
+      directory_fd = procwatch.open_process_directory(os.getpid())
+      try:
+        with mock.patch.object(procwatch, "MAX_THREAD_SAMPLES", 1):
+          aux, _ = procwatch.capture_auxiliary(directory_fd)
+      finally:
+        os.close(directory_fd)
+    finally:
+      release.set()
+      worker.join()
+    self.assertGreaterEqual(aux.thread_count, 2)
+    self.assertEqual(len(aux.thread_cpu_ticks), 1)
+    self.assertTrue(aux.threads_truncated)
+    self.assertEqual(len(aux.thread_cpu_ticks[0]), 3)
+
+
+class CgroupTests(unittest.TestCase):
+  def collect(self, cgroup_line, mount_root, files):
+    with tempfile.TemporaryDirectory() as mount_point:
+      for relative, value in files.items():
+        path = Path(mount_point, relative)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(value)
+      with mock.patch.object(procwatch, "read_bounded_proc_file", return_value=cgroup_line.encode()):
+        return procwatch.collect_cgroup_context(9, (mount_point, mount_root))
+
+  def test_tightest_ancestor_limits_are_reported(self):
+    context, gaps = self.collect("0::/a/b\n", "/", {
+      "a/cpu.max": "50000 100000\n",
+      "a/memory.max": "1048576\n",
+      "a/b/cpu.max": "max 100000\n",
+      "a/b/memory.max": "2097152\n",
+    })
+    self.assertEqual(gaps, [])
+    self.assertEqual(context.path, "/a/b")
+    self.assertEqual((context.cpu_constraint, context.cpu_constraint_source), ("50000 100000", "/a"))
+    self.assertEqual((context.memory_constraint, context.memory_constraint_source), ("1048576", "/a"))
+
+  def test_unlimited_and_unsupported_values_are_distinguished(self):
+    context, gaps = self.collect("0::/a\n", "/", {"a/cpu.max": "max 100000\n", "a/memory.max": "lots\n"})
+    self.assertEqual((context.cpu_constraint, context.cpu_constraint_source), ("max 100000", None))
+    self.assertIsNone(context.memory_constraint)
+    self.assertTrue(any("memory.max at /a has an unsupported value" in gap for gap in gaps))
+    self.assertIn("no limit at any readable level", procwatch._constraint_text("max 100000", None))
+
+  def test_nested_mount_root_and_outside_paths(self):
+    context, gaps = self.collect("0::/pod/app\n", "/pod", {"memory.max": "4096\n", "app/cpu.max": "max 100000\n"})
+    self.assertEqual((context.memory_constraint, context.memory_constraint_source), ("4096", "/pod"))
+    self.assertEqual(gaps, [])
+    context, gaps = self.collect("0::/other\n", "/pod", {})
+    self.assertIsNone(context.cpu_constraint)
+    self.assertIn("not below cgroup2 mount root", gaps[0])
+    context, gaps = self.collect("0::/../escaped\n", "/", {})
+    self.assertIn("outside this cgroup namespace", gaps[0])
+
+  def test_cgroup2_mount_is_found_with_escapes(self):
+    mountinfo = (
+      "24 1 8:1 / / rw - ext4 /dev/sda1 rw\n"
+      "30 25 0:26 /pod /sys/fs/cgroup\\040x rw,nosuid shared:4 - cgroup2 cgroup2 rw\n"
+    )
+    self.assertEqual(procwatch.parse_cgroup2_mount(mountinfo), ("/sys/fs/cgroup x", "/pod"))
+    self.assertIsNone(procwatch.parse_cgroup2_mount("24 1 8:1 / / rw - ext4 /dev/sda1 rw\n"))
 
 
 class RenderingTests(unittest.TestCase):
@@ -355,7 +488,7 @@ class RenderingTests(unittest.TestCase):
     )
     result = procwatch.AnalysisResult(123, 1.0, 100, 4096, initial, final, 2.0)
     output = procwatch.render_result(result)
-    self.assertIn("Observed sample interval: 2.000000 s", output)
+    self.assertIn("Observation window: 2.000000 s", output)
     self.assertIn("User CPU delta: 1.500000 s", output)
     self.assertIn("System CPU delta: 0.500000 s", output)
     self.assertIn("Utilization relative to one logical CPU: 100.00%", output)
@@ -382,14 +515,21 @@ class RenderingTests(unittest.TestCase):
     self.assertIn("Unavailable", output)
     self.assertNotIn("CPU evidence\n", output)
 
-  def test_inspect_maps_incomplete_to_exit_one_and_warning(self):
-    initial = sample()
-    result = procwatch.AnalysisResult(123, 1.0, 100, 4096, initial, None, None, "exited")
-    with mock.patch.object(procwatch, "observe", return_value=result):
-      output, warning, code = procwatch.inspect(123, 1.0)
-    self.assertEqual(code, 1)
-    self.assertIn("Status: incomplete", output)
-    self.assertEqual(warning, "procwatch: warning: incomplete observation: exited")
+  def test_truncated_auxiliary_evidence_is_labelled(self):
+    aux = procwatch.AuxiliarySample(
+      1, 0, 0, 0, 0, 0, (7, 8), ((1, 10, 5),), children_truncated=True, thread_count=300, threads_truncated=True,
+    )
+    base = extended()
+    output = procwatch.render_extended(procwatch.ExtendedResult(base.analysis, aux, None, None, ()))
+    self.assertIn("Child PIDs: 7, 8 (truncated)", output)
+    self.assertIn("Observed threads: 1 of 300 (truncated)", output)
+
+  def test_reused_thread_id_is_not_compared(self):
+    initial = procwatch.AuxiliarySample(1, 0, 0, 0, 0, 0, (), ((5, 10, 100), (6, 10, 100)))
+    final = procwatch.AuxiliarySample(1, 0, 0, 0, 0, 0, (), ((5, 90, 200), (6, 30, 100)))
+    base = extended()
+    output = procwatch.render_extended(procwatch.ExtendedResult(base.analysis, initial, final, None, ()))
+    self.assertIn("Top per-thread CPU tick deltas: 6:+20\n", output + "\n")
 
 
 if __name__ == "__main__":

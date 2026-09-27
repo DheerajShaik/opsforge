@@ -293,14 +293,15 @@ class ResolverTests(unittest.TestCase):
     self.assertEqual(candidates, ())
     self.assertEqual(failure, "resolver returned no TCP candidates")
 
-  def test_over_limit_and_malformed_records_are_fatal(self):
+  def test_over_limit_is_truncated_and_malformed_records_are_fatal(self):
     target = netdoctor.Target("example.com", "example.com", 443, "hostname")
     records = [
       (socket.AF_INET, socket.SOCK_STREAM, 6, "", (f"192.0.2.{index}", 443))
       for index in range(1, netdoctor.MAX_RESOLVER_CANDIDATES + 2)
     ]
-    with self.assertRaises(netdoctor.ObservationError):
-      netdoctor.resolve_candidates(target, resolver=lambda *args: records)
+    notes = []
+    candidates, failure = netdoctor.resolve_candidates(target, resolver=lambda *args: records, notes=notes)
+    self.assertEqual((len(candidates), failure, len(notes)), (netdoctor.MAX_RESOLVER_CANDIDATES, None, 1))
     for bad in (
       (socket.AF_UNIX, socket.SOCK_STREAM, 0, "", ("x", 443)),
       (socket.AF_INET, socket.SOCK_DGRAM, 17, "", ("192.0.2.1", 443)),
@@ -353,16 +354,64 @@ class ConnectionTests(unittest.TestCase):
         self.assertEqual(attempts[0].outcome, expected)
         self.assertTrue(fake.closed)
 
-  def test_socket_creation_and_timeout_setup_failures_are_fatal(self):
-    with self.assertRaises(netdoctor.ObservationError):
-      netdoctor.attempt_connections(
-        (candidate(),), socket_factory=mock.Mock(side_effect=OSError("no fds"))
-      )
+  def test_socket_creation_failure_is_an_attempt_and_timeout_setup_is_fatal(self):
+    fallback = FakeSocket()
+    sockets = [OSError(errno.EAFNOSUPPORT, "no ipv6"), fallback]
+    def factory(*args):
+      item = sockets.pop(0)
+      if isinstance(item, Exception):
+        raise item
+      return item
+    attempts = netdoctor.attempt_connections(
+      (candidate("2001:db8::1", family=socket.AF_INET6), candidate()), socket_factory=factory,
+    )
+    self.assertEqual([item.outcome for item in attempts], ["socket unavailable (EAFNOSUPPORT)", "connected"])
     fake = FakeSocket()
     fake.settimeout = mock.Mock(side_effect=OSError("failed"))
     with self.assertRaises(netdoctor.ObservationError):
       netdoctor.attempt_connections((candidate(),), socket_factory=lambda *args: fake)
     self.assertTrue(fake.closed)
+
+  def test_ssl_errors_are_not_permission_denied(self):
+    import ssl
+    outcome, number = netdoctor.classify_connect_error(ssl.SSLError(1, "[SSL: WRONG_VERSION_NUMBER] wrong version number"))
+    self.assertTrue(outcome.startswith("TLS protocol error"))
+    self.assertIsNone(number)
+
+    class Context:
+      check_hostname = True
+      verify_mode = None
+      def wrap_socket(self, sock, server_hostname=None):
+        raise ssl.SSLError(1, "[SSL: WRONG_VERSION_NUMBER] wrong version number")
+    status, *_ = netdoctor.tls_handshake(
+      None, candidate(), timeout=1.0, sni_name="example.com",
+      socket_factory=lambda *args: FakeSocket(), context_factory=Context,
+    )
+    self.assertTrue(status.startswith("failed: TLS protocol error"), status)
+
+  def test_context_files_follow_symlinks_but_refuse_fifos(self):
+    import os
+    import tempfile
+    with tempfile.TemporaryDirectory() as directory:
+      real = Path(directory, "stub-resolv.conf")
+      real.write_text("nameserver 127.0.0.53\n")
+      link = Path(directory, "resolv.conf")
+      link.symlink_to(real)
+      fifo = Path(directory, "fifo")
+      os.mkfifo(fifo)
+      self.assertIn("127.0.0.53", netdoctor.read_bounded_text(str(link)))
+      self.assertIsNone(netdoctor.read_bounded_text(str(fifo)))
+
+  def test_default_route_ignores_split_routes_and_prefers_lowest_metric(self):
+    table = (
+      "Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\tMask\t\tMTU\tWindow\tIRTT\n"
+      "tun0\t00000000\t0100080A\t0003\t0\t0\t0\t00000080\t0\t0\t0\n"
+      "eth1\t00000000\t0101A8C0\t0003\t0\t0\t600\t00000000\t0\t0\t0\n"
+      "eth0\t00000000\t0102A8C0\t0003\t0\t0\t100\t00000000\t0\t0\t0\n"
+    )
+    with mock.patch.object(netdoctor, "read_bounded_text", return_value=table):
+      interface, gateway = netdoctor.default_route_context()
+    self.assertEqual(interface, "eth0")
 
   def test_keyboard_interrupt_closes_socket_and_propagates(self):
     fake = FakeSocket(connect_error=KeyboardInterrupt())

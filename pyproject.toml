@@ -58,3 +58,7 @@ packages = [
   "procwatch",
   "svcdoctor",
 ]
+
+# MANIFEST.in adds tests to the sdist; include-package-data would otherwise copy them into the wheel.
+[tool.setuptools.exclude-package-data]
+"*" = ["tests/*"]

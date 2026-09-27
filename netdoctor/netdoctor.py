@@ -13,7 +13,6 @@ import socket
 import ssl
 import sys
 import time
-import unicodedata
 from typing import Callable, Sequence
 
 from opsforge_common import (
@@ -21,9 +20,14 @@ from opsforge_common import (
   OutputRecord,
   add_output_arguments,
   emit_output,
+  has_unsafe_characters,
   make_conclusion,
+  print_safe,
+  sanitize_text as display_safe,
   validate_output_arguments,
 )
+from opsforge_common.fs import open_regular_file
+from opsforge_common.procfs import parse_ipv4_default_routes
 
 
 CONNECT_TIMEOUT_SECONDS = 3.0
@@ -95,6 +99,7 @@ class DiagnosticResult:
   tls_version: str | None = None
   tls_cipher: str | None = None
   tls_seconds: float | None = None
+  notes: tuple[str, ...] = ()
 
   @property
   def connected(self) -> bool:
@@ -115,7 +120,7 @@ def parse_host(value: str) -> tuple[str, str]:
     raise argparse.ArgumentTypeError("scoped IPv6 zone identifiers are not supported in V1")
   if any(character.isspace() for character in value):
     raise argparse.ArgumentTypeError("host must not contain whitespace")
-  if any(unicodedata.category(character) in {"Cc", "Cf", "Cs", "Zl", "Zp"} for character in value):
+  if has_unsafe_characters(value):
     raise argparse.ArgumentTypeError("host must not contain control or presentation characters")
 
   try:
@@ -191,43 +196,6 @@ def parse_retries(value: str) -> int:
   return int(value, 10)
 
 
-def display_safe(value: object) -> str:
-  """Escape terminal controls, presentation controls, surrogates, and backslashes."""
-  rendered = []
-  for character in str(value):
-    codepoint = ord(character)
-    category = unicodedata.category(character)
-    if character == "\\":
-      rendered.append("\\\\")
-    elif 0xDC80 <= codepoint <= 0xDCFF:
-      rendered.append(f"\\x{codepoint - 0xDC00:02x}")
-    elif category in {"Cc", "Cf", "Cs", "Zl", "Zp"}:
-      if codepoint <= 0xFF:
-        rendered.append(f"\\x{codepoint:02x}")
-      elif codepoint <= 0xFFFF:
-        rendered.append(f"\\u{codepoint:04x}")
-      else:
-        rendered.append(f"\\U{codepoint:08x}")
-    else:
-      rendered.append(character)
-  return "".join(rendered)
-
-
-def stream_safe(value: object, stream: object) -> str:
-  text = str(value)
-  encoding = getattr(stream, "encoding", None)
-  if not encoding:
-    return text
-  try:
-    return text.encode(encoding, errors="backslashreplace").decode(encoding)
-  except (LookupError, UnicodeError):
-    return text.encode("ascii", errors="backslashreplace").decode("ascii")
-
-
-def print_safe(value: object, *, file: object) -> None:
-  print(stream_safe(value, file), file=file)
-
-
 def format_endpoint(address: str, port: int, scope_id: int = 0) -> str:
   try:
     parsed = ipaddress.ip_address(address)
@@ -298,6 +266,7 @@ def resolve_candidates(
   target: Target,
   *,
   resolver: Callable[..., object] = socket.getaddrinfo,
+  notes: list[str] | None = None,
 ) -> tuple[tuple[ConnectionCandidate, ...], str | None]:
   flags = getattr(socket, "AI_NUMERICHOST", 0) if target.kind in {"ipv4", "ipv6"} else 0
   try:
@@ -334,16 +303,20 @@ def resolve_candidates(
     if identity in seen:
       continue
     seen.add(identity)
+    if len(candidates) >= MAX_RESOLVER_CANDIDATES:
+      if notes is not None:
+        notes.append(f"the resolver returned more than {MAX_RESOLVER_CANDIDATES} candidates; only the first {MAX_RESOLVER_CANDIDATES} were considered")
+      break
     candidates.append(candidate)
-    if len(candidates) > MAX_RESOLVER_CANDIDATES:
-      raise ObservationError(
-        f"resolver returned more than the {MAX_RESOLVER_CANDIDATES}-candidate V1 limit"
-      )
   return tuple(candidates), None
 
 
 def classify_connect_error(error: OSError) -> tuple[str, int | None]:
   number = getattr(error, "errno", None)
+  if isinstance(error, ssl.SSLError):
+    # SSL errors carry SSL_ERROR_* codes in errno (SSL_ERROR_SSL == 1 == EPERM), not OS errno values.
+    reason = getattr(error, "reason", None) or type(error).__name__
+    return f"TLS protocol error ({reason})", None
   if isinstance(error, (socket.timeout, TimeoutError)) or number == errno.ETIMEDOUT:
     return "timed out", number
   if number == errno.ECONNREFUSED:
@@ -370,7 +343,9 @@ def attempt_connections(
     try:
       client = socket_factory(candidate.family, candidate.socket_type, candidate.protocol)
     except OSError as error:
-      raise ObservationError("could not create a TCP socket for a resolver candidate") from error
+      name = errno.errorcode.get(getattr(error, "errno", None) or 0, "unknown error")
+      attempts.append(ConnectionAttempt(candidate, f"socket unavailable ({name})", getattr(error, "errno", None)))
+      continue
     try:
       try:
         client.settimeout(timeout)
@@ -426,7 +401,8 @@ def diagnose(
   monotonic_fn: Callable[[], float] = time.monotonic,
 ) -> DiagnosticResult:
   resolution_started = monotonic_fn()
-  candidates, resolution_error = resolve_candidates(target, resolver=resolver)
+  notes: list[str] = []
+  candidates, resolution_error = resolve_candidates(target, resolver=resolver, notes=notes)
   resolution_seconds = max(0.0, monotonic_fn() - resolution_started)
   if resolution_error is not None:
     return DiagnosticResult(target, "failed", resolution_error, (), (), resolution_seconds, timeout)
@@ -440,14 +416,14 @@ def diagnose(
       break
   return DiagnosticResult(
     target, "resolved", None, candidates, tuple(attempts), resolution_seconds,
-    timeout, retries=retry,
+    timeout, retries=retry, notes=tuple(notes),
   )
 
 
 def read_bounded_text(path: str) -> str | None:
-  flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+  """Read a small root-managed context file; symlinks are followed (resolv.conf commonly is one)."""
   try:
-    descriptor = os.open(path, flags)
+    descriptor, _ = open_regular_file(path, follow_symlinks=True)
   except OSError:
     return None
   try:
@@ -481,22 +457,14 @@ def resolver_context() -> tuple[str, ...]:
 
 
 def default_route_context() -> tuple[str | None, str | None]:
+  """Return the lowest-metric usable IPv4 default route as (interface, gateway or None)."""
   text = read_bounded_text("/proc/net/route")
   if text is None:
     return None, None
-  for line in text.splitlines()[1:]:
-    fields = line.split()
-    if len(fields) < 4 or fields[1] != "00000000":
-      continue
-    try:
-      flags = int(fields[3], 16)
-      raw = bytes.fromhex(fields[2])
-      gateway = str(ipaddress.IPv4Address(raw[::-1]))
-    except (ValueError, IndexError):
-      continue
-    if flags & 0x1:
-      return fields[0][:64], gateway
-  return None, None
+  routes = parse_ipv4_default_routes(text)
+  if not routes:
+    return None, None
+  return routes[0].interface, routes[0].gateway
 
 
 def proxy_context(environment: dict[str, str] | None = None) -> tuple[str, ...]:
@@ -515,21 +483,26 @@ def tls_handshake(
   context_factory=lambda: ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT),
   monotonic_fn=time.monotonic,
 ) -> tuple[str, str | None, str | None, float]:
-  started = monotonic_fn()
+  """Reconnect to the connected candidate and time only the TLS handshake."""
   tcp = socket_factory(candidate.family, candidate.socket_type, candidate.protocol)
   tls = None
+  started = monotonic_fn()
   try:
     tcp.settimeout(timeout)
-    tcp.connect(candidate.sockaddr)
+    try:
+      tcp.connect(candidate.sockaddr)
+    except OSError as error:
+      return f"failed: TCP reconnect for TLS failed ({classify_connect_error(error)[0]})", None, None, 0.0
     context = context_factory()
     context.check_hostname = False
     context.verify_mode = ssl.CERT_NONE
+    started = monotonic_fn()
     tls = context.wrap_socket(tcp, server_hostname=sni_name)
     version = tls.version()
     cipher_value = tls.cipher()
     cipher = cipher_value[0] if cipher_value else None
     return "connected", version, cipher, max(0.0, monotonic_fn() - started)
-  except (OSError, ssl.SSLError, TimeoutError) as error:
+  except OSError as error:
     return f"failed: {classify_connect_error(error)[0]}", None, None, max(0.0, monotonic_fn() - started)
   finally:
     if tls is not None:
@@ -614,10 +587,15 @@ def render_result(result: DiagnosticResult) -> str:
       "  Certificate trust, hostname identity, revocation, and application readiness were not assessed.",
     ))
 
+  tls_completed = result.tls_status == "connected"
   lines.extend((
     "",
     "Interpretation limits",
-    "  A successful result proves only that one TCP connection handshake completed to one resolved candidate during this invocation.",
+    "  A successful result proves only that one TCP connection handshake completed to one resolved candidate during this invocation."
+    if not tls_completed else
+    "  A successful result proves only that TCP and an unverified TLS handshake completed to one resolved candidate during this invocation.",
+    "  It does not establish certificate trust, HTTP, service, readiness, or end-to-end health."
+    if tls_completed else
     "  It does not establish application, TLS, HTTP, service, readiness, or end-to-end health.",
     "  A failed connection does not by itself identify whether routing, firewall policy, listener state, remote policy, or another network condition caused the outcome.",
     "  Name-resolution and connection observations are live and non-atomic; network state may change immediately after the report.",
@@ -658,7 +636,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     result = replace(
       result,
       resolver_servers=resolver_context(),
-      default_route=(f"{gateway} via {route_interface}" if gateway and route_interface else None),
+      default_route=(
+        f"{gateway} via {route_interface}" if gateway and route_interface
+        else f"direct via {route_interface} (no gateway)" if route_interface else None
+      ),
       selected_interface=None,
       proxy_variables=proxy_context(),
       tls_status=tls_status,
@@ -700,6 +681,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     finding = f"the targeted connection did not complete at the {stage} stage"
     next_action = f"review the {stage} evidence and target-specific network policy"
   conclusion = make_conclusion(status, target.endpoint, finding, next_action)
+  warnings = list(result.notes)
+  if not result.resolver_servers:
+    warnings.append("no nameserver was read from /etc/resolv.conf; resolver context is unavailable")
   record = OutputRecord(
     tool="netdoctor",
     status=status,
@@ -719,7 +703,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     },
     conclusion=conclusion,
     next_action=next_action + ".",
-    warnings=(),
+    warnings=tuple(warnings),
     elapsed_seconds=time.monotonic() - started,
   )
   brief = "\n".join([

@@ -25,10 +25,10 @@ class ConcreteTargetTests(unittest.TestCase):
         svcdoctor.normalize_target(target)
 
   def test_pattern_rejection_happens_before_systemctl(self):
-    with mock.patch.object(svcdoctor, "inspect_service") as inspect:
+    with mock.patch.object(svcdoctor, "collect_service") as collect:
       code = svcdoctor.main(["*.service"])
     self.assertEqual(code, 2)
-    inspect.assert_not_called()
+    collect.assert_not_called()
 
   def test_concrete_targets_remain_supported(self):
     cases = {
