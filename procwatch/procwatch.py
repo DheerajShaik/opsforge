@@ -5,12 +5,13 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import dataclass
+from fractions import Fraction
 import math
 import os
+import re
 import stat
 import sys
 import time
-import unicodedata
 from typing import Callable, Sequence
 
 from opsforge_common import (
@@ -19,8 +20,11 @@ from opsforge_common import (
   add_output_arguments,
   emit_output,
   make_conclusion,
+  print_safe,
+  sanitize_text as display_safe,
   validate_output_arguments,
 )
+from opsforge_common.procfs import unified_cgroup_path
 
 
 DEFAULT_INTERVAL_SECONDS = 1.0
@@ -31,6 +35,13 @@ READ_CHUNK_BYTES = 4096
 MAX_SAMPLES = 100
 MAX_DURATION_SECONDS = 3600.0
 MAX_AUX_ENTRIES = 100_000
+MAX_THREAD_SAMPLES = 256
+MAX_CHILD_PIDS = 256
+MAX_CGROUP_VALUE_BYTES = 256
+MAX_MOUNTINFO_BYTES = 1024 * 1024
+DEFAULT_CGROUP_MOUNT = ("/sys/fs/cgroup", "/")
+EXITED_STATES = frozenset({"Z", "X"})
+MOUNTINFO_ESCAPE = re.compile(r"\\([0-7]{3})")
 
 
 class InvalidTargetError(Exception):
@@ -75,10 +86,22 @@ class AnalysisResult:
   elapsed_seconds: float | None
   incomplete_warning: str | None = None
   samples: tuple[ProcessSample, ...] = ()
+  requested_samples: int = 2
 
   @property
   def incomplete(self) -> bool:
     return self.final is None or self.incomplete_warning is not None
+
+  @property
+  def captured_samples(self) -> int:
+    return len(self.samples) if self.samples else 1 + int(self.final is not None)
+
+  @property
+  def cpu_utilization_percent(self) -> float | None:
+    if self.final is None or not self.elapsed_seconds:
+      return None
+    cpu_seconds = (self.final.cpu_ticks - self.initial.cpu_ticks) / self.clock_ticks_per_second
+    return cpu_seconds / self.elapsed_seconds * 100
 
 
 @dataclass(frozen=True)
@@ -89,8 +112,21 @@ class AuxiliarySample:
   write_bytes: int | None
   voluntary_context_switches: int | None
   nonvoluntary_context_switches: int | None
-  children: tuple[int, ...]
-  thread_cpu_ticks: tuple[tuple[int, int], ...]
+  children: tuple[int, ...] | None
+  # (thread ID, cumulative CPU ticks, thread start ticks); start ticks detect a reused thread ID.
+  thread_cpu_ticks: tuple[tuple[int, int, int], ...] | None
+  children_truncated: bool = False
+  thread_count: int | None = None
+  threads_truncated: bool = False
+
+
+@dataclass(frozen=True)
+class CgroupContext:
+  path: str | None = None
+  cpu_constraint: str | None = None
+  cpu_constraint_source: str | None = None
+  memory_constraint: str | None = None
+  memory_constraint_source: str | None = None
 
 
 @dataclass(frozen=True)
@@ -98,9 +134,7 @@ class ExtendedResult:
   analysis: AnalysisResult
   auxiliary_initial: AuxiliarySample | None
   auxiliary_final: AuxiliarySample | None
-  cgroup: str | None
-  cpu_constraint: str | None
-  memory_constraint: str | None
+  cgroup: CgroupContext | None
   warnings: tuple[str, ...]
 
 
@@ -143,8 +177,14 @@ def parse_duration(value: str) -> float:
   return duration
 
 
+class Parser(argparse.ArgumentParser):
+  def error(self, message):
+    self.print_usage(sys.stderr)
+    self.exit(2, f"{self.prog}: error: {display_safe(message)}\n")
+
+
 def build_argument_parser() -> argparse.ArgumentParser:
-  parser = argparse.ArgumentParser(
+  parser = Parser(
     prog="procwatch",
     description=(
       "Sample one Linux process for bounded CPU and memory evidence without judging abnormality."
@@ -167,43 +207,6 @@ def build_argument_parser() -> argparse.ArgumentParser:
   sampling.add_argument("--continuous", type=parse_sample_count, metavar="COUNT", help="bounded continuous-mode sample count (2-100)")
   add_output_arguments(parser)
   return parser
-
-
-def display_safe(value: object) -> str:
-  """Escape terminal controls, presentation controls, and ambiguous escapes."""
-  rendered = []
-  for character in str(value):
-    codepoint = ord(character)
-    category = unicodedata.category(character)
-    if character == "\\":
-      rendered.append("\\\\")
-    elif 0xDC80 <= codepoint <= 0xDCFF:
-      rendered.append(f"\\x{codepoint - 0xDC00:02x}")
-    elif category in {"Cc", "Cf", "Cs", "Zl", "Zp"}:
-      if codepoint <= 0xFF:
-        rendered.append(f"\\x{codepoint:02x}")
-      elif codepoint <= 0xFFFF:
-        rendered.append(f"\\u{codepoint:04x}")
-      else:
-        rendered.append(f"\\U{codepoint:08x}")
-    else:
-      rendered.append(character)
-  return "".join(rendered)
-
-
-def stream_safe(value: object, stream: object) -> str:
-  text = str(value)
-  encoding = getattr(stream, "encoding", None)
-  if not encoding:
-    return text
-  try:
-    return text.encode(encoding, errors="backslashreplace").decode(encoding)
-  except (LookupError, UnicodeError):
-    return text.encode("ascii", errors="backslashreplace").decode("ascii")
-
-
-def print_safe(value: object, *, file: object) -> None:
-  print(stream_safe(value, file), file=file)
 
 
 def system_parameter(name: str) -> int:
@@ -238,7 +241,7 @@ def open_process_directory(pid: int) -> int:
     raise
 
 
-def read_bounded_proc_file(directory_fd: int, name: str, limit: int) -> bytes:
+def read_bounded_proc_file(directory_fd: int | None, name: str, limit: int) -> bytes:
   flags = os.O_RDONLY
   flags |= getattr(os, "O_CLOEXEC", 0)
   flags |= getattr(os, "O_NOFOLLOW", 0)
@@ -348,35 +351,43 @@ def observe_samples(
         f"cannot read initial process state for {pid}: {display_safe(error)}"
       ) from error
 
+    if initial.state in EXITED_STATES:
+      return AnalysisResult(
+        pid, interval, clock_ticks, page_size, initial, None, None,
+        f"process had already exited at the first sample (state {initial.state})", (initial,), sample_count,
+      )
     samples = [initial]
-    final = None
+    stop_reason = None
     for index in range(1, sample_count):
       sleep_fn(interval)
+      label = "second sample" if index == 1 else f"sample {index + 1}"
       try:
         candidate = capture_sample(directory_fd, pid, monotonic_fn=monotonic_fn)
       except ProcReadError as error:
-        label = "second sample" if index == 1 else f"sample {index + 1}"
-        return AnalysisResult(
-          pid, interval, clock_ticks, page_size, initial, None, None,
-          f"{label} unavailable: {display_safe(error)}", tuple(samples),
-        )
+        stop_reason = f"{label} unavailable: {display_safe(error)}"
+        break
       previous = samples[-1]
       if candidate.start_ticks != initial.start_ticks:
-        return AnalysisResult(
-          pid, interval, clock_ticks, page_size, initial, None, None,
-          "process identity changed between samples", tuple(samples),
-        )
-      if candidate.user_ticks < previous.user_ticks or candidate.system_ticks < previous.system_ticks:
-        return AnalysisResult(
-          pid, interval, clock_ticks, page_size, initial, None, None,
-          "cumulative CPU counters moved backwards between samples", tuple(samples),
-        )
-      samples.append(candidate)
-      final = candidate
-    assert final is not None
+        problem = "process identity changed"
+      elif candidate.state in EXITED_STATES:
+        problem = f"process exited (state {candidate.state})"
+      elif candidate.user_ticks < previous.user_ticks or candidate.system_ticks < previous.system_ticks:
+        problem = "cumulative CPU counters moved backwards"
+      else:
+        samples.append(candidate)
+        continue
+      stop_reason = f"{label} unavailable: {problem}"
+      break
+    if len(samples) < 2:
+      return AnalysisResult(
+        pid, interval, clock_ticks, page_size, initial, None, None, stop_reason, tuple(samples), sample_count,
+      )
+    final = samples[-1]
     elapsed = final.observed_at - initial.observed_at
     if not math.isfinite(elapsed) or elapsed <= 0:
       raise ObservationError("monotonic sample interval is not positive and finite")
+    if stop_reason is not None:
+      stop_reason += f"; results cover samples 1-{len(samples)} ({elapsed:.3f} s)"
     return AnalysisResult(
       pid=pid,
       requested_interval=interval,
@@ -385,34 +396,39 @@ def observe_samples(
       initial=initial,
       final=final,
       elapsed_seconds=elapsed,
+      incomplete_warning=stop_reason,
       samples=tuple(samples),
+      requested_samples=sample_count,
     )
   finally:
     os.close(directory_fd)
 
 
-def observe(
-  pid: int,
-  interval: float = DEFAULT_INTERVAL_SECONDS,
-  *,
-  sleep_fn: Callable[[float], None] = time.sleep,
-  monotonic_fn: Callable[[], float] = time.monotonic,
-) -> AnalysisResult:
-  return observe_samples(
-    pid, interval, sample_count=2, sleep_fn=sleep_fn, monotonic_fn=monotonic_fn,
-  )
-
-
 def _parse_proc_mapping(data: bytes) -> dict[str, int]:
   values = {}
-  for raw_line in data.decode("ascii", "strict").splitlines():
+  # Only numeric fields are used, so undecodable Name bytes must not discard the rest.
+  for raw_line in data.decode("ascii", "replace").split("\n"):
     if ":" not in raw_line:
       continue
     name, raw_value = raw_line.split(":", 1)
-    token = raw_value.strip().split()[0] if raw_value.strip() else ""
-    if token.isdecimal():
-      values[name] = int(token, 10)
+    tokens = raw_value.split()
+    if tokens and tokens[0].isascii() and tokens[0].isdecimal():
+      values[name] = int(tokens[0], 10)
   return values
+
+
+def _read_counters(
+  directory_fd: int, name: str, keys: tuple[str, ...], label: str, gaps: list[str],
+) -> tuple[int | None, ...]:
+  try:
+    values = _parse_proc_mapping(read_bounded_proc_file(directory_fd, name, MAX_STAT_BYTES))
+  except ProcReadError as error:
+    gaps.append(f"{label} unavailable: {display_safe(error)}")
+    return (None,) * len(keys)
+  missing = [key for key in keys if key not in values]
+  if missing:
+    gaps.append(f"{label} unavailable: {name} has no valid {' or '.join(missing)}")
+  return tuple(values.get(key) for key in keys)
 
 
 def _open_proc_subdirectory(directory_fd: int, name: str) -> int:
@@ -421,132 +437,227 @@ def _open_proc_subdirectory(directory_fd: int, name: str) -> int:
   return os.open(name, flags, dir_fd=directory_fd)
 
 
-def _bounded_directory_names(directory_fd: int, limit: int) -> list[str] | None:
+def _bounded_directory_names(directory_fd: int, limit: int) -> list[str]:
   names = []
   with os.scandir(directory_fd) as entries:
     for entry in entries:
       if len(names) >= limit:
-        return None
+        raise ProcReadError(f"more than {limit} directory entries")
       names.append(entry.name)
   return names
 
 
-def capture_auxiliary(directory_fd: int, pid: int) -> AuxiliarySample:
-  try:
-    io_values = _parse_proc_mapping(read_bounded_proc_file(directory_fd, "io", MAX_STAT_BYTES))
-  except (ProcReadError, UnicodeDecodeError):
-    io_values = {}
-  try:
-    status_values = _parse_proc_mapping(read_bounded_proc_file(directory_fd, "status", MAX_STAT_BYTES))
-  except (ProcReadError, UnicodeDecodeError):
-    status_values = {}
+def capture_auxiliary(directory_fd: int) -> tuple[AuxiliarySample, list[str]]:
+  gaps = []
+  read_bytes, write_bytes = _read_counters(directory_fd, "io", ("read_bytes", "write_bytes"), "I/O byte counters", gaps)
+  voluntary, nonvoluntary = _read_counters(
+    directory_fd, "status", ("voluntary_ctxt_switches", "nonvoluntary_ctxt_switches"), "context switch counters", gaps,
+  )
   fd_count = None
   socket_count = None
   try:
     fd_directory = _open_proc_subdirectory(directory_fd, "fd")
     try:
       names = _bounded_directory_names(fd_directory, MAX_AUX_ENTRIES)
-      if names is not None:
-        fd_count = len(names)
-        socket_count = 0
-        for name in names:
-          try:
-            if os.readlink(name, dir_fd=fd_directory).startswith("socket:["):
-              socket_count += 1
-          except OSError:
-            continue
+      fd_count = len(names)
+      socket_count = 0
+      for name in names:
+        try:
+          if os.readlink(name, dir_fd=fd_directory).startswith("socket:["):
+            socket_count += 1
+        except OSError:
+          continue
     finally:
       os.close(fd_directory)
-  except OSError:
-    pass
-  children = ()
-  try:
-    raw_children = read_bounded_proc_file(directory_fd, f"task/{pid}/children", MAX_STAT_BYTES)
-    children = tuple(int(token, 10) for token in raw_children.decode("ascii").split() if token.isdecimal())[:256]
-  except (ProcReadError, UnicodeDecodeError):
-    pass
-  thread_ticks = []
+  except (OSError, ProcReadError) as error:
+    gaps.append(f"file descriptor counts unavailable: {display_safe(error)}")
+  thread_ticks = None
+  thread_count = None
+  threads_truncated = False
+  children = None
+  children_truncated = False
   try:
     task_directory = _open_proc_subdirectory(directory_fd, "task")
     try:
-      names = _bounded_directory_names(task_directory, 256)
-      for name in sorted((name for name in (names or ()) if name.isdecimal()), key=int):
-        thread_directory = None
+      tids = sorted(int(name, 10) for name in _bounded_directory_names(task_directory, MAX_AUX_ENTRIES) if name.isdecimal())
+      thread_count = len(tids)
+      threads_truncated = thread_count > MAX_THREAD_SAMPLES
+      thread_ticks = []
+      found_children = set()
+      children_read = False
+      children_error = "no thread children list was readable"
+      for tid in tids[:MAX_THREAD_SAMPLES]:
         try:
-          thread_directory = _open_proc_subdirectory(task_directory, name)
-          sample = parse_stat(read_bounded_proc_file(thread_directory, "stat", MAX_STAT_BYTES), int(name), 0.0)
-          thread_ticks.append((int(name), sample.cpu_ticks))
-        except (OSError, ProcReadError):
+          thread_directory = _open_proc_subdirectory(task_directory, str(tid))
+        except OSError:
           continue
+        try:
+          try:
+            thread = parse_stat(read_bounded_proc_file(thread_directory, "stat", MAX_STAT_BYTES), tid, 0.0)
+            thread_ticks.append((tid, thread.cpu_ticks, thread.start_ticks))
+          except ProcReadError:
+            pass
+          try:
+            raw_children = read_bounded_proc_file(thread_directory, "children", MAX_STAT_BYTES)
+            found_children.update(int(token, 10) for token in raw_children.split() if token.isdigit())
+            children_read = True
+          except ProcReadError as error:
+            children_error = display_safe(error)
         finally:
-          if thread_directory is not None:
-            os.close(thread_directory)
+          os.close(thread_directory)
+      if children_read:
+        ordered = sorted(found_children)
+        children = tuple(ordered[:MAX_CHILD_PIDS])
+        # Children of threads beyond the thread cap were never read.
+        children_truncated = threads_truncated or len(ordered) > MAX_CHILD_PIDS
+      else:
+        gaps.append(f"child PIDs unavailable: {children_error}")
     finally:
       os.close(task_directory)
-  except OSError:
-    pass
-  return AuxiliarySample(
-    fd_count, socket_count, io_values.get("read_bytes"), io_values.get("write_bytes"),
-    status_values.get("voluntary_ctxt_switches"), status_values.get("nonvoluntary_ctxt_switches"),
-    children, tuple(thread_ticks),
+  except (OSError, ProcReadError) as error:
+    gaps.append(f"thread and child PID evidence unavailable: {display_safe(error)}")
+  sample = AuxiliarySample(
+    fd_count, socket_count, read_bytes, write_bytes, voluntary, nonvoluntary,
+    children, None if thread_ticks is None else tuple(thread_ticks),
+    children_truncated, thread_count, threads_truncated,
   )
+  return sample, gaps
 
 
-def collect_cgroup_context(directory_fd: int) -> tuple[str | None, str | None, str | None]:
+def parse_cgroup2_mount(mountinfo: str) -> tuple[str, str] | None:
+  """Return (mount point, hierarchy root) of the first cgroup2 mount in mountinfo text."""
+  for line in mountinfo.split("\n"):
+    head, separator, tail = line.partition(" - ")
+    fields = head.split(" ")
+    if separator and len(fields) >= 5 and tail.split(" ", 1)[0] == "cgroup2":
+      point, root = (MOUNTINFO_ESCAPE.sub(lambda match: chr(int(match.group(1), 8)), value) for value in (fields[4], fields[3]))
+      return point, root
+  return None
+
+
+def _read_cgroup_value(path: str) -> str | None:
+  """Return the stripped ASCII value, or None when this level does not expose the file."""
+  flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
   try:
-    text = read_bounded_proc_file(directory_fd, "cgroup", MAX_STAT_BYTES).decode("utf-8", "strict")
-  except (ProcReadError, UnicodeDecodeError):
-    return None, None, None
-  path = next((line.split("::", 1)[1] for line in text.splitlines() if line.startswith("0::")), None)
-  if path is None or ".." in path.split("/"):
-    return path, None, None
-  root = os.path.join("/sys/fs/cgroup", path.lstrip("/"))
-  def read_constraint(name: str) -> str | None:
+    descriptor = os.open(path, flags)
+  except FileNotFoundError:
+    return None
+  try:
+    data = os.read(descriptor, MAX_CGROUP_VALUE_BYTES + 1)
+  finally:
+    os.close(descriptor)
+  if len(data) > MAX_CGROUP_VALUE_BYTES:
+    raise ValueError("value is too long")
+  return data.decode("ascii").strip()
+
+
+def _cgroup_limit(name: str, value: str) -> int | Fraction | None:
+  """Return a comparable limit, None for "max", or raise ValueError."""
+  tokens = value.split()
+  if name == "memory.max" and len(tokens) == 1 and (tokens[0] == "max" or tokens[0].isdecimal()):
+    return None if tokens[0] == "max" else int(tokens[0], 10)
+  if name == "cpu.max" and len(tokens) == 2 and tokens[1].isdecimal() and int(tokens[1], 10) > 0:
+    if tokens[0] == "max":
+      return None
+    if tokens[0].isdecimal():
+      return Fraction(int(tokens[0], 10), int(tokens[1], 10))
+  raise ValueError(f"unsupported {name} value")
+
+
+def collect_cgroup_context(
+  directory_fd: int, mount: tuple[str, str] | None = None,
+) -> tuple[CgroupContext, list[str]]:
+  """Report the tightest cpu.max and memory.max from the process cgroup up to the cgroup2 mount root."""
+  try:
+    text = read_bounded_proc_file(directory_fd, "cgroup", MAX_STAT_BYTES).decode("utf-8", "surrogateescape")
+  except ProcReadError as error:
+    return CgroupContext(), [f"cgroup context unavailable: {display_safe(error)}"]
+  path = unified_cgroup_path(text)
+  if path is None or not path.startswith("/"):
+    return CgroupContext(), ["cgroup context unavailable: no cgroup v2 path is listed"]
+  if ".." in path.split("/"):
+    return CgroupContext(path), ["cgroup constraints unavailable: the cgroup is outside this cgroup namespace"]
+  if mount is None:
     try:
-      with open(os.path.join(root, name), "rb") as handle:
-        value = handle.read(257)
-    except (OSError, UnicodeDecodeError):
-      return None
-    if len(value) > 256:
-      return None
-    return display_safe(value.decode("ascii", "strict").strip())
-  return path, read_constraint("cpu.max"), read_constraint("memory.max")
+      mountinfo = read_bounded_proc_file(None, "/proc/self/mountinfo", MAX_MOUNTINFO_BYTES)
+    except ProcReadError:
+      mountinfo = b""
+    mount = parse_cgroup2_mount(mountinfo.decode("utf-8", "surrogateescape")) or DEFAULT_CGROUP_MOUNT
+  mount_point, mount_root = mount
+  prefix = mount_root.rstrip("/")
+  if path != prefix and not path.startswith(prefix + "/"):
+    return CgroupContext(path), [f"cgroup constraints unavailable: the cgroup is not below cgroup2 mount root {display_safe(mount_root)}"]
+  parts = [part for part in path[len(prefix):].split("/") if part]
+  gaps = []
+  found = {}
+  for depth in range(len(parts), -1, -1):
+    level = "/".join([prefix, *parts[:depth]]) or "/"
+    for name in ("cpu.max", "memory.max"):
+      try:
+        value = _read_cgroup_value(os.path.join(mount_point, *parts[:depth], name))
+        if value is None:
+          continue
+        limit = _cgroup_limit(name, value)
+      except OSError as error:
+        gaps.append(f"cgroup {name} unreadable at {display_safe(level)}: {display_safe(error.strerror or error)}")
+        continue
+      except ValueError:
+        gaps.append(f"cgroup {name} at {display_safe(level)} has an unsupported value")
+        continue
+      best = found.get(name)
+      if best is None or (limit is not None and (best[2] is None or limit < best[2])):
+        found[name] = (value, None if limit is None else level, limit)
+  for name, label in (("cpu.max", "CPU"), ("memory.max", "memory")):
+    if name not in found:
+      gaps.append(f"cgroup {label} constraint unavailable: no readable {name} at {display_safe(path)} or its ancestors")
+  cpu = found.get("cpu.max", (None, None))
+  memory = found.get("memory.max", (None, None))
+  return CgroupContext(path, cpu[0], cpu[1], memory[0], memory[1]), gaps
 
 
 def observe_extended(pid: int, interval: float, sample_count: int) -> ExtendedResult:
   warnings = []
+  gaps = []
   initial_aux = None
   initial_identity = None
-  cgroup = cpu_constraint = memory_constraint = None
+  cgroup = None
   try:
     descriptor = open_process_directory(pid)
     try:
       initial_identity = capture_sample(descriptor, pid).start_ticks
-      initial_aux = capture_auxiliary(descriptor, pid)
-      cgroup, cpu_constraint, memory_constraint = collect_cgroup_context(descriptor)
+      initial_aux, aux_gaps = capture_auxiliary(descriptor)
+      cgroup, cgroup_gaps = collect_cgroup_context(descriptor)
       if capture_sample(descriptor, pid).start_ticks != initial_identity:
         raise ProcReadError("process identity mismatch during initial auxiliary collection")
+      gaps = aux_gaps + cgroup_gaps
     finally:
       os.close(descriptor)
   except (InvalidTargetError, ProcReadError, OSError) as error:
     initial_aux = None
-    cgroup = cpu_constraint = memory_constraint = None
+    initial_identity = None
+    cgroup = None
     warnings.append(f"initial auxiliary evidence unavailable: {display_safe(error)}")
   analysis = observe_samples(pid, interval, sample_count=sample_count)
   if initial_identity is not None and initial_identity != analysis.initial.start_ticks:
     initial_aux = None
-    cgroup = cpu_constraint = memory_constraint = None
+    cgroup = None
+    gaps = []
     warnings.append("initial auxiliary evidence discarded because of process identity mismatch")
+  warnings.extend(gaps)
   final_aux = None
-  if not analysis.incomplete:
+  if analysis.incomplete:
+    if initial_aux is not None:
+      warnings.append("final auxiliary evidence not collected because sampling ended early")
+  else:
     try:
       descriptor = open_process_directory(pid)
       try:
         current = capture_sample(descriptor, pid)
         if current.start_ticks == analysis.initial.start_ticks:
-          final_aux = capture_auxiliary(descriptor, pid)
+          final_aux, final_gaps = capture_auxiliary(descriptor)
           if capture_sample(descriptor, pid).start_ticks != analysis.initial.start_ticks:
             raise ProcReadError("process identity mismatch during final auxiliary collection")
+          warnings.extend([gap for gap in final_gaps if gap not in warnings])
         else:
           warnings.append("final auxiliary evidence discarded because of process identity mismatch")
       finally:
@@ -554,7 +665,7 @@ def observe_extended(pid: int, interval: float, sample_count: int) -> ExtendedRe
     except (InvalidTargetError, ProcReadError, OSError) as error:
       final_aux = None
       warnings.append(f"final auxiliary evidence unavailable: {display_safe(error)}")
-  return ExtendedResult(analysis, initial_aux, final_aux, cgroup, cpu_constraint, memory_constraint, tuple(warnings))
+  return ExtendedResult(analysis, initial_aux, final_aux, cgroup, tuple(warnings))
 
 
 def kibibytes(byte_count: int) -> float:
@@ -575,11 +686,15 @@ def render_result(result: AnalysisResult) -> str:
     f"  Process start ticks: {initial.start_ticks}",
     "Observation",
     f"  Status: {'incomplete' if result.incomplete else 'complete'}",
-    f"  Requested sample interval: {result.requested_interval:.3f} s",
-    "  Scope: one anchored Linux /proc process directory; two bounded stat reads",
+    f"  Sample interval: {result.requested_interval:.3f} s",
+    (
+      "  Scope: one anchored Linux /proc process directory; "
+      f"{result.captured_samples} of {result.requested_samples} requested bounded stat samples used"
+    ),
     "  Snapshot: no; fields within and across samples may change during observation",
   ]
-  if result.incomplete:
+  final = result.final
+  if final is None or result.elapsed_seconds is None:
     lines.extend((
       "Initial process evidence",
       f"  State: {display_safe(initial.state)}",
@@ -592,9 +707,6 @@ def render_result(result: AnalysisResult) -> str:
       "  Unavailable: a trustworthy second sample was not obtained for the same process identity.",
     ))
   else:
-    assert result.final is not None
-    assert result.elapsed_seconds is not None
-    final = result.final
     final_rss = final.rss_pages * result.page_size_bytes
     cpu_delta_ticks = final.cpu_ticks - initial.cpu_ticks
     user_delta_ticks = final.user_ticks - initial.user_ticks
@@ -602,9 +714,9 @@ def render_result(result: AnalysisResult) -> str:
     cpu_seconds = cpu_delta_ticks / result.clock_ticks_per_second
     user_seconds = user_delta_ticks / result.clock_ticks_per_second
     system_seconds = system_delta_ticks / result.clock_ticks_per_second
-    utilization = cpu_seconds / result.elapsed_seconds * 100
+    utilization = result.cpu_utilization_percent
     lines.extend((
-      f"  Observed sample interval: {result.elapsed_seconds:.6f} s",
+      f"  Observation window: {result.elapsed_seconds:.6f} s",
       "Process evidence",
       f"  State: {display_safe(initial.state)} -> {display_safe(final.state)}",
       f"  Parent PID: {initial.ppid} -> {final.ppid}",
@@ -636,6 +748,14 @@ def _delta(initial: int | None, final: int | None) -> str:
   return f"{initial} -> {final} (delta {final - initial:+d})"
 
 
+def _constraint_text(value: str | None, source: str | None) -> str:
+  if value is None:
+    return "unavailable"
+  if source is None:
+    return f"{display_safe(value)} (no limit at any readable level)"
+  return f"{display_safe(value)} (tightest; set by {display_safe(source)})"
+
+
 def render_extended(result: ExtendedResult) -> str:
   analysis = result.analysis
   lines = [render_result(analysis), "Auxiliary evidence"]
@@ -643,6 +763,20 @@ def render_extended(result: ExtendedResult) -> str:
   if initial is None:
     lines.append("  unavailable")
   else:
+    if initial.children is None:
+      children = "unavailable"
+    else:
+      children = ", ".join(map(str, initial.children)) or "none observed"
+      if initial.children_truncated:
+        children += " (truncated)"
+    if initial.thread_cpu_ticks is None:
+      threads = "unavailable"
+    else:
+      threads = str(len(initial.thread_cpu_ticks))
+      if initial.thread_count is not None and initial.thread_count != len(initial.thread_cpu_ticks):
+        threads += f" of {initial.thread_count}"
+      if initial.threads_truncated:
+        threads += " (truncated)"
     lines.extend([
       f"  File descriptors: {_delta(initial.file_descriptors, final.file_descriptors if final else None)}",
       f"  Sockets: {_delta(initial.sockets, final.sockets if final else None)}",
@@ -650,35 +784,33 @@ def render_extended(result: ExtendedResult) -> str:
       f"  Write bytes: {_delta(initial.write_bytes, final.write_bytes if final else None)}",
       f"  Voluntary context switches: {_delta(initial.voluntary_context_switches, final.voluntary_context_switches if final else None)}",
       f"  Nonvoluntary context switches: {_delta(initial.nonvoluntary_context_switches, final.nonvoluntary_context_switches if final else None)}",
-      f"  Child PIDs: {', '.join(map(str, initial.children)) or 'none observed'}",
-      f"  Observed threads: {len(initial.thread_cpu_ticks)}",
+      f"  Child PIDs: {children}",
+      f"  Observed threads: {threads}",
     ])
     if final is not None:
-      initial_threads = dict(initial.thread_cpu_ticks)
-      deltas = sorted(
-        ((ticks - initial_threads[tid], tid) for tid, ticks in final.thread_cpu_ticks if tid in initial_threads),
-        reverse=True,
-      )[:10]
+      deltas = []
+      if initial.thread_cpu_ticks is not None and final.thread_cpu_ticks is not None:
+        initial_threads = {(tid, start): ticks for tid, ticks, start in initial.thread_cpu_ticks}
+        deltas = sorted(
+          (
+            (ticks - initial_threads[tid, start], tid)
+            for tid, ticks, start in final.thread_cpu_ticks if (tid, start) in initial_threads
+          ),
+          reverse=True,
+        )[:10]
       lines.append("  Top per-thread CPU tick deltas: " + (
         ", ".join(f"{tid}:{ticks:+d}" for ticks, tid in deltas) or "unavailable"
       ))
+  cgroup = result.cgroup or CgroupContext()
   lines.extend([
     "Cgroup context",
-    f"  Path: {display_safe(result.cgroup) if result.cgroup else 'unavailable'}",
-    f"  CPU constraint: {display_safe(result.cpu_constraint) if result.cpu_constraint else 'unavailable'}",
-    f"  Memory constraint: {display_safe(result.memory_constraint) if result.memory_constraint else 'unavailable'}",
+    f"  Path: {'unavailable' if cgroup.path is None else display_safe(cgroup.path)}",
+    f"  CPU constraint: {_constraint_text(cgroup.cpu_constraint, cgroup.cpu_constraint_source)}",
+    f"  Memory constraint: {_constraint_text(cgroup.memory_constraint, cgroup.memory_constraint_source)}",
   ])
   if analysis.samples:
     lines.append(f"Sampling: {len(analysis.samples)} samples were captured")
   return "\n".join(lines)
-
-
-def inspect(pid: int, interval: float) -> tuple[str, str | None, int]:
-  result = observe(pid, interval)
-  warning = None
-  if result.incomplete_warning is not None:
-    warning = f"procwatch: warning: incomplete observation: {result.incomplete_warning}"
-  return render_result(result), warning, 1 if result.incomplete else 0
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -687,8 +819,14 @@ def main(argv: Sequence[str] | None = None) -> int:
   validate_output_arguments(parser, arguments)
   interval = arguments.interval
   if arguments.duration is not None:
-    sample_count = min(MAX_SAMPLES, max(2, int(arguments.duration / interval) + 1))
-    interval = arguments.duration / (sample_count - 1)
+    # 1e-9 absorbs float error such as 0.3 / 0.1 == 2.9999999999999996.
+    steps = max(
+      1,
+      math.floor(arguments.duration / interval + 1e-9),
+      math.ceil(arguments.duration / MAX_INTERVAL_SECONDS - 1e-9),
+    )
+    sample_count = min(MAX_SAMPLES, steps + 1)
+    interval = round(arguments.duration / (sample_count - 1), 6)
   else:
     sample_count = arguments.continuous or arguments.samples
   started = time.monotonic()
@@ -714,38 +852,56 @@ def main(argv: Sequence[str] | None = None) -> int:
     return 3
   for warning in warning_items:
     print_safe(f"procwatch: warning: {warning}", file=sys.stderr)
-  if result.incomplete:
+  initial_rss = result.initial.rss_pages * result.page_size_bytes
+  final_rss = None if result.final is None else result.final.rss_pages * result.page_size_bytes
+  utilization = result.cpu_utilization_percent
+  if final_rss is None:
     status = "PARTIAL"
     finding = "the requested process could not be sampled completely with stable identity"
     next_action = "repeat the bounded observation if the same process instance is still running"
   else:
-    status = "OBSERVED"
-    assert result.final is not None
-    rss_delta = (result.final.rss_pages - result.initial.rss_pages) * result.page_size_bytes
     fd_delta = None
     if extended.auxiliary_initial and extended.auxiliary_final:
       if extended.auxiliary_initial.file_descriptors is not None and extended.auxiliary_final.file_descriptors is not None:
         fd_delta = extended.auxiliary_final.file_descriptors - extended.auxiliary_initial.file_descriptors
-    finding = f"{sample_count} bounded samples captured; resident memory changed by {signed_kibibytes(rss_delta)}"
+    if result.incomplete:
+      status = "PARTIAL"
+      finding = f"{result.captured_samples} of {sample_count} bounded samples captured before sampling stopped"
+      next_action = "repeat the bounded observation if the same process instance is still running"
+    else:
+      status = "OBSERVED"
+      finding = f"{sample_count} bounded samples captured"
+      next_action = "correlate observed growth with workload; this sample does not establish a leak"
+    finding += f"; resident memory changed by {signed_kibibytes(final_rss - initial_rss)}"
     if fd_delta is not None:
       finding += f" and file descriptors changed by {fd_delta:+d}"
-    next_action = "correlate observed growth with workload; this sample does not establish a leak"
+  cgroup = extended.cgroup or CgroupContext()
   conclusion = make_conclusion(status, f"PID {arguments.pid}", finding, next_action)
   record = OutputRecord(
     tool="procwatch",
     status=status,
     target=str(arguments.pid),
     observations={
-      "sample_count": len(result.samples) if result.samples else 1 + int(result.final is not None),
-      "requested_interval_seconds": interval,
+      "sample_count": result.captured_samples,
+      "requested_sample_count": sample_count,
+      "requested_interval_seconds": arguments.interval,
+      "effective_interval_seconds": interval,
       "observed_interval_seconds": result.elapsed_seconds,
+      "clock_ticks_per_second": result.clock_ticks_per_second,
+      "page_size_bytes": result.page_size_bytes,
+      "cpu_utilization_percent": None if utilization is None else round(utilization, 2),
+      "initial_rss_bytes": initial_rss,
+      "final_rss_bytes": final_rss,
+      "rss_delta_bytes": None if final_rss is None else final_rss - initial_rss,
       "initial": result.initial,
       "final": result.final,
       "auxiliary_initial": extended.auxiliary_initial,
       "auxiliary_final": extended.auxiliary_final,
-      "cgroup": result.cgroup if hasattr(result, "cgroup") else extended.cgroup,
-      "cpu_constraint": extended.cpu_constraint,
-      "memory_constraint": extended.memory_constraint,
+      "cgroup": cgroup.path,
+      "cpu_constraint": cgroup.cpu_constraint,
+      "cpu_constraint_source": cgroup.cpu_constraint_source,
+      "memory_constraint": cgroup.memory_constraint,
+      "memory_constraint_source": cgroup.memory_constraint_source,
     },
     conclusion=conclusion,
     next_action=next_action + ".",
@@ -754,7 +910,7 @@ def main(argv: Sequence[str] | None = None) -> int:
   )
   brief = "\n".join([
     f"PID: {arguments.pid}",
-    f"Samples: {len(result.samples) if result.samples else 1 + int(result.final is not None)}",
+    f"Samples: {result.captured_samples}",
     f"State: {display_safe(result.initial.state)}" + (f" -> {display_safe(result.final.state)}" if result.final else ""),
     f"Observation: {'partial' if result.incomplete else 'complete'}",
   ])

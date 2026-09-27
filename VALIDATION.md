@@ -12,6 +12,8 @@ The user's completed WSL2 manual campaign reported functional PASS across all te
 
 The previous local record referenced `f3dc8775b4ad11e7ff3bc043a8217b43d70f3188`. A Git diff of all Python files between that commit and `96a61406...` is empty: the previously validated runtime matched the reviewed runtime. The new hardening changes require the regression and targeted revalidation below; the older manual results do not claim execution of the new code.
 
+Changes listed under **Unreleased** in [CHANGELOG.md](CHANGELOG.md) postdate this record. They are covered by the repository test suite and CI, but the results below were not re-executed for them.
+
 ## Local environment
 
 - Ubuntu 24.04.1 LTS under WSL2, x86_64

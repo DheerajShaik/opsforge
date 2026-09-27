@@ -1,4 +1,5 @@
 import contextlib
+from datetime import datetime, timezone
 import importlib.util
 import io
 import json
@@ -56,13 +57,47 @@ class CliTests(unittest.TestCase):
         self.assertEqual(caught.exception.code, 2)
 
   def test_success_and_dash_leading_filename(self):
+    previous = os.getcwd()
     with tempfile.TemporaryDirectory() as directory:
-      path = Path(directory, "-events")
-      path.write_text("same\nsame\n", encoding="utf-8")
-      with mock.patch.object(loghound.os.path, "abspath", return_value=str(path)):
+      Path(directory, "-events").write_text("same\nsame\n", encoding="utf-8")
+      os.chdir(directory)
+      try:
         code, stdout, stderr = self.run_main(["--", "-events"])
+      finally:
+        os.chdir(previous)
     self.assertEqual((code, stderr), (0, ""))
     self.assertIn("Count: 2", stdout)
+
+  def test_argument_errors_are_terminal_safe(self):
+    stderr = io.StringIO()
+    with contextlib.redirect_stderr(stderr), self.assertRaises(SystemExit):
+      loghound.main(["x", "\x1b[31m"])
+    self.assertNotIn("\x1b", stderr.getvalue())
+    self.assertIn("\\x1b", stderr.getvalue())
+
+  def test_backslash_filter_is_printable_text(self):
+    with tempfile.TemporaryDirectory() as directory:
+      path = Path(directory, "log")
+      path.write_text("C:\\temp failed\nC:\\temp failed\nother\n", encoding="utf-8")
+      code, stdout, _ = self.run_main(["--include", "C:\\temp", str(path)])
+    self.assertEqual(code, 0)
+    self.assertIn("Count: 2", stdout)
+    self.assertIn("Filtered physical lines: 1", stdout)
+
+  def test_json_patterns_are_bounded_and_strictly_encodable(self):
+    with tempfile.TemporaryDirectory() as directory:
+      path = Path(directory, "log")
+      path.write_bytes((b"x" * 400 + b"\n") * 2 + b"bad\x80\nbad\x80\n")
+      code, stdout, _ = self.run_main(["--json", str(path)])
+    self.assertEqual(code, 0)
+    self.assertNotIn("\\udc", stdout)
+    observations = json.loads(stdout)["observations"]
+    self.assertEqual((observations["distinct_patterns"], observations["recurring_patterns"]), (2, 2))
+    long_pattern, binary_pattern = observations["patterns"]
+    self.assertEqual(long_pattern["key"], "x" * loghound.EXCERPT_CODEPOINTS)
+    self.assertEqual((long_pattern["key_truncated"], long_pattern["key_length"]), (True, 400))
+    self.assertEqual(len(long_pattern["key_digest"]), 32)
+    self.assertEqual(binary_pattern["key"], "bad\\x80")
 
   def test_expected_and_internal_errors_use_stderr(self):
     with mock.patch.object(loghound, "analyze_sources", side_effect=loghound.ObservationError("bad")):
@@ -163,7 +198,17 @@ class TargetTests(unittest.TestCase):
     with tempfile.TemporaryDirectory() as directory:
       path = Path(directory, "application.log.gz")
       path.write_text("plain\nplain\n")
-      self.assertEqual(loghound.inspect(str(path))[2], 0)
+      self.assertFalse(loghound.analyze(str(path)).incomplete)
+
+  def test_dotdot_after_symlinked_directory_follows_the_kernel(self):
+    with tempfile.TemporaryDirectory() as directory:
+      real = Path(directory, "real", "sub")
+      real.mkdir(parents=True)
+      Path(directory, "real", "app.log").write_text("kernel\nkernel\n")
+      Path(directory, "app.log").write_text("lexical\nlexical\n")
+      Path(directory, "link").symlink_to(real)
+      result = loghound.analyze(str(Path(directory, "link")) + "/../app.log")
+    self.assertEqual([item.key for item in result.patterns], ["kernel"])
 
   def test_known_compressed_signatures_are_rejected(self):
     for signature, name in loghound.COMPRESSED_SIGNATURES:
@@ -185,25 +230,63 @@ class NormalizationTests(unittest.TestCase):
       "2026-09-05T12:34:56Z ",
       "2024-02-29T00:00:00.123+05:30   ",
       "2026-09-05T12:34:56-04:00 ",
+      "2026-09-05 12:34:56,123 ",
+      "2026-09-05t12:34:56z ",
+      "2026-09-05T12:34:56+0530 ",
+      "2026-09-05T12:34:56Z\t",
+      "2026-09-05T12:34:56 ",
+      "Sep  5 12:34:56 ",
+      "Sep 27 01:02:03 ",
     ):
       with self.subTest(prefix=prefix):
         self.assertEqual(loghound.normalize_message(prefix + "message  "), "message  ")
 
   def test_unsupported_or_invalid_timestamps_remain(self):
     values = (
-      "2026-09-05T12:34:56 message", "2026-09-05t12:34:56Z message",
-      "2026-09-05T12:34:56z message", "2026-13-05T12:34:56Z message",
-      "2026-02-30T12:34:56Z message", "2026-09-05T25:34:56Z message",
-      "[2026-09-05T12:34:56Z] message", " 2026-09-05T12:34:56Z message",
-      "prefix 2026-09-05T12:34:56Z message", "Sep  5 12:34:56 message",
-      "2026-09-05T12:34:56Z\tmessage",
+      "2026-13-05T12:34:56Z message", "2026-02-30T12:34:56Z message",
+      "2026-09-05T25:34:56Z message", "[2026-09-05T12:34:56Z] message",
+      " 2026-09-05T12:34:56Z message", "prefix 2026-09-05T12:34:56Z message",
       "2026-09-05T12:34:56+05:60 message",
       "2026-09-05T12:34:56-00:99 message",
       "2026-09-05T12:34:56+24:00 message",
+      "2026-09-05T12:34:56Zmessage",
+      "Sep 31 12:34:56 message", "Sept 5 12:34:56 message",
+      "9999-12-31T23:59:59-01:00 message",
     )
     for value in values:
       with self.subTest(value=value):
         self.assertEqual(loghound.normalize_message(value), value)
+
+  def test_rfc3164_year_comes_from_file_time_with_rollover(self):
+    reference = datetime(2027, 1, 1, 12, 0, tzinfo=timezone.utc)
+    for text, expected in (
+      ("Dec 31 23:59:59 late", datetime(2026, 12, 31, 23, 59, 59)),
+      ("Jan  1 00:00:01 early", datetime(2027, 1, 1, 0, 0, 1)),
+      ("Feb 29 10:00:00 leap", datetime(2024, 2, 29, 10, 0, 0)),
+    ):
+      with self.subTest(text=text):
+        timestamp, _, local = loghound.extract_timestamp(text, reference)
+        self.assertEqual(timestamp.astimezone().replace(tzinfo=None), expected)
+        self.assertTrue(local)
+
+  def test_common_identifiers_normalize(self):
+    first = "Sep 27 10:00:00 host sshd[4242]: Failed password for root from 10.0.0.5 port 22 ssh2"
+    second = "Sep 27 10:00:01 host sshd[99]: Failed password for root from 10.0.0.7 port 40022 ssh2"
+    self.assertEqual(
+      loghound.normalize_message(first), "host sshd[<pid>]: Failed password for root from <ip> port <port> ssh2",
+    )
+    self.assertEqual(loghound.normalize_message(second), loghound.normalize_message(first))
+    for value, expected in (
+      ("id 0190b2e3-7c4a-7b3e-9f1d-2a3b4c5d6e7f", "id <uuid>"),
+      ("connect to 2001:db8::1 failed", "connect to <ip> failed"),
+      ("peer fe80::1%eth0 and ::ffff:10.0.0.1", "peer <ip> and <ip>"),
+      ("dial [2001:db8::2]:443", "dial [<ip>]:443"),
+      ("refused by 10.0.0.1.", "refused by <ip>."),
+      ('{"pid": 4242, "request_id": "abc-1"}', '{"pid": <pid>, "request_id": "<id>"}'),
+      ("at 10:00:00 mac 00:1a:2b:3c:4d:5e version 1.2.3.4.5", "at 10:00:00 mac 00:1a:2b:3c:4d:5e version 1.2.3.4.5"),
+    ):
+      with self.subTest(value=value):
+        self.assertEqual(loghound.normalize_message(value), expected)
 
   def test_conservative_identifier_normalization(self):
     values = (
@@ -221,6 +304,63 @@ class NormalizationTests(unittest.TestCase):
     first = "request_id=abc-123 uuid 123e4567-e89b-12d3-a456-426614174000"
     second = "request_id=xyz-999 uuid 223e4567-e89b-12d3-a456-426614174999"
     self.assertEqual(loghound.normalize_message(first), loghound.normalize_message(second))
+
+
+class SeverityTests(unittest.TestCase):
+  def test_explicit_levels_win_and_absence_is_not_an_error(self):
+    for message, expected in (
+      ("INFO loaded 0 critical patches", "info"),
+      ("DEBUG retrying after failure", "debug"),
+      ("ok=5 changed=0 unreachable=0 failed=0", "info"),
+      ("error=0 fatal=false", "info"),
+      ("completed with no errors", "info"),
+      ("GET /error 404", "info"),
+      ('{"level":"error","msg":"disk"}', "error"),
+      ("level=warn msg=slow", "warning"),
+      ("<3>kernel: oops", "error"),
+      ("E0905 12:34:56.789012 1 main.go:1] boom", "error"),
+      ("[error] upstream timed out", "error"),
+      ("ERR something", "error"),
+      ("Connection failed.", "error"),
+      ("Failing over to replica", "error"),
+      ("3 errors found", "error"),
+      ("panic: runtime error", "critical"),
+      ("host sshd[1]: Failed password for root", "error"),
+      ("request completed", "info"),
+    ):
+      with self.subTest(message=message):
+        self.assertEqual(loghound.classify_severity(message), expected)
+
+
+class WindowTests(unittest.TestCase):
+  def analyze_text(self, text, now, mtime=None):
+    with tempfile.TemporaryDirectory() as directory:
+      path = Path(directory, "log")
+      path.write_text(text, encoding="utf-8")
+      if mtime is not None:
+        os.utime(path, (mtime, mtime))
+      options = loghound.AnalysisOptions(window_seconds=3600)
+      return loghound.analyze_sources(str(path), options, 0, clock=lambda: now)
+
+  def test_undated_lines_are_reported_and_continuations_inherit_time(self):
+    result = self.analyze_text(
+      "orphan line\n"
+      "2026-01-01T00:00:00Z ERROR recent\n"
+      "  continuation\n"
+      "2025-01-01T00:00:00Z ERROR old\n"
+      "  old continuation\n",
+      datetime(2026, 1, 1, 0, 30, tzinfo=timezone.utc),
+    )
+    self.assertEqual((result.analyzable_lines, result.filtered_lines, result.undated_lines_excluded), (2, 3, 1))
+    self.assertTrue(result.incomplete)
+    self.assertIn("no recognized timestamp", result.incomplete_warning)
+
+  def test_syslog_lines_are_placed_in_the_window(self):
+    now = datetime(2026, 9, 27, 11, 0).astimezone(timezone.utc)
+    text = "".join(f"Sep 27 10:{minute:02d}:00 host sshd[{minute}]: Failed password\n" for minute in range(0, 60, 10))
+    result = self.analyze_text(text, now, mtime=now.timestamp())
+    self.assertEqual((result.analyzable_lines, result.local_time_lines, len(result.patterns)), (6, 6, 1))
+    self.assertFalse(result.incomplete)
 
 
 class ObservationTests(unittest.TestCase):
@@ -269,6 +409,49 @@ class ObservationTests(unittest.TestCase):
     self.assertEqual((result.stack_trace_groups, result.stack_trace_lines), (1, 2))
     self.assertEqual((result.earlier_period_messages, result.later_period_messages), (1, 1))
 
+  def test_python_traceback_with_source_caret_and_chain_is_one_group(self):
+    result = self.analyze_bytes(
+      b"Traceback (most recent call last):\n"
+      b'  File "/app/server.py", line 10, in handle\n'
+      b"    result = compute(x)\n"
+      b"             ^^^^^^^^^^\n"
+      b'  File "/app/logic.py", line 22, in compute\n'
+      b"    return 1 / x\n"
+      b"ZeroDivisionError: division by zero\n"
+      b"\n"
+      b"During handling of the above exception, another exception occurred:\n"
+      b"\n"
+      b"Traceback (most recent call last):\n"
+      b'  File "/app/server.py", line 12, in handle\n'
+      b'    raise RuntimeError("wrapped")\n'
+      b"RuntimeError: wrapped\n"
+      b"2026-09-27T10:00:01Z INFO next request\n"
+    )
+    self.assertEqual((result.stack_trace_groups, result.stack_trace_lines), (1, 12))
+
+  def test_java_module_frames_and_cause_chain_are_grouped(self):
+    result = self.analyze_bytes(
+      b"2026-09-27T10:00:00Z ERROR request failed\n"
+      b"java.lang.IllegalStateException: boom\n"
+      b"\tat com.example.App.run(App.java:10)\n"
+      b"\tat java.base/java.lang.Thread.run(Thread.java:833)\n"
+      b"Caused by: java.io.IOException: disk\n"
+      b"\tat com.example.Store.write(Store.java:5)\n"
+      b"\t... 1 more\n"
+      b"\tSuppressed: java.lang.Exception: close\n"
+      b"\t\tat com.example.Store.close(Store.java:9)\n"
+      b'Exception in thread "main" java.lang.Error: second\n'
+      b"\tat com.example.Main.main(Main.java:3)\n"
+    )
+    self.assertEqual((result.stack_trace_groups, result.stack_trace_lines), (2, 10))
+
+  def test_distinct_pattern_limit_is_partial(self):
+    with mock.patch.object(loghound, "MAX_PATTERNS", 2):
+      result = self.analyze_bytes(b"a\nb\nc\na\nd\n")
+    self.assertEqual({item.key: item.count for item in result.patterns}, {"a": 2, "b": 1})
+    self.assertEqual(result.untracked_lines, 2)
+    self.assertIn("distinct pattern limit", result.incomplete_warning)
+
   def test_invalid_utf8_is_lossless_and_distinct(self):
     result = self.analyze_bytes(b"bad\x80\nbad\x80\nbad\x81\nbad\x81\n")
     self.assertEqual(len(result.patterns), 2)
@@ -276,23 +459,33 @@ class ObservationTests(unittest.TestCase):
     self.assertIn("bad\\x80", output)
     self.assertIn("bad\\x81", output)
 
-  def test_nul_anywhere_is_fatal_even_after_lines(self):
-    for data in (b"\x00a", b"a\x00b", b"a\x00", b"valid\nvalid\n\x00"):
-      with self.subTest(data=data), self.assertRaises(loghound.ObservationError):
-        self.analyze_bytes(data)
+  def test_nul_bytes_are_removed_and_reported(self):
+    for data, keys in (
+      (b"\x00a", {"a"}), (b"a\x00b", {"ab"}), (b"a\x00", {"a"}),
+      (b"valid\nvalid\n" + b"\x00" * 8192, {"valid"}),
+    ):
+      with self.subTest(data=data[:16]):
+        result = self.analyze_bytes(data)
+        self.assertEqual({item.key for item in result.patterns}, keys)
+        self.assertTrue(result.incomplete)
+        self.assertIn("NUL bytes", result.incomplete_warning)
 
   def test_line_length_boundary(self):
-    self.assertEqual(self.analyze_bytes(b"a" * loghound.MAX_LINE_BYTES).analyzable_lines, 1)
-    self.assertEqual(
-      self.analyze_bytes(b"a" * loghound.MAX_LINE_BYTES + b"\r\n").analyzable_lines, 1
-    )
-    for data in (
-      b"a" * (loghound.MAX_LINE_BYTES + 1),
-      b"valid\n" + b"a" * (loghound.MAX_LINE_BYTES + 1),
-      b"a" * loghound.MAX_LINE_BYTES + b"\r",
+    for data in (b"a" * loghound.MAX_LINE_BYTES, b"a" * loghound.MAX_LINE_BYTES + b"\r\n"):
+      result = self.analyze_bytes(data)
+      self.assertEqual((result.analyzable_lines, result.truncated_lines), (1, 0))
+      self.assertFalse(result.incomplete)
+    for data, lines in (
+      (b"a" * (loghound.MAX_LINE_BYTES + 1), 1),
+      (b"valid\n" + b"a" * (loghound.MAX_LINE_BYTES + 1), 2),
+      (b"a" * loghound.MAX_LINE_BYTES + b"\r", 1),
+      (b"a" * (3 * loghound.MAX_LINE_BYTES) + b"\nnext\n", 2),
     ):
-      with self.assertRaises(loghound.ObservationError):
-        self.analyze_bytes(data)
+      with self.subTest(size=len(data)):
+        result = self.analyze_bytes(data)
+        self.assertEqual((result.physical_lines, result.truncated_lines), (lines, 1))
+        self.assertTrue(result.incomplete)
+        self.assertIn("truncated", result.incomplete_warning)
 
   def test_chunk_boundaries_do_not_change_lines(self):
     data = b"a" * (loghound.READ_CHUNK_BYTES - 1) + b"\r\nnext\n"
@@ -413,6 +606,20 @@ class RankingAndRenderingTests(unittest.TestCase):
     self.assertEqual(positions, sorted(positions))
     self.assertIn("Absence of recurrence does not establish health", output)
     self.assertIn("not an atomic snapshot", output)
+
+  def test_message_rate_and_evidence_counters_are_rendered(self):
+    result = loghound.AnalysisResult(
+      "/log", 1, 1, 4, 4, (), timestamped_lines=4, duration_seconds=2.0, truncated_lines=1,
+    )
+    output = loghound.render_result(result)
+    self.assertIn("Approximate message rate: 2.000 timestamped messages per second", output)
+    self.assertIn(f"Lines truncated at {loghound.MAX_LINE_BYTES} bytes: 1", output)
+    self.assertNotIn("NUL bytes removed", output)
+
+  def test_truncated_pattern_excerpt_is_labelled(self):
+    pattern = loghound.PatternEvidence("x" * loghound.EXCERPT_CODEPOINTS, 2, 1, 2, 500, "0" * 32)
+    result = loghound.AnalysisResult("/log", 1, 1, 2, 2, (pattern,))
+    self.assertIn("x" * loghound.EXCERPT_CODEPOINTS + "... [truncated]", loghound.render_result(result))
 
 
 if __name__ == "__main__":

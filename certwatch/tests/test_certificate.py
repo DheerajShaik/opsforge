@@ -142,12 +142,13 @@ class CertificateTests(unittest.TestCase):
         with self.assertRaises(c.CertWatchError):
             c.parse_certificate_output(raw, b"x")
 
-    def test_malformed_san(self):
+    def test_unknown_san_kinds_are_retained_but_not_identities(self):
+        raw = BASE + b"X509v3 Subject Alternative Name:\n    othername: 1.3.6.1.4.1.311.25.1::<unsupported>, DNS:dc01.example.com\n"
+        result = c.parse_certificate_output(raw, b"x")
+        self.assertIn(("other", "othername: 1.3.6.1.4.1.311.25.1::<unsupported>"), result.sans)
+        self.assertTrue(c.verify_hostname(c.parse_target("dc01.example.com"), result))
         with self.assertRaises(c.CertWatchError):
-            c.parse_certificate_output(
-                BASE + b"X509v3 Subject Alternative Name:\n  other:thing\n",
-                b"x",
-            )
+            c.parse_certificate_output(BASE + b"X509v3 Subject Alternative Name:\n  other:\x1bthing\n", b"x")
 
     def test_find_decoder(self):
         self.assertEqual(c.find_decoder(lambda _: "/usr/bin/openssl"), "/usr/bin/openssl")
@@ -159,9 +160,9 @@ class CertificateTests(unittest.TestCase):
         safe = c.sanitize(value)
         self.assertNotIn("\x1b", safe)
         self.assertNotIn("\n", safe)
-        self.assertIn("\\x0A", safe)
-        self.assertIn("\\u202E", safe)
-        self.assertIn("\\x5C", safe)
+        self.assertIn("\\x0a", safe)
+        self.assertIn("\\u202e", safe)
+        self.assertIn("a\\\\b", safe)
 
     def test_openssl_arguments(self):
         self.assertEqual(c.OPENSSL_ARGS[0], "x509")

@@ -6,26 +6,20 @@ from __future__ import annotations
 import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, replace
-from datetime import datetime, timezone
 import errno
+import functools
 import ipaddress
 import json
 import hashlib
-import math
 import os
 import re
-import signal
 import shutil
 import socket
 import ssl
 import stat
-import subprocess
 import sys
 import time
-import unicodedata
-import urllib.error
 import urllib.parse
-import urllib.request
 from typing import Callable, Mapping, Sequence
 
 from opsforge_common import (
@@ -33,9 +27,21 @@ from opsforge_common import (
   OutputRecord,
   add_output_arguments,
   emit_output,
+  has_unsafe_characters,
   make_conclusion,
+  print_safe,
+  sanitize_text as display_safe,
   validate_output_arguments,
 )
+from opsforge_common.fs import FileIdentityError, NotRegularFileError, open_regular_file
+from opsforge_common.process import (
+  ProcessSpawnError,
+  ProcessTimeoutError,
+  child_environment,
+  resolve_executable,
+  run_bounded,
+)
+from opsforge_common.systemd import UnitNameError, normalize_service_name
 
 
 CONFIG_MAX_BYTES = 64 * 1024
@@ -49,6 +55,10 @@ MAX_WORKERS = 8
 MAX_HTTP_REDIRECTS = 3
 MAX_HTTP_HEADER_BYTES = 64 * 1024
 MAX_HASH_BYTES = 64 * 1024 * 1024
+RETRY_BACKOFF_SECONDS = 0.1
+MAX_RETRY_BACKOFF_SECONDS = 0.5
+X509_V_ERR_CERT_NOT_YET_VALID = 9
+X509_V_ERR_CERT_HAS_EXPIRED = 10
 CHECK_NAME_RE = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9._-]{0,63})\Z", re.ASCII)
 HOST_LABEL_RE = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\Z", re.ASCII)
 
@@ -61,7 +71,7 @@ class ObservationError(Exception):
   """A configured check could not produce trustworthy evidence."""
 
 
-class RedirectPolicyError(urllib.error.URLError):
+class RedirectPolicyError(ObservationError):
   """An HTTP redirect exceeded the configured target boundary."""
 
 
@@ -145,42 +155,6 @@ class TcpAttempt:
   error_number: int | None = None
 
 
-def display_safe(value: object) -> str:
-  rendered = []
-  for character in str(value):
-    codepoint = ord(character)
-    category = unicodedata.category(character)
-    if character == "\\":
-      rendered.append("\\\\")
-    elif 0xDC80 <= codepoint <= 0xDCFF:
-      rendered.append(f"\\x{codepoint - 0xDC00:02x}")
-    elif category in {"Cc", "Cf", "Cs", "Zl", "Zp"}:
-      if codepoint <= 0xFF:
-        rendered.append(f"\\x{codepoint:02x}")
-      elif codepoint <= 0xFFFF:
-        rendered.append(f"\\u{codepoint:04x}")
-      else:
-        rendered.append(f"\\U{codepoint:08x}")
-    else:
-      rendered.append(character)
-  return "".join(rendered)
-
-
-def stream_safe(value: object, stream: object) -> str:
-  text = str(value)
-  encoding = getattr(stream, "encoding", None)
-  if not encoding:
-    return text
-  try:
-    return text.encode(encoding, errors="backslashreplace").decode(encoding)
-  except (LookupError, UnicodeError):
-    return text.encode("ascii", errors="backslashreplace").decode("ascii")
-
-
-def print_safe(value: object, *, file: object) -> None:
-  print(stream_safe(value, file), file=file)
-
-
 def _metadata_identity(metadata: os.stat_result) -> tuple[int, int, int, int, int]:
   return (
     metadata.st_dev,
@@ -192,27 +166,24 @@ def _metadata_identity(metadata: os.stat_result) -> tuple[int, int, int, int, in
 
 
 def read_config_bytes(path: str) -> bytes:
-  flags = os.O_RDONLY
-  for name in ("O_CLOEXEC", "O_NOFOLLOW", "O_NONBLOCK"):
-    flags |= getattr(os, name, 0)
   try:
-    descriptor = os.open(path, flags)
+    descriptor, before = open_regular_file(path)
   except (FileNotFoundError, NotADirectoryError) as error:
     raise ConfigError("configuration file was not found") from error
   except PermissionError as error:
     raise ConfigError("configuration file is not readable with current permissions") from error
+  except NotRegularFileError as error:
+    if os.path.islink(path):
+      raise ConfigError("configuration file must not be a final-component symlink") from error
+    raise ConfigError("configuration target must be a regular file") from error
+  except FileIdentityError as error:
+    raise ConfigError("configuration file changed during observation") from error
   except OSError as error:
     if error.errno == errno.ELOOP:
       raise ConfigError("configuration file must not be a final-component symlink") from error
     raise ConfigError("configuration file could not be opened") from error
 
   try:
-    try:
-      before = os.fstat(descriptor)
-    except OSError as error:
-      raise ConfigError("configuration file metadata could not be inspected") from error
-    if not stat.S_ISREG(before.st_mode):
-      raise ConfigError("configuration target must be a regular file")
     if before.st_size < 0 or before.st_size > CONFIG_MAX_BYTES:
       raise ConfigError(f"configuration file exceeds the {CONFIG_MAX_BYTES}-byte V1 limit")
 
@@ -281,10 +252,10 @@ def _parse_check_name(value: str, context: str) -> str:
 def _parse_percent(value: object, context: str) -> float:
   if isinstance(value, bool) or not isinstance(value, (int, float)):
     raise ConfigError(f"{context} must be a JSON number from 0 through 100")
-  number = float(value)
-  if not math.isfinite(number) or not 0.0 <= number <= 100.0:
+  # Comparing before float() rejects NaN and infinities and cannot overflow on huge integers.
+  if not 0.0 <= value <= 100.0:
     raise ConfigError(f"{context} must be a finite number from 0 through 100")
-  return number
+  return float(value)
 
 
 def _parse_timeout(value: object, context: str) -> float:
@@ -292,12 +263,11 @@ def _parse_timeout(value: object, context: str) -> float:
     raise ConfigError(
       f"{context} must be a JSON number from {MIN_TCP_TIMEOUT_SECONDS} through {MAX_TCP_TIMEOUT_SECONDS}"
     )
-  number = float(value)
-  if not math.isfinite(number) or not MIN_TCP_TIMEOUT_SECONDS <= number <= MAX_TCP_TIMEOUT_SECONDS:
+  if not MIN_TCP_TIMEOUT_SECONDS <= value <= MAX_TCP_TIMEOUT_SECONDS:
     raise ConfigError(
       f"{context} must be a finite number from {MIN_TCP_TIMEOUT_SECONDS} through {MAX_TCP_TIMEOUT_SECONDS}"
     )
-  return number
+  return float(value)
 
 
 def _parse_port(value: object, context: str) -> int:
@@ -312,7 +282,25 @@ def _parse_nonnegative_int(value: object, context: str, maximum: int) -> int:
   return value
 
 
+def _parse_path(check: Mapping[str, object], context: str) -> str:
+  path = _require_string(check, "path", context)
+  if not path:
+    raise ConfigError(f"{context}.path must not be empty")
+  if "\x00" in path:
+    raise ConfigError(f"{context}.path must not contain NUL")
+  try:
+    os.fsencode(path)
+  except UnicodeEncodeError as error:
+    raise ConfigError(f"{context}.path cannot be encoded as a file-system path") from error
+  return path
+
+
 COMMON_CHECK_FIELDS = {"severity", "group", "profile", "depends_on", "retries"}
+FILE_CHECK_FIELDS = {
+  "file_exists": {"path"},
+  "file_metadata": {"path", "minimum_bytes", "maximum_bytes"},
+  "config_hash": {"path", "sha256"},
+}
 
 
 def _common_check_fields(check: Mapping[str, object], context: str) -> dict[str, object]:
@@ -344,7 +332,7 @@ def parse_host(value: str, context: str) -> tuple[str, str]:
     raise ConfigError(f"{context} does not support scoped IPv6 zone identifiers in V1")
   if any(character.isspace() for character in value):
     raise ConfigError(f"{context} must not contain whitespace")
-  if any(unicodedata.category(character) in {"Cc", "Cf", "Cs", "Zl", "Zp"} for character in value):
+  if has_unsafe_characters(value):
     raise ConfigError(f"{context} must not contain control or presentation characters")
 
   try:
@@ -374,7 +362,8 @@ def parse_host(value: str, context: str) -> tuple[str, str]:
 def parse_config_document(document: object, *, path: str) -> HealthConfig:
   root = _expect_mapping(document, "configuration")
   _reject_unknown_keys(root, {"version", "checks", "max_workers"}, "configuration")
-  if root.get("version") != 1 or isinstance(root.get("version"), bool):
+  version = root.get("version")
+  if type(version) is not int or version != 1:
     raise ConfigError("configuration.version must be the JSON integer 1")
   checks_value = root.get("checks")
   if not isinstance(checks_value, list):
@@ -401,11 +390,7 @@ def parse_config_document(document: object, *, path: str) -> HealthConfig:
 
     if check_type == "disk_free_percent":
       _reject_unknown_keys(check, {"name", "type", "path", "minimum_free_percent"} | COMMON_CHECK_FIELDS, context)
-      check_path = _require_string(check, "path", context)
-      if not check_path:
-        raise ConfigError(f"{context}.path must not be empty")
-      if "\x00" in check_path:
-        raise ConfigError(f"{context}.path must not contain NUL")
+      check_path = _parse_path(check, context)
       minimum = _parse_percent(check.get("minimum_free_percent"), f"{context}.minimum_free_percent")
       checks.append(DiskFreeCheck(name, check_path, minimum, **common))
     elif check_type == "tcp_connect":
@@ -462,17 +447,15 @@ def parse_config_document(document: object, *, path: str) -> HealthConfig:
     elif check_type == "systemd_service":
       _reject_unknown_keys(check, {"name", "type", "service", "timeout_seconds"} | COMMON_CHECK_FIELDS, context)
       service = _require_string(check, "service", context)
-      if not service or service.startswith("-") or "/" in service or any(value.isspace() for value in service):
-        raise ConfigError(f"{context}.service is invalid")
-      service = service if service.endswith(".service") else service + ".service"
+      try:
+        service = normalize_service_name(service)
+      except UnitNameError as error:
+        raise ConfigError(f"{context}.service is invalid: {error}") from error
       timeout = _parse_timeout(check.get("timeout_seconds", DEFAULT_TCP_TIMEOUT_SECONDS), f"{context}.timeout_seconds")
       checks.append(GenericCheck(name, check_type, service, timeout, **common))
-    elif check_type in {"file_exists", "file_metadata", "config_hash"}:
-      allowed = {"name", "type", "path", "minimum_bytes", "maximum_bytes", "sha256"} | COMMON_CHECK_FIELDS
-      _reject_unknown_keys(check, allowed, context)
-      check_path = _require_string(check, "path", context)
-      if not check_path or "\x00" in check_path:
-        raise ConfigError(f"{context}.path is invalid")
+    elif check_type in FILE_CHECK_FIELDS:
+      _reject_unknown_keys(check, {"name", "type"} | FILE_CHECK_FIELDS[check_type] | COMMON_CHECK_FIELDS, context)
+      check_path = _parse_path(check, context)
       options = []
       if check_type == "file_metadata":
         options.extend((
@@ -535,6 +518,10 @@ def load_config(path: str) -> HealthConfig:
     raise ConfigError(
       f"configuration file is not valid JSON at line {error.lineno}, column {error.colno}"
     ) from error
+  except ValueError as error:
+    raise ConfigError("configuration file contains a JSON value that cannot be parsed safely") from error
+  except RecursionError as error:
+    raise ConfigError("configuration JSON is nested too deeply") from error
   return parse_config_document(document, path=path)
 
 
@@ -604,6 +591,7 @@ def resolve_tcp_candidates(
   check: TcpConnectCheck,
   *,
   resolver: Callable[..., object] = socket.getaddrinfo,
+  notes: list[str] | None = None,
 ) -> tuple[TcpCandidate, ...] | None:
   flags = getattr(socket, "AI_NUMERICHOST", 0) if check.host_kind in {"ipv4", "ipv6"} else 0
   try:
@@ -624,12 +612,13 @@ def resolve_tcp_candidates(
     identity = (candidate.family, candidate.socket_type, candidate.protocol, candidate.sockaddr)
     if identity in seen:
       continue
+    if len(candidates) == MAX_RESOLVER_CANDIDATES:
+      note = f"resolver returned more than {MAX_RESOLVER_CANDIDATES} candidates; only the first {MAX_RESOLVER_CANDIDATES} were tried"
+      if notes is not None and note not in notes:
+        notes.append(note)
+      break
     seen.add(identity)
     candidates.append(candidate)
-    if len(candidates) > MAX_RESOLVER_CANDIDATES:
-      raise ObservationError(
-        f"resolver returned more than the {MAX_RESOLVER_CANDIDATES}-candidate V1 limit"
-      )
   return tuple(candidates)
 
 
@@ -659,7 +648,8 @@ def attempt_tcp_candidates(
     try:
       client = socket_factory(candidate.family, candidate.socket_type, candidate.protocol)
     except OSError as error:
-      raise ObservationError("could not create a TCP socket") from error
+      attempts.append(TcpAttempt("socket unavailable", candidate.endpoint, error.errno))
+      continue
     try:
       try:
         client.settimeout(check.timeout_seconds)
@@ -690,7 +680,7 @@ def run_disk_check(
   try:
     usage = disk_usage(check.path)
   except (OSError, ValueError):
-    return CheckResult(check.name, check.type, "ERROR", target, "filesystem capacity could not be observed")
+    return CheckResult(check.name, check.type, "ERROR", target, "filesystem capacity could not be observed", "CRITICAL")
   try:
     total = int(usage.total)
     free = int(usage.free)
@@ -707,6 +697,10 @@ def run_disk_check(
   return CheckResult(check.name, check.type, status, target, evidence)
 
 
+def _with_notes(evidence: str, notes: Sequence[str]) -> str:
+  return "; ".join((evidence, *notes))
+
+
 def run_tcp_check(
   check: TcpConnectCheck,
   *,
@@ -714,7 +708,8 @@ def run_tcp_check(
   socket_factory: Callable[[int, int, int], socket.socket] = socket.socket,
 ) -> CheckResult:
   target = f"[{check.host}]:{check.port}" if check.host_kind == "ipv6" else f"{check.host}:{check.port}"
-  candidates = resolve_tcp_candidates(check, resolver=resolver)
+  notes: list[str] = []
+  candidates = resolve_tcp_candidates(check, resolver=resolver, notes=notes)
   if candidates is None:
     return CheckResult(check.name, check.type, "FAIL", target, "OS resolution produced no usable TCP candidate")
   connected, attempts = attempt_tcp_candidates(check, candidates, socket_factory=socket_factory)
@@ -725,47 +720,35 @@ def run_tcp_check(
       check.type,
       "PASS",
       target,
-      f"TCP handshake completed to {endpoint} after {len(attempts)} attempt(s)",
+      _with_notes(f"TCP handshake completed to {endpoint} after {len(attempts)} attempt(s)", notes),
     )
-  if not attempts:
-    raise ObservationError("no TCP candidate was attempted")
+  if all(attempt.outcome == "socket unavailable" for attempt in attempts):
+    raise ObservationError("could not create a TCP socket for any resolved candidate")
   last = attempts[-1]
   detail = last.outcome
-  if last.error_number is not None and last.outcome == "connection error":
+  if last.error_number is not None and last.outcome in {"connection error", "socket unavailable"}:
     detail += f" (errno {last.error_number})"
   return CheckResult(
     check.name,
     check.type,
     "FAIL",
     target,
-    f"no TCP handshake completed across {len(attempts)} candidate(s); last outcome: {detail}",
+    _with_notes(f"no TCP handshake completed across {len(attempts)} candidate(s); last outcome: {detail}", notes),
   )
-
-
-class LimitedRedirectHandler(urllib.request.HTTPRedirectHandler):
-  def __init__(self):
-    self.redirects = 0
-
-  def redirect_request(self, req, fp, code, msg, headers, newurl):
-    self.redirects += 1
-    if self.redirects > MAX_HTTP_REDIRECTS:
-      raise RedirectPolicyError("redirect limit exceeded")
-    destination = validate_redirect_url(req.full_url, newurl)
-    return super().redirect_request(req, fp, code, msg, headers, destination)
 
 
 def validate_redirect_url(current_url: str, new_url: str) -> str:
   """Resolve and validate a same-origin redirect without consulting proxy state."""
-  destination = urllib.parse.urljoin(current_url, new_url)
-  if len(destination) > 2048 or not destination.isascii() or display_safe(destination) != destination:
-    raise RedirectPolicyError("redirect URL is malformed")
   try:
+    destination = urllib.parse.urljoin(current_url, new_url)
     old = urllib.parse.urlsplit(current_url)
     new = urllib.parse.urlsplit(destination)
     old_port = old.port or (443 if old.scheme == "https" else 80)
     new_port = new.port or (443 if new.scheme == "https" else 80)
   except ValueError as exc:
     raise RedirectPolicyError("redirect URL is malformed") from exc
+  if len(destination) > 2048 or not destination.isascii() or display_safe(destination) != destination:
+    raise RedirectPolicyError("redirect URL is malformed")
   if (
     new.scheme != old.scheme or new.hostname != old.hostname or new_port != old_port
     or new.username is not None or new.password is not None or new.query or new.fragment
@@ -791,15 +774,20 @@ def _connect_tcp_target(
   resolver: Callable[..., object],
   socket_factory: Callable[[int, int, int], socket.socket],
   clock: Callable[[], float],
+  notes: list[str] | None = None,
 ) -> socket.socket:
   check = TcpConnectCheck("network", host, host_kind, port, 0.1)
-  candidates = resolve_tcp_candidates(check, resolver=resolver)
+  candidates = resolve_tcp_candidates(check, resolver=resolver, notes=notes)
   if not candidates:
     raise socket.gaierror("name resolution returned no usable address")
   last_error: OSError | None = None
   for candidate in candidates:
     remaining = _deadline_remaining(deadline, clock)
-    client = socket_factory(candidate.family, candidate.socket_type, candidate.protocol)
+    try:
+      client = socket_factory(candidate.family, candidate.socket_type, candidate.protocol)
+    except OSError as error:
+      last_error = error
+      continue
     try:
       client.settimeout(remaining)
       client.connect(candidate.sockaddr)
@@ -840,6 +828,12 @@ def _parse_http_head(data: bytes) -> tuple[int, str | None]:
   return status, locations[0] if locations else None
 
 
+@functools.lru_cache(maxsize=1)
+def default_tls_context() -> ssl.SSLContext:
+  """Load the default CA store once; every HTTPS hop and certificate check shares this context."""
+  return ssl.create_default_context()
+
+
 def _one_http_head(
   url: str,
   deadline: float,
@@ -848,6 +842,7 @@ def _one_http_head(
   socket_factory: Callable[[int, int, int], socket.socket],
   context_factory: Callable[[], ssl.SSLContext],
   clock: Callable[[], float],
+  notes: list[str] | None = None,
 ) -> tuple[int, str | None]:
   parsed = urllib.parse.urlsplit(url)
   assert parsed.hostname is not None
@@ -855,7 +850,7 @@ def _one_http_head(
   port = parsed.port or (443 if parsed.scheme == "https" else 80)
   client = _connect_tcp_target(
     host, host_kind, port, deadline,
-    resolver=resolver, socket_factory=socket_factory, clock=clock,
+    resolver=resolver, socket_factory=socket_factory, clock=clock, notes=notes,
   )
   stream = client
   try:
@@ -902,15 +897,16 @@ def run_http_head(
   *,
   resolver: Callable[..., object] = socket.getaddrinfo,
   socket_factory: Callable[[int, int, int], socket.socket] = socket.socket,
-  context_factory: Callable[[], ssl.SSLContext] = ssl.create_default_context,
+  context_factory: Callable[[], ssl.SSLContext] = default_tls_context,
   clock: Callable[[], float] = time.monotonic,
+  notes: list[str] | None = None,
 ) -> int:
   deadline = clock() + check.timeout_seconds
   current = check.target
   for redirects in range(MAX_HTTP_REDIRECTS + 1):
     status, location = _one_http_head(
       current, deadline, resolver=resolver, socket_factory=socket_factory,
-      context_factory=context_factory, clock=clock,
+      context_factory=context_factory, clock=clock, notes=notes,
     )
     if status not in {301, 302, 303, 307, 308} or location is None:
       return status
@@ -925,16 +921,12 @@ def _options(check: GenericCheck) -> dict[str, object]:
 
 
 def hash_regular_file(path: str, expected_metadata: os.stat_result) -> str:
-  flags = os.O_RDONLY
-  for flag_name in ("O_CLOEXEC", "O_NOFOLLOW", "O_NONBLOCK"):
-    flags |= getattr(os, flag_name, 0)
   try:
-    descriptor = os.open(path, flags)
+    descriptor, before = open_regular_file(path)
   except OSError as error:
     raise ObservationError("file could not be opened safely for hashing") from error
   try:
-    before = os.fstat(descriptor)
-    if not stat.S_ISREG(before.st_mode) or _metadata_identity(before) != _metadata_identity(expected_metadata):
+    if _metadata_identity(before) != _metadata_identity(expected_metadata):
       raise ObservationError("file identity changed before hashing")
     if before.st_size > MAX_HASH_BYTES:
       raise ObservationError(f"file exceeds {MAX_HASH_BYTES}-byte hash limit")
@@ -958,150 +950,181 @@ def hash_regular_file(path: str, expected_metadata: os.stat_result) -> str:
     os.close(descriptor)
 
 
-def _stop_process_group(process: subprocess.Popen[bytes]) -> None:
-  running = process.poll() is None
-  try:
-    os.killpg(process.pid, signal.SIGKILL)
-  except OSError:
-    if running:
-      try:
-        process.kill()
-      except OSError:
-        pass
-  try:
-    process.wait(timeout=1.0)
-  except (OSError, subprocess.SubprocessError):
-    pass
-
-
 def run_silent_command(arguments: Sequence[str], timeout_seconds: float) -> int:
-  process = subprocess.Popen(
-    list(arguments), stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-    stderr=subprocess.DEVNULL,
-    env={**os.environ, "LC_ALL": "C", "SYSTEMD_PAGER": "", "SYSTEMD_COLORS": "0"},
-    start_new_session=True,
-  )
   try:
-    return process.wait(timeout=timeout_seconds)
-  except subprocess.TimeoutExpired as error:
-    _stop_process_group(process)
+    result = run_bounded(
+      arguments, timeout=timeout_seconds, max_output_bytes=0, capture=False,
+      environment=child_environment(SYSTEMD_PAGER="", SYSTEMD_COLORS="0"),
+    )
+  except ProcessTimeoutError as error:
     raise ObservationError("command exceeded its deadline") from error
-  except BaseException:
-    _stop_process_group(process)
-    raise
+  except ProcessSpawnError as error:
+    raise ObservationError("command could not be started") from error
+  return result.returncode
+
+
+def _http_check(check: GenericCheck, options: Mapping[str, object]) -> CheckResult:
+  notes: list[str] = []
+  try:
+    status_code = run_http_head(check, notes=notes)
+  except ssl.SSLError as error:
+    return CheckResult(check.name, check.type, "FAIL", check.target, _with_notes(f"TLS layer failed: {type(error).__name__}", notes), check.severity)
+  except socket.gaierror as error:
+    return CheckResult(check.name, check.type, "FAIL", check.target, _with_notes(f"resolution layer failed: {type(error).__name__}", notes), check.severity)
+  except (OSError, TimeoutError) as error:
+    return CheckResult(check.name, check.type, "FAIL", check.target, _with_notes(f"TCP layer failed: {type(error).__name__}", notes), check.severity)
+  expected = int(options["expected_status"])
+  status = "PASS" if status_code == expected else "FAIL"
+  return CheckResult(check.name, check.type, status, check.target, _with_notes(f"HTTP status {status_code}; required {expected}", notes), "OK" if status == "PASS" else check.severity)
+
+
+def _dns_check(check: GenericCheck, options: Mapping[str, object]) -> CheckResult:
+  try:
+    records = socket.getaddrinfo(check.target, None, socket.AF_UNSPEC, socket.SOCK_STREAM)
+  except socket.gaierror:
+    return CheckResult(check.name, check.type, "FAIL", check.target, "OS resolution returned no usable address", check.severity)
+  addresses: list[str] = []
+  notes = []
+  try:
+    for record in records:
+      address = str(ipaddress.ip_address(record[4][0].split("%", 1)[0]))
+      if address in addresses:
+        continue
+      if len(addresses) == MAX_RESOLVER_CANDIDATES:
+        notes.append(f"resolver returned more than {MAX_RESOLVER_CANDIDATES} addresses; only the first {MAX_RESOLVER_CANDIDATES} are reported")
+        break
+      addresses.append(address)
+  except (IndexError, TypeError, ValueError):
+    return CheckResult(check.name, check.type, "ERROR", check.target, "OS resolution returned malformed address evidence", "CRITICAL")
+  status = "PASS" if addresses else "FAIL"
+  evidence = _with_notes(f"resolved addresses: {', '.join(sorted(addresses)) or 'none'}", notes)
+  return CheckResult(check.name, check.type, status, check.target, evidence, "OK" if status == "PASS" else check.severity)
+
+
+def _certificate_check(check: GenericCheck, options: Mapping[str, object]) -> CheckResult:
+  host, port = str(options["host"]), int(options["port"])
+  notes: list[str] = []
+  try:
+    deadline = time.monotonic() + check.timeout_seconds
+    context = default_tls_context()
+    _, host_kind = parse_host(host, "certificate host")
+    with _connect_tcp_target(
+      host, host_kind, port, deadline, resolver=socket.getaddrinfo,
+      socket_factory=socket.socket, clock=time.monotonic, notes=notes,
+    ) as tcp:
+      tcp.settimeout(_deadline_remaining(deadline, time.monotonic))
+      with context.wrap_socket(tcp, server_hostname=host) as tls:
+        certificate = tls.getpeercert()
+        _deadline_remaining(deadline, time.monotonic)
+    not_after = certificate.get("notAfter")
+    if not isinstance(not_after, str):
+      raise ValueError
+    remaining = ssl.cert_time_to_seconds(not_after) - time.time()
+  except ssl.SSLCertVerificationError as error:
+    code = getattr(error, "verify_code", None)
+    message = getattr(error, "verify_message", None) or type(error).__name__
+    if code == X509_V_ERR_CERT_HAS_EXPIRED:
+      finding, severity = f"certificate has expired ({message})", "CRITICAL"
+    elif code == X509_V_ERR_CERT_NOT_YET_VALID:
+      finding, severity = f"certificate is not yet valid ({message})", "CRITICAL"
+    else:
+      finding, severity = f"certificate verification failed ({message})", check.severity
+    return CheckResult(check.name, check.type, "FAIL", check.target, _with_notes(f"{finding}; revocation not checked", notes), severity)
+  except (OSError, ssl.SSLError, ValueError, ObservationError) as error:
+    evidence = f"trusted TLS certificate observation failed ({type(error).__name__}); revocation not checked"
+    return CheckResult(check.name, check.type, "ERROR", check.target, _with_notes(evidence, notes), "CRITICAL")
+  days = remaining / 86400
+  critical, warn = int(options["critical_days"]), int(options["warn_days"])
+  if days < critical:
+    status, severity = "FAIL", "CRITICAL"
+  elif days < warn:
+    status, severity = "FAIL", "WARN"
+  else:
+    status, severity = "PASS", "OK"
+  evidence = _with_notes(f"trusted certificate expires in {days:.2f} days; revocation not checked", notes)
+  return CheckResult(check.name, check.type, status, check.target, evidence, severity)
+
+
+def _process_check(check: GenericCheck, options: Mapping[str, object]) -> CheckResult:
+  pid = int(options["pid"])
+  try:
+    metadata = os.stat(f"/proc/{pid}", follow_symlinks=False)
+    exists = stat.S_ISDIR(metadata.st_mode)
+  except OSError:
+    exists = False
+  return CheckResult(check.name, check.type, "PASS" if exists else "FAIL", check.target, "process directory exists" if exists else "process directory was not observed", "OK" if exists else check.severity)
+
+
+def _service_check(check: GenericCheck, options: Mapping[str, object]) -> CheckResult:
+  systemctl = resolve_executable("systemctl")
+  if systemctl is None:
+    return CheckResult(check.name, check.type, "ERROR", check.target, "systemctl was not found in a trusted PATH directory", "CRITICAL")
+  try:
+    return_code = run_silent_command(
+      [systemctl, "is-active", "--system", "--quiet", "--", check.target],
+      check.timeout_seconds,
+    )
+  except ObservationError as error:
+    return CheckResult(check.name, check.type, "ERROR", check.target, f"systemd state could not be observed: {error}", "CRITICAL")
+  if return_code == 0:
+    return CheckResult(check.name, check.type, "PASS", check.target, "service is active", "OK")
+  if return_code in {3, 4}:
+    return CheckResult(check.name, check.type, "FAIL", check.target, f"service is not active (status {return_code})", check.severity)
+  return CheckResult(check.name, check.type, "ERROR", check.target, f"systemctl could not determine the service state (status {return_code})", "CRITICAL")
+
+
+def _file_check(check: GenericCheck, options: Mapping[str, object]) -> CheckResult:
+  path = os.path.abspath(check.target)
+  try:
+    metadata = os.lstat(path)
+  except OSError:
+    return CheckResult(check.name, check.type, "FAIL", path, "path was not observed", check.severity)
+  if stat.S_ISLNK(metadata.st_mode):
+    return CheckResult(check.name, check.type, "ERROR", path, "final-component symlinks are not followed", "CRITICAL")
+  if check.type == "file_exists":
+    return CheckResult(check.name, check.type, "PASS", path, "path exists", "OK")
+  if not stat.S_ISREG(metadata.st_mode):
+    return CheckResult(check.name, check.type, "FAIL", path, "path is not a regular file", check.severity)
+  if check.type == "file_metadata":
+    minimum, maximum = int(options["minimum_bytes"]), int(options["maximum_bytes"])
+    passed = minimum <= metadata.st_size <= maximum
+    return CheckResult(check.name, check.type, "PASS" if passed else "FAIL", path, f"size {metadata.st_size} bytes; required {minimum}-{maximum}", "OK" if passed else check.severity)
+  try:
+    observed_digest = hash_regular_file(path, metadata)
+  except ObservationError as error:
+    return CheckResult(check.name, check.type, "ERROR", path, str(error), "CRITICAL")
+  passed = observed_digest == options["sha256"]
+  return CheckResult(check.name, check.type, "PASS" if passed else "FAIL", path, f"SHA-256 {'matched' if passed else 'did not match'}", "OK" if passed else check.severity)
+
+
+GENERIC_CHECK_RUNNERS = {
+  "http": _http_check,
+  "https": _http_check,
+  "dns": _dns_check,
+  "certificate_expiry": _certificate_check,
+  "process": _process_check,
+  "systemd_service": _service_check,
+  "file_exists": _file_check,
+  "file_metadata": _file_check,
+  "config_hash": _file_check,
+}
 
 
 def run_generic_check(check: GenericCheck) -> CheckResult:
-  options = _options(check)
-  if check.type in {"http", "https"}:
-    try:
-      status_code = run_http_head(check)
-    except urllib.error.URLError as error:
-      reason = error.reason
-      if isinstance(reason, ssl.SSLError):
-        layer = "TLS"
-      elif isinstance(reason, socket.gaierror):
-        layer = "resolution"
-      elif isinstance(reason, (ConnectionError, TimeoutError, socket.timeout, OSError)):
-        layer = "TCP"
-      else:
-        layer = "HTTP"
-      return CheckResult(check.name, check.type, "FAIL", check.target, f"{layer} layer failed: {type(reason).__name__}", check.severity)
-    except ssl.SSLError as error:
-      return CheckResult(check.name, check.type, "FAIL", check.target, f"TLS layer failed: {type(error).__name__}", check.severity)
-    except socket.gaierror as error:
-      return CheckResult(check.name, check.type, "FAIL", check.target, f"resolution layer failed: {type(error).__name__}", check.severity)
-    except (OSError, TimeoutError) as error:
-      return CheckResult(check.name, check.type, "FAIL", check.target, f"TCP layer failed: {type(error).__name__}", check.severity)
-    expected = int(options["expected_status"])
-    status = "PASS" if status_code == expected else "FAIL"
-    return CheckResult(check.name, check.type, status, check.target, f"HTTP status {status_code}; required {expected}", "OK" if status == "PASS" else check.severity)
-  if check.type == "dns":
-    try:
-      records = socket.getaddrinfo(check.target, None, socket.AF_UNSPEC, socket.SOCK_STREAM)
-    except socket.gaierror:
-      return CheckResult(check.name, check.type, "FAIL", check.target, "OS resolution returned no usable address", check.severity)
-    addresses = set()
-    try:
-      for record in records:
-        addresses.add(str(ipaddress.ip_address(record[4][0].split("%", 1)[0])))
-        if len(addresses) > MAX_RESOLVER_CANDIDATES:
-          return CheckResult(check.name, check.type, "ERROR", check.target, "OS resolution exceeded the 16-address limit", "CRITICAL")
-    except (IndexError, TypeError, ValueError):
-      return CheckResult(check.name, check.type, "ERROR", check.target, "OS resolution returned malformed address evidence", "CRITICAL")
-    addresses = sorted(addresses)
-    status = "PASS" if addresses else "FAIL"
-    return CheckResult(check.name, check.type, status, check.target, f"resolved addresses: {', '.join(addresses) or 'none'}", "OK" if status == "PASS" else check.severity)
-  if check.type == "certificate_expiry":
-    host, port = str(options["host"]), int(options["port"])
-    try:
-      deadline = time.monotonic() + check.timeout_seconds
-      context = ssl.create_default_context()
-      _, host_kind = parse_host(host, "certificate host")
-      with _connect_tcp_target(
-        host, host_kind, port, deadline, resolver=socket.getaddrinfo,
-        socket_factory=socket.socket, clock=time.monotonic,
-      ) as tcp:
-        tcp.settimeout(_deadline_remaining(deadline, time.monotonic))
-        with context.wrap_socket(tcp, server_hostname=host) as tls:
-          certificate = tls.getpeercert()
-          _deadline_remaining(deadline, time.monotonic)
-      not_after = certificate.get("notAfter")
-      if not isinstance(not_after, str):
-        raise ValueError
-      remaining = ssl.cert_time_to_seconds(not_after) - time.time()
-    except (OSError, ssl.SSLError, ValueError, ObservationError):
-      return CheckResult(check.name, check.type, "ERROR", check.target, "trusted TLS certificate observation failed; revocation not checked", "CRITICAL")
-    days = remaining / 86400
-    critical, warn = int(options["critical_days"]), int(options["warn_days"])
-    if days < critical:
-      status, severity = "FAIL", "CRITICAL"
-    elif days < warn:
-      status, severity = "FAIL", "WARN"
-    else:
-      status, severity = "PASS", "OK"
-    return CheckResult(check.name, check.type, status, check.target, f"trusted certificate expires in {days:.2f} days; revocation not checked", severity)
-  if check.type == "process":
-    pid = int(options["pid"])
-    try:
-      metadata = os.stat(f"/proc/{pid}", follow_symlinks=False)
-      exists = stat.S_ISDIR(metadata.st_mode)
-    except OSError:
-      exists = False
-    return CheckResult(check.name, check.type, "PASS" if exists else "FAIL", check.target, "process directory exists" if exists else "process directory was not observed", "OK" if exists else check.severity)
-  if check.type == "systemd_service":
-    try:
-      return_code = run_silent_command(
-        ["systemctl", "is-active", "--system", "--quiet", "--", check.target],
-        check.timeout_seconds,
-      )
-    except (OSError, subprocess.SubprocessError, ObservationError):
-      return CheckResult(check.name, check.type, "ERROR", check.target, "systemd state could not be observed", "CRITICAL")
-    active = return_code == 0
-    return CheckResult(check.name, check.type, "PASS" if active else "FAIL", check.target, "service is active" if active else f"service is not active (status {return_code})", "OK" if active else check.severity)
-  if check.type in {"file_exists", "file_metadata", "config_hash"}:
-    path = os.path.abspath(check.target)
-    try:
-      metadata = os.lstat(path)
-    except OSError:
-      return CheckResult(check.name, check.type, "FAIL", path, "path was not observed", check.severity)
-    if stat.S_ISLNK(metadata.st_mode):
-      return CheckResult(check.name, check.type, "ERROR", path, "final-component symlinks are not followed", "CRITICAL")
-    if check.type == "file_exists":
-      return CheckResult(check.name, check.type, "PASS", path, "path exists", "OK")
-    if not stat.S_ISREG(metadata.st_mode):
-      return CheckResult(check.name, check.type, "FAIL", path, "path is not a regular file", check.severity)
-    if check.type == "file_metadata":
-      minimum, maximum = int(options["minimum_bytes"]), int(options["maximum_bytes"])
-      passed = minimum <= metadata.st_size <= maximum
-      return CheckResult(check.name, check.type, "PASS" if passed else "FAIL", path, f"size {metadata.st_size} bytes; required {minimum}-{maximum}", "OK" if passed else check.severity)
-    try:
-      observed_digest = hash_regular_file(path, metadata)
-    except ObservationError as error:
-      return CheckResult(check.name, check.type, "ERROR", path, str(error), "CRITICAL")
-    passed = observed_digest == options["sha256"]
-    return CheckResult(check.name, check.type, "PASS" if passed else "FAIL", path, f"SHA-256 {'matched' if passed else 'did not match'}", "OK" if passed else check.severity)
-  raise ObservationError("configuration produced an unsupported generic check type")
+  runner = GENERIC_CHECK_RUNNERS.get(check.type)
+  if runner is None:
+    raise ObservationError("configuration produced an unsupported generic check type")
+  return runner(check, _options(check))
+
+
+def _error_result(check: HealthCheck, error: Exception) -> CheckResult:
+  if isinstance(error, ObservationError):
+    evidence = str(error)
+  elif isinstance(error, OSError):
+    evidence = f"operating-system observation failed ({type(error).__name__})"
+  else:
+    evidence = f"check could not be evaluated ({type(error).__name__})"
+  return CheckResult(check.name, check.type, "ERROR", _check_target(check), evidence, "CRITICAL")
 
 
 def run_check(check: HealthCheck) -> CheckResult:
@@ -1109,18 +1132,28 @@ def run_check(check: HealthCheck) -> CheckResult:
   result = None
   attempts = 0
   for attempts in range(1, check.retries + 2):
-    if isinstance(check, DiskFreeCheck):
-      result = run_disk_check(check)
-    elif isinstance(check, TcpConnectCheck):
-      result = run_tcp_check(check)
-    elif isinstance(check, GenericCheck):
-      result = run_generic_check(check)
-    else:
-      raise ObservationError("configuration produced an unsupported check type")
+    if attempts > 1:
+      time.sleep(min(RETRY_BACKOFF_SECONDS * (attempts - 1), MAX_RETRY_BACKOFF_SECONDS))
+    try:
+      if isinstance(check, DiskFreeCheck):
+        result = run_disk_check(check)
+      elif isinstance(check, TcpConnectCheck):
+        result = run_tcp_check(check)
+      elif isinstance(check, GenericCheck):
+        result = run_generic_check(check)
+      else:
+        raise ObservationError("configuration produced an unsupported check type")
+    except Exception as error:
+      result = _error_result(check, error)
     if result.status == "PASS":
       break
   assert result is not None
-  severity = "OK" if result.status == "PASS" else result.severity if result.severity in {"WARN", "CRITICAL"} else check.severity
+  if result.status == "PASS":
+    severity = "OK"
+  elif result.status == "ERROR":
+    severity = "CRITICAL"
+  else:
+    severity = result.severity if result.severity in {"WARN", "CRITICAL"} else check.severity
   return replace(result, severity=severity, elapsed_seconds=time.monotonic() - started, attempts=attempts)
 
 
@@ -1141,8 +1174,8 @@ def evaluate_config(
       failed_dependencies = [name for name in check.depends_on if completed[name].status != "PASS"]
       if failed_dependencies:
         completed[check.name] = CheckResult(
-          check.name, check.type, "FAIL", _check_target(check),
-          f"dependency did not pass: {', '.join(failed_dependencies)}", check.severity,
+          check.name, check.type, "SKIPPED", _check_target(check),
+          f"dependency did not pass: {', '.join(failed_dependencies)}", "OK", attempts=0,
         )
       else:
         runnable.append(check)
@@ -1153,11 +1186,9 @@ def evaluate_config(
           check = futures[future]
           try:
             result = future.result()
-          except ObservationError as error:
-            result = CheckResult(check.name, check.type, "ERROR", _check_target(check), str(error), "CRITICAL")
-          except OSError:
-            result = CheckResult(check.name, check.type, "ERROR", _check_target(check), "operating-system observation failed", "CRITICAL")
-          if result.name != check.name or result.type != check.type or result.status not in {"PASS", "FAIL", "ERROR"}:
+          except Exception as error:
+            result = _error_result(check, error)
+          if result.name != check.name or result.type != check.type or result.status not in {"PASS", "FAIL", "ERROR", "SKIPPED"}:
             raise ObservationError("check executor returned an invalid result")
           completed[check.name] = result
     for check in ready:
@@ -1179,6 +1210,7 @@ def render_report(config: HealthConfig, results: Sequence[CheckResult]) -> str:
   passes = sum(result.status == "PASS" for result in results)
   failures = sum(result.status == "FAIL" for result in results)
   errors = sum(result.status == "ERROR" for result in results)
+  skipped = sum(result.status == "SKIPPED" for result in results)
   lines = [
     "HealthCtl: configured health criteria",
     "",
@@ -1204,11 +1236,13 @@ def render_report(config: HealthConfig, results: Sequence[CheckResult]) -> str:
     f"  PASS: {passes}",
     f"  FAIL: {failures}",
     f"  ERROR: {errors}",
+    f"  SKIPPED: {skipped}",
     "",
     "Interpretation limits",
     "  PASS means only that the caller-configured criterion was satisfied during this invocation.",
     "  FAIL means the configured criterion was observed and was not satisfied.",
     "  ERROR means that criterion could not be evaluated trustworthily.",
+    "  SKIPPED means the check was not run because a dependency did not pass.",
     "  These results do not prove overall host, application, or service health or identify root cause.",
   ))
   return "\n".join(lines)
@@ -1274,18 +1308,27 @@ def main(argv: Sequence[str] | None = None) -> int:
     print_safe("healthctl: internal error: unexpected failure", file=sys.stderr)
     return 3
   exit_code = result_exit_code(results)
-  errors = sum(result.status == "ERROR" for result in results)
-  critical = sum(result.status != "PASS" and result.severity == "CRITICAL" for result in results)
-  warnings = sum(result.status != "PASS" and result.severity == "WARN" for result in results)
-  status = "CRITICAL" if errors or critical else "WARN" if warnings else "OK"
-  finding = f"{sum(result.status == 'PASS' for result in results)} of {len(results)} checks passed; {warnings} warning and {critical} critical/error results"
+  summary = {
+    "pass": sum(result.status == "PASS" for result in results),
+    "fail_warn": sum(result.status == "FAIL" and result.severity == "WARN" for result in results),
+    "fail_critical": sum(result.status == "FAIL" and result.severity != "WARN" for result in results),
+    "error": sum(result.status == "ERROR" for result in results),
+    "skipped": sum(result.status == "SKIPPED" for result in results),
+  }
+  status = "CRITICAL" if summary["error"] or summary["fail_critical"] else "WARN" if summary["fail_warn"] else "OK"
+  finding = (
+    f"{summary['pass']} of {len(results)} checks passed; {summary['fail_warn']} warning and "
+    f"{summary['fail_critical'] + summary['error']} critical/error results"
+  )
+  if summary["skipped"]:
+    finding += f"; {summary['skipped']} skipped"
   next_action = "review failed checks in dependency order" if exit_code else "all selected criteria passed during this invocation"
   conclusion = make_conclusion(status, config.path, finding, next_action)
   record = OutputRecord(
     tool="healthctl", status=status, target=config.path,
     observations={
       "checks": results,
-      "summary": {"ok": sum(result.status == "PASS" for result in results), "warn": warnings, "critical": critical, "error": errors},
+      "summary": summary,
       "profile": args.profile, "group": args.group, "max_workers": config.max_workers,
     },
     conclusion=conclusion, next_action=next_action + ".", warnings=(),
@@ -1294,7 +1337,8 @@ def main(argv: Sequence[str] | None = None) -> int:
   brief = "\n".join([
     f"Configuration: {display_safe(config.path)}",
     f"Checks: {len(results)}",
-    f"OK/WARN/CRITICAL: {sum(result.status == 'PASS' for result in results)}/{warnings}/{critical}",
+    f"PASS/FAIL/ERROR/SKIPPED: {summary['pass']}/{summary['fail_warn'] + summary['fail_critical']}/{summary['error']}/{summary['skipped']}",
+    *(f"  [{result.status}] {display_safe(result.name)}" for result in results if result.status != "PASS"),
   ])
   try:
     emit_output(
@@ -1305,6 +1349,9 @@ def main(argv: Sequence[str] | None = None) -> int:
   except OutputError as error:
     print_safe(f"healthctl: output error: {display_safe(error)}", file=sys.stderr)
     return 3
+  except KeyboardInterrupt:
+    print_safe("healthctl: interrupted", file=sys.stderr)
+    return 130
   return exit_code
 
 

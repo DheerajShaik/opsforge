@@ -66,4 +66,5 @@ class GlobalBudgetTests(unittest.TestCase):
       result = diskhound.scan(temp, diskhound.ScanOptions(max_entries=10, max_depth=1, excludes=('excluded',)))
       self.assertEqual(result.excluded_entries, 1)
       self.assertEqual(result.depth_limited_directories, 1)
-      self.assertFalse(result.incomplete)
+      self.assertTrue(result.incomplete)
+      self.assertFalse(any(failure.category == 'entry-limit' for failure in result.failures))

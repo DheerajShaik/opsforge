@@ -26,6 +26,17 @@ class VerificationTests(unittest.TestCase):
   def test_ip_identity_and_missing_san(self):
     self.assertTrue(c.verify_hostname(c.parse_target("192.0.2.1"), certificate((("IP", "192.0.2.1"),))))
     self.assertIsNone(c.verify_hostname(c.parse_target("example.com"), certificate(())))
+    self.assertFalse(c.verify_hostname(c.parse_target("example.com"), certificate((("IP", "192.0.2.1"),))))
+
+  def test_identity_follows_the_sni_name(self):
+    cert = certificate((("DNS", "api.example.com"),))
+    by_ip = c.replace(c.parse_target("192.0.2.10:443"), sni_name="api.example.com")
+    by_host = c.replace(c.parse_target("node5.internal"), sni_name="api.example.com")
+    misrouted = c.replace(c.parse_target("node5.internal"), sni_name="api.example.com")
+    self.assertTrue(c.verify_hostname(by_ip, cert))
+    self.assertTrue(c.verify_hostname(by_host, cert))
+    self.assertFalse(c.verify_hostname(misrouted, certificate((("DNS", "node5.internal"),))))
+    self.assertEqual(c.parse_target("example.com.").sni_name, "example.com")
 
   def test_resolver_candidates_are_deduplicated_and_bounded(self):
     record = (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("192.0.2.1", 443))
@@ -69,9 +80,37 @@ class VerificationTests(unittest.TestCase):
       target, cert, resolver=lambda *args: [record], socket_factory=lambda *args: Tcp(),
       context_factory=lambda: Context(b"different"),
     )
-    self.assertTrue(changed.trust_verified)
+    self.assertIsNone(changed.trust_verified)
     self.assertFalse(changed.leaf_matches_observation)
     self.assertIn("different leaf", changed.verification_error)
+
+  def test_trust_is_verified_on_the_observed_candidate_only(self):
+    class Tcp:
+      connected = []
+      def settimeout(self, value): pass
+      def connect(self, address): Tcp.connected.append(address)
+      def close(self): pass
+    class Context:
+      def wrap_socket(self, tcp, server_hostname=None): raise OSError("refused")
+    observed = c.ConnectionCandidate(socket.AF_INET, socket.SOCK_STREAM, 6, ("192.0.2.7", 443))
+    resolver_calls = []
+    evidence = c.verify_endpoint(
+      c.parse_target("example.com"), certificate((("DNS", "example.com"),)),
+      resolver=lambda *args: resolver_calls.append(args) or [], socket_factory=lambda *args: Tcp(),
+      context_factory=Context, candidate=observed,
+    )
+    self.assertEqual((Tcp.connected, resolver_calls), ([("192.0.2.7", 443)], []))
+    self.assertIsNone(evidence.trust_verified)
+
+  def test_status_ranking_and_aggregation(self):
+    verified = c.VerificationEvidence(True, True, None, 2, True)
+    expired = c.ValidityAssessment(c.ValidityStatus.EXPIRED, None, False, 1)
+    critical = c.ValidityAssessment(c.ValidityStatus.CRITICAL, None, True, 1)
+    self.assertEqual(c.classify_target(expired, verified, True), "EXPIRED")
+    self.assertEqual(c.classify_target(critical, verified, None), "CRITICAL")
+    self.assertEqual(c.aggregate_status(["VALID", "EXPIRED", "WARNING"]), "EXPIRED")
+    self.assertEqual(c.aggregate_status(["ERROR", "ERROR"]), "ERROR")
+    self.assertEqual(c.aggregate_status(["ERROR", "VALID"]), "PARTIAL")
 
 
 if __name__ == "__main__":

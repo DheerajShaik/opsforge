@@ -8,12 +8,14 @@ from datetime import date, datetime
 from decimal import Decimal
 from enum import Enum
 import json
+import math
 import os
-from pathlib import Path
+import secrets
 import stat
 import sys
-import unicodedata
 from typing import Any, Mapping, Sequence, TextIO
+
+from .text import sanitize_text
 
 
 SCHEMA_VERSION = 1
@@ -46,7 +48,7 @@ class OutputRecord:
       "observations": to_jsonable(self.observations),
       "conclusion": self.conclusion,
       "next_action": self.next_action,
-      "warnings": [str(item) for item in self.warnings],
+      "warnings": [self.warnings] if isinstance(self.warnings, str) else [str(item) for item in self.warnings],
       "elapsed_seconds": round(max(0.0, float(self.elapsed_seconds)), 6),
     }
 
@@ -82,41 +84,23 @@ def add_output_arguments(parser: argparse.ArgumentParser) -> None:
 
 
 def validate_output_arguments(parser: argparse.ArgumentParser, arguments: argparse.Namespace) -> None:
+  if getattr(arguments, "output", None) == "":
+    parser.error("--output requires a non-empty path")
   if getattr(arguments, "force", False) and not getattr(arguments, "output", None):
     parser.error("--force requires --output")
 
 
 def make_conclusion(status: str, target: object, finding: str, next_action: str) -> str:
   """Build the required deterministic human conclusion line."""
-  clean_status = _single_line(status).upper()
-  clean_target = _single_line(target)
+  clean_status = sanitize_text(str(status).upper())
+  clean_target = sanitize_text(target)
   clean_finding = _sentence(finding)
   clean_next = _sentence(next_action)
   return f"Conclusion: [{clean_status}] {clean_target} — {clean_finding} Next: {clean_next}"
 
 
-def _single_line(value: object) -> str:
-  text = str(value)
-  pieces = []
-  for character in text:
-    codepoint = ord(character)
-    category = unicodedata.category(character)
-    if character == "\\":
-      pieces.append("\\\\")
-    elif category in {"Cc", "Cf", "Cs", "Zl", "Zp"}:
-      if codepoint <= 0xFF:
-        pieces.append(f"\\x{codepoint:02x}")
-      elif codepoint <= 0xFFFF:
-        pieces.append(f"\\u{codepoint:04x}")
-      else:
-        pieces.append(f"\\U{codepoint:08x}")
-    else:
-      pieces.append(character)
-  return "".join(pieces)
-
-
 def _sentence(value: object) -> str:
-  text = _single_line(value).strip()
+  text = sanitize_text(value).strip()
   if not text:
     return "no additional action is available."
   return text if text.endswith((".", "!", "?")) else text + "."
@@ -124,6 +108,8 @@ def _sentence(value: object) -> str:
 
 def to_jsonable(value: Any) -> Any:
   """Convert known diagnostic values into deterministic JSON-compatible data."""
+  if isinstance(value, float) and not math.isfinite(value):
+    return None
   if value is None or isinstance(value, (bool, int, float, str)):
     return value
   if isinstance(value, Decimal):
@@ -147,56 +133,97 @@ def _json_text(record: OutputRecord) -> str:
     ensure_ascii=True,
     sort_keys=True,
     separators=(",", ":"),
+    allow_nan=False,
   )
 
 
 def _bounded_output(text: str) -> tuple[str, bytes]:
   rendered = text.rstrip("\n")
-  encoded = (rendered + "\n").encode("utf-8")
+  encoded = (rendered + "\n").encode("utf-8", errors="backslashreplace")
   if len(encoded) > MAX_OUTPUT_BYTES:
     raise OutputError("rendered output exceeds the 16 MiB safety limit")
   return rendered, encoded
 
 
-def _write_new_or_replace(path: str, encoded: bytes, *, force: bool) -> None:
-  flags = os.O_WRONLY
-  if hasattr(os, "O_CLOEXEC"):
-    flags |= os.O_CLOEXEC
-  if hasattr(os, "O_NOFOLLOW"):
-    flags |= os.O_NOFOLLOW
-  if hasattr(os, "O_NONBLOCK"):
-    flags |= os.O_NONBLOCK
+def _create_exclusive(path: str) -> int:
+  flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+  return os.open(path, flags, 0o600)
+
+
+def _write_and_sync(descriptor: int, encoded: bytes) -> None:
+  view = memoryview(encoded)
+  while view:
+    view = view[os.write(descriptor, view):]
+  os.fsync(descriptor)
+
+
+def _write_new(path: str, encoded: bytes) -> None:
   try:
-    if force:
-      try:
-        descriptor = os.open(path, flags)
-      except FileNotFoundError:
-        descriptor = os.open(path, flags | os.O_CREAT | os.O_EXCL, 0o600)
-    else:
-      descriptor = os.open(path, flags | os.O_CREAT | os.O_EXCL, 0o600)
+    descriptor = _create_exclusive(path)
   except FileExistsError as error:
-    raise OutputError(f"output file already exists: {_single_line(path)}; use --force to replace it") from error
+    raise OutputError(f"output file already exists: {sanitize_text(path)}; use --force to replace it") from error
   except OSError as error:
-    raise OutputError(f"could not open output file {_single_line(path)}: {_single_line(error)}") from error
+    raise OutputError(f"could not open output file {sanitize_text(path)}: {sanitize_text(error)}") from error
   try:
-    metadata = os.fstat(descriptor)
-    if not stat.S_ISREG(metadata.st_mode):
-      raise OutputError(f"output target is not a regular file: {_single_line(path)}")
-    if force and metadata.st_nlink != 1:
-      raise OutputError(f"refusing to replace multiply-linked output file: {_single_line(path)}")
-    if force:
-      os.fchmod(descriptor, 0o600)
-      os.ftruncate(descriptor, 0)
-    with os.fdopen(descriptor, "wb", closefd=True) as handle:
-      descriptor = -1
-      handle.write(encoded)
-  except OutputError:
+    _write_and_sync(descriptor, encoded)
+  except BaseException as error:
+    os.close(descriptor)
+    try:
+      os.unlink(path)
+    except OSError:
+      pass
+    if isinstance(error, OSError):
+      raise OutputError(f"could not write output file {sanitize_text(path)}: {sanitize_text(error)}") from error
     raise
+  os.close(descriptor)
+
+
+def _replace_atomically(path: str, encoded: bytes) -> None:
+  try:
+    existing = os.lstat(path)
+  except FileNotFoundError:
+    existing = None
   except OSError as error:
-    raise OutputError(f"could not write output file {_single_line(path)}: {_single_line(error)}") from error
-  finally:
-    if descriptor >= 0:
+    raise OutputError(f"could not inspect output file {sanitize_text(path)}: {sanitize_text(error)}") from error
+  if existing is not None:
+    if stat.S_ISLNK(existing.st_mode) or not stat.S_ISREG(existing.st_mode):
+      raise OutputError(f"output target is not a regular file: {sanitize_text(path)}")
+    if existing.st_nlink != 1:
+      raise OutputError(f"refusing to replace multiply-linked output file: {sanitize_text(path)}")
+  directory, name = os.path.split(path)
+  temporary = os.path.join(directory, f".{name[:128]}.{secrets.token_hex(8)}.tmp")
+  try:
+    descriptor = _create_exclusive(temporary)
+  except OSError as error:
+    raise OutputError(f"could not create a temporary file beside {sanitize_text(path)}: {sanitize_text(error)}") from error
+  try:
+    try:
+      _write_and_sync(descriptor, encoded)
+    finally:
       os.close(descriptor)
+    # A fresh private inode replaces the name, so a pre-existing file's owner never sees the result.
+    os.replace(temporary, path)
+  except BaseException as error:
+    try:
+      os.unlink(temporary)
+    except OSError:
+      pass
+    if isinstance(error, OSError):
+      raise OutputError(f"could not write output file {sanitize_text(path)}: {sanitize_text(error)}") from error
+    raise
+
+
+def _silence_broken_pipe(stream: TextIO) -> None:
+  """Point a closed stdout pipe at /dev/null so interpreter shutdown cannot fail flushing it."""
+  try:
+    descriptor = stream.fileno()
+  except (AttributeError, OSError, ValueError):
+    return
+  devnull = os.open(os.devnull, os.O_WRONLY)
+  try:
+    os.dup2(devnull, descriptor)
+  finally:
+    os.close(devnull)
 
 
 def emit_output(
@@ -221,7 +248,11 @@ def emit_output(
     return
   rendered, encoded = _bounded_output(rendered)
   if output_path is not None:
-    _write_new_or_replace(os.fspath(Path(output_path)), encoded, force=force)
+    path = os.fspath(output_path)
+    if force:
+      _replace_atomically(path, encoded)
+    else:
+      _write_new(path, encoded)
   if not quiet and output_path is None:
     destination = sys.stdout if stdout is None else stdout
     encoding = getattr(destination, "encoding", None)
@@ -236,4 +267,9 @@ def emit_output(
         stream_bytes = (rendered + "\n").encode("ascii", errors="backslashreplace")
       if len(stream_bytes) > MAX_OUTPUT_BYTES:
         raise OutputError("rendered output exceeds the 16 MiB safety limit")
-    print(rendered, file=destination)
+    try:
+      print(rendered, file=destination)
+      destination.flush()
+    except BrokenPipeError:
+      # A reader such as `head` closing early is not a diagnostic failure; keep the tool's exit status.
+      _silence_broken_pipe(destination)

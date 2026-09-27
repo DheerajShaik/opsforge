@@ -1,10 +1,12 @@
 import contextlib
+import errno
 import importlib.util
 import io
 import json
 import os
 from pathlib import Path
 import socket
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -46,6 +48,23 @@ class FakeSocket:
 
   def close(self):
     self.closed = True
+
+
+class ResponseSocket(FakeSocket):
+  def __init__(self, response=b"", **kwargs):
+    super().__init__(**kwargs)
+    self.response = response
+    self.sent = b""
+
+  def sendall(self, data):
+    self.sent += data
+
+  def recv(self, size):
+    value, self.response = self.response[:size], self.response[size:]
+    return value
+
+
+MALFORMED_REDIRECT = b"HTTP/1.1 302 Found\r\nLocation: http://[\r\nContent-Length: 0\r\n\r\n"
 
 
 class HealthCtlTests(unittest.TestCase):
@@ -93,6 +112,50 @@ class HealthCtlTests(unittest.TestCase):
     document["version"] = 2
     with self.assertRaisesRegex(healthctl.ConfigError, "integer 1"):
       healthctl.parse_config_document(document, path="health.json")
+
+  def test_rejects_non_integer_version(self):
+    for version in (1.0, True, "1"):
+      document = self.valid_document()
+      document["version"] = version
+      with self.subTest(version=version), self.assertRaisesRegex(healthctl.ConfigError, "integer 1"):
+        healthctl.parse_config_document(document, path="health.json")
+
+  def test_file_checks_accept_only_their_own_fields(self):
+    for check in (
+      {"name": "f", "type": "file_exists", "path": "/etc/hostname", "sha256": "0" * 64},
+      {"name": "f", "type": "file_exists", "path": "/etc/hostname", "minimum_bytes": 1},
+      {"name": "f", "type": "file_metadata", "path": "/etc/hostname", "sha256": "0" * 64},
+      {"name": "f", "type": "config_hash", "path": "/etc/hostname", "sha256": "0" * 64, "maximum_bytes": 1},
+    ):
+      with self.subTest(check=check), self.assertRaisesRegex(healthctl.ConfigError, "unsupported field"):
+        healthctl.parse_config_document({"version": 1, "checks": [check]}, path="x")
+
+  def test_rejects_non_concrete_service_names(self):
+    for service in ("*", "nginx*", "ngin?", "[ab]", ".service", "foo@.service", "a\x00b", "-x", "a/b", "a b", "", "sshd.socket"):
+      document = {"version": 1, "checks": [{"name": "svc", "type": "systemd_service", "service": service}]}
+      with self.subTest(service=service), self.assertRaisesRegex(healthctl.ConfigError, "service is invalid"):
+        healthctl.parse_config_document(document, path="x")
+    document = {"version": 1, "checks": [{"name": "svc", "type": "systemd_service", "service": "nginx"}]}
+    self.assertEqual(healthctl.parse_config_document(document, path="x").checks[0].target, "nginx.service")
+
+  def test_rejects_unusable_paths_and_unrepresentable_numbers(self):
+    for path in ("", "a\x00b", "/tmp/\ud800"):
+      for check in (
+        {"name": "p", "type": "disk_free_percent", "path": path, "minimum_free_percent": 1},
+        {"name": "p", "type": "file_exists", "path": path},
+      ):
+        with self.subTest(check=check), self.assertRaisesRegex(healthctl.ConfigError, r"\.path"):
+          healthctl.parse_config_document({"version": 1, "checks": [check]}, path="x")
+    raw_byte = {"name": "p", "type": "file_exists", "path": "/tmp/\udcff"}
+    self.assertEqual(healthctl.parse_config_document({"version": 1, "checks": [raw_byte]}, path="x").checks[0].target, "/tmp/\udcff")
+    document = self.valid_document()
+    document["checks"][0]["minimum_free_percent"] = 10 ** 400
+    with self.assertRaisesRegex(healthctl.ConfigError, "minimum_free_percent"):
+      healthctl.parse_config_document(document, path="x")
+    document = self.valid_document()
+    document["checks"][1]["timeout_seconds"] = 10 ** 400
+    with self.assertRaisesRegex(healthctl.ConfigError, "timeout_seconds"):
+      healthctl.parse_config_document(document, path="x")
 
   def test_rejects_empty_checks(self):
     with self.assertRaisesRegex(healthctl.ConfigError, "at least one"):
@@ -144,10 +207,8 @@ class HealthCtlTests(unittest.TestCase):
       document = {"version": 1, "checks": [{"name": "web", "type": "https", "url": url}]}
       with self.subTest(url=url), self.assertRaises(healthctl.ConfigError):
         healthctl.parse_config_document(document, path="x")
-    handler = healthctl.LimitedRedirectHandler()
-    request = healthctl.urllib.request.Request("https://example.com/start")
     with self.assertRaises(healthctl.RedirectPolicyError):
-      handler.redirect_request(request, None, 302, "", {}, "http://example.com/next")
+      healthctl.validate_redirect_url("https://example.com/start", "http://example.com/next")
     with self.assertRaises(healthctl.RedirectPolicyError):
       healthctl.validate_redirect_url("https://example.com/start", "/next?token=secret")
 
@@ -172,13 +233,16 @@ class HealthCtlTests(unittest.TestCase):
       sockets.append(value)
       return value
     check = healthctl.GenericCheck("web", "http", "http://example.com/start", 1.0)
-    with mock.patch.dict(os.environ, {"HTTP_PROXY": "http://127.0.0.1:9"}), mock.patch.object(
-      healthctl.urllib.request, "build_opener", side_effect=AssertionError("proxy opener used"),
-    ):
+    resolved = []
+    def resolver(host, *args):
+      resolved.append(host)
+      return [record]
+    with mock.patch.dict(os.environ, {"HTTP_PROXY": "http://127.0.0.1:9", "http_proxy": "http://127.0.0.1:9"}):
       status = healthctl.run_http_head(
-        check, resolver=lambda *args: [record], socket_factory=factory, clock=lambda: 0.0,
+        check, resolver=resolver, socket_factory=factory, clock=lambda: 0.0,
       )
     self.assertEqual(status, 204)
+    self.assertEqual(resolved, ["example.com", "example.com"])
     self.assertEqual(len(sockets), 2)
     self.assertIn(b"HEAD /ready HTTP/1.1", sockets[1].sent)
     self.assertTrue(all(item.closed for item in sockets))
@@ -199,6 +263,15 @@ class HealthCtlTests(unittest.TestCase):
       healthctl.run_http_head(
         check, resolver=lambda *args: [record],
         socket_factory=lambda *args: FakeSocket(oversized), clock=lambda: 0.0,
+      )
+
+  def test_malformed_redirect_location_is_a_redirect_policy_error(self):
+    record = (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", 8080))
+    check = healthctl.GenericCheck("web", "http", "http://127.0.0.1:8080/health", 1.0)
+    with self.assertRaisesRegex(healthctl.RedirectPolicyError, "redirect URL is malformed"):
+      healthctl.run_http_head(
+        check, resolver=lambda *args: [record],
+        socket_factory=lambda *args: ResponseSocket(MALFORMED_REDIRECT), clock=lambda: 0.0,
       )
 
   def test_rejects_dependency_cycle(self):
@@ -306,6 +379,24 @@ class HealthCtlTests(unittest.TestCase):
       with self.assertRaisesRegex(healthctl.ConfigError, "line 1, column 2"):
         healthctl.load_config(str(path))
 
+  def test_load_config_rejects_values_the_json_parser_cannot_handle(self):
+    with tempfile.TemporaryDirectory() as tempdir:
+      path = Path(tempdir) / "health.json"
+      digits = "1" + "0" * 5000
+      path.write_text(
+        '{"version":1,"checks":[{"name":"d","type":"disk_free_percent","path":"/","minimum_free_percent":' + digits + "}]}",
+        encoding="utf-8",
+      )
+      with self.assertRaises(healthctl.ConfigError):
+        healthctl.load_config(str(path))
+      path.write_text("[" * 30000 + "]" * 30000, encoding="utf-8")
+      with self.assertRaises(healthctl.ConfigError):
+        healthctl.load_config(str(path))
+      with mock.patch.object(healthctl.json, "loads", side_effect=RecursionError), self.assertRaisesRegex(
+        healthctl.ConfigError, "nested too deeply",
+      ):
+        healthctl.load_config(str(path))
+
   def test_disk_check_passes_and_fails_at_threshold(self):
     check = healthctl.DiskFreeCheck("disk", "/", 25.0)
     passed = healthctl.run_disk_check(check, disk_usage=lambda _: FakeUsage(1000, 250))
@@ -323,6 +414,14 @@ class HealthCtlTests(unittest.TestCase):
     check = healthctl.DiskFreeCheck("disk", "/", 10)
     with self.assertRaises(healthctl.ObservationError):
       healthctl.run_disk_check(check, disk_usage=lambda _: FakeUsage(0, 0))
+
+  def test_observation_errors_are_always_critical(self):
+    check = healthctl.DiskFreeCheck("disk", "/missing", 10, severity="WARN")
+    unobservable = lambda _: (_ for _ in ()).throw(FileNotFoundError())
+    self.assertEqual(healthctl.run_disk_check(check, disk_usage=unobservable).severity, "CRITICAL")
+    inherited = healthctl.CheckResult("disk", "disk_free_percent", "ERROR", "/missing", "unobservable", "WARN")
+    with mock.patch.object(healthctl, "run_disk_check", return_value=inherited):
+      self.assertEqual(healthctl.run_check(check).severity, "CRITICAL")
 
   def ipv4_record(self, address="127.0.0.1", port=8080):
     return (socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, "", (address, port))
@@ -353,11 +452,38 @@ class HealthCtlTests(unittest.TestCase):
     with self.assertRaisesRegex(healthctl.ObservationError, "IPv4 socket address shape"):
       healthctl.resolve_tcp_candidates(check, resolver=lambda *args: [record])
 
-  def test_resolver_candidate_bound_is_conservative(self):
+  def test_resolver_keeps_first_16_candidates_and_notes_truncation(self):
     check = healthctl.TcpConnectCheck("tcp", "localhost", "hostname", 8080, 1)
     records = [self.ipv4_record(f"127.0.0.{i}") for i in range(1, 18)]
-    with self.assertRaisesRegex(healthctl.ObservationError, "16-candidate"):
-      healthctl.resolve_tcp_candidates(check, resolver=lambda *args: records)
+    notes = []
+    candidates = healthctl.resolve_tcp_candidates(check, resolver=lambda *args: records, notes=notes)
+    self.assertEqual([item.endpoint for item in candidates], [f"127.0.0.{i}:8080" for i in range(1, 17)])
+    self.assertEqual(len(notes), 1)
+    self.assertIn("only the first 16", notes[0])
+    result = healthctl.run_tcp_check(
+      check, resolver=lambda *args: records,
+      socket_factory=lambda *args: FakeSocket(OSError(111, "refused")),
+    )
+    self.assertEqual(result.status, "FAIL")
+    self.assertIn("across 16 candidate(s)", result.evidence)
+    self.assertIn("only the first 16", result.evidence)
+
+  def test_socket_creation_failure_falls_through_to_next_candidate(self):
+    records = [
+      (socket.AF_INET6, socket.SOCK_STREAM, socket.IPPROTO_TCP, "", ("2001:db8::1", 8080, 0, 0)),
+      self.ipv4_record(),
+    ]
+    def factory(family, *args):
+      if family == socket.AF_INET6:
+        raise OSError(errno.EAFNOSUPPORT, "Address family not supported by protocol")
+      return ResponseSocket(b"HTTP/1.1 200 OK\r\n\r\n")
+    check = healthctl.TcpConnectCheck("tcp", "localhost", "hostname", 8080, 1)
+    result = healthctl.run_tcp_check(check, resolver=lambda *args: records, socket_factory=factory)
+    self.assertEqual(result.status, "PASS")
+    self.assertIn("to 127.0.0.1:8080 after 2 attempt(s)", result.evidence)
+    http = healthctl.GenericCheck("web", "http", "http://localhost:8080/", 1.0)
+    status = healthctl.run_http_head(http, resolver=lambda *args: records, socket_factory=factory, clock=lambda: 0.0)
+    self.assertEqual(status, 200)
 
   def test_tcp_check_passes_on_first_success_and_closes_socket(self):
     check = healthctl.TcpConnectCheck("tcp", "127.0.0.1", "ipv4", 8080, 0.5)
@@ -423,6 +549,7 @@ class HealthCtlTests(unittest.TestCase):
     checks = (
       healthctl.GenericCheck("a", "file_exists", "/a"),
       healthctl.GenericCheck("b", "file_exists", "/b", depends_on=("a",)),
+      healthctl.GenericCheck("c", "file_exists", "/c", depends_on=("b",)),
     )
     calls = []
     def executor(check):
@@ -430,7 +557,38 @@ class HealthCtlTests(unittest.TestCase):
       return healthctl.CheckResult(check.name, check.type, "FAIL", check.target, "no", check.severity)
     results = healthctl.evaluate_config(healthctl.HealthConfig("/tmp/x", checks), executor=executor)
     self.assertEqual(calls, ["a"])
-    self.assertIn("dependency did not pass", results[1].evidence)
+    self.assertEqual([(item.status, item.severity, item.attempts) for item in results[1:]], [("SKIPPED", "OK", 0)] * 2)
+    self.assertEqual([item.evidence for item in results[1:]], ["dependency did not pass: a", "dependency did not pass: b"])
+
+  def test_one_raising_check_does_not_abort_the_run(self):
+    checks = (
+      healthctl.GenericCheck("a", "file_exists", "/a"),
+      healthctl.GenericCheck("b", "file_exists", "/b"),
+    )
+    def executor(check):
+      if check.name == "a":
+        raise ValueError("unexpected")
+      return healthctl.CheckResult(check.name, check.type, "PASS", check.target, "ok")
+    results = healthctl.evaluate_config(healthctl.HealthConfig("/tmp/x", checks), executor=executor)
+    self.assertEqual([(item.name, item.status, item.severity) for item in results], [("a", "ERROR", "CRITICAL"), ("b", "PASS", "OK")])
+    self.assertIn("ValueError", results[0].evidence)
+
+  def test_run_check_retries_an_attempt_that_raised(self):
+    check = healthctl.GenericCheck("web", "http", "http://example.test/", retries=1)
+    passed = healthctl.CheckResult("web", "http", "PASS", check.target, "HTTP status 200; required 200")
+    with mock.patch.object(healthctl, "run_generic_check", side_effect=[ValueError("bad"), passed]) as run, \
+         mock.patch.object(healthctl.time, "sleep") as sleep:
+      result = healthctl.run_check(check)
+    self.assertEqual((result.status, result.attempts, run.call_count), ("PASS", 2, 2))
+    sleep.assert_called_once_with(0.1)
+    persistent = healthctl.GenericCheck("web", "http", "http://example.test/", retries=2)
+    with mock.patch.object(healthctl, "run_generic_check", side_effect=ValueError("bad")), \
+         mock.patch.object(healthctl.time, "sleep") as sleep:
+      result = healthctl.run_check(persistent)
+    self.assertEqual((result.status, result.severity, result.attempts), ("ERROR", "CRITICAL", 3))
+    self.assertEqual([call.args[0] for call in sleep.call_args_list], [0.1, 0.2])
+    with mock.patch.object(healthctl, "run_generic_check", side_effect=KeyboardInterrupt), self.assertRaises(KeyboardInterrupt):
+      healthctl.run_check(check)
 
   def test_config_hash_check_matches_regular_file(self):
     import hashlib
@@ -456,11 +614,13 @@ class HealthCtlTests(unittest.TestCase):
     with mock.patch.object(healthctl.os, "stat", return_value=mock.Mock(st_mode=healthctl.stat.S_IFDIR)):
       self.assertEqual(healthctl.run_generic_check(process).status, "PASS")
     service = healthctl.GenericCheck("service", "systemd_service", "dbus.service", 1.0)
-    with mock.patch.object(healthctl, "run_silent_command", return_value=0) as run:
+    with mock.patch.object(healthctl, "resolve_executable", return_value="/usr/bin/systemctl"), mock.patch.object(
+      healthctl, "run_silent_command", return_value=0,
+    ) as run:
       self.assertEqual(healthctl.run_generic_check(service).status, "PASS")
     self.assertEqual(
       run.call_args.args,
-      (["systemctl", "is-active", "--system", "--quiet", "--", "dbus.service"], 1.0),
+      (["/usr/bin/systemctl", "is-active", "--system", "--quiet", "--", "dbus.service"], 1.0),
     )
 
     class CertificateSocket:
@@ -476,18 +636,41 @@ class HealthCtlTests(unittest.TestCase):
       options=(("host", "example.com"), ("port", 443), ("warn_days", 30), ("critical_days", 7)),
     )
     with mock.patch.object(healthctl, "_connect_tcp_target", return_value=CertificateSocket()), mock.patch.object(
-      healthctl.ssl, "create_default_context", return_value=Context(),
+      healthctl, "default_tls_context", return_value=Context(),
     ):
       self.assertEqual(healthctl.run_generic_check(certificate).status, "PASS")
 
+  def test_systemctl_exit_status_mapping(self):
+    service = healthctl.GenericCheck("svc", "systemd_service", "dbus.service", 1.0, severity="WARN")
+    expected = {
+      0: ("PASS", "OK", "service is active"),
+      3: ("FAIL", "WARN", "service is not active (status 3)"),
+      4: ("FAIL", "WARN", "service is not active (status 4)"),
+      1: ("ERROR", "CRITICAL", "systemctl could not determine the service state (status 1)"),
+    }
+    with mock.patch.object(healthctl, "resolve_executable", return_value="/usr/bin/systemctl"):
+      for code, outcome in expected.items():
+        with self.subTest(code=code), mock.patch.object(healthctl, "run_silent_command", return_value=code):
+          result = healthctl.run_generic_check(service)
+          self.assertEqual((result.status, result.severity, result.evidence), outcome)
+    with mock.patch.object(healthctl, "resolve_executable", return_value=None):
+      self.assertEqual(healthctl.run_generic_check(service).status, "ERROR")
+
+  def test_default_tls_context_is_created_once(self):
+    healthctl.default_tls_context.cache_clear()
+    self.addCleanup(healthctl.default_tls_context.cache_clear)
+    with mock.patch.object(healthctl.ssl, "create_default_context", return_value=object()) as create:
+      self.assertIs(healthctl.default_tls_context(), healthctl.default_tls_context())
+    create.assert_called_once_with()
+
   def test_silent_command_timeout_terminates_and_reaps_child(self):
-    real_popen = healthctl.subprocess.Popen
+    real_popen = subprocess.Popen
     children = []
     def capture(*args, **kwargs):
       process = real_popen(*args, **kwargs)
       children.append(process)
       return process
-    with mock.patch.object(healthctl.subprocess, "Popen", side_effect=capture):
+    with mock.patch.object(subprocess, "Popen", side_effect=capture):
       with self.assertRaisesRegex(healthctl.ObservationError, "deadline"):
         healthctl.run_silent_command(
           [sys.executable, "-c", "import time; time.sleep(30)"], 0.05,
@@ -495,7 +678,7 @@ class HealthCtlTests(unittest.TestCase):
     self.assertEqual(len(children), 1)
     self.assertIsNotNone(children[0].poll())
 
-  def test_dns_check_rejects_excess_resolver_addresses(self):
+  def test_dns_check_reports_first_16_addresses_and_notes_truncation(self):
     check = healthctl.GenericCheck("dns", "dns", "example.test")
     records = [
       (socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, "", (f"10.0.0.{index}", 0))
@@ -503,8 +686,10 @@ class HealthCtlTests(unittest.TestCase):
     ]
     with mock.patch.object(healthctl.socket, "getaddrinfo", return_value=records):
       result = healthctl.run_generic_check(check)
-    self.assertEqual(result.status, "ERROR")
-    self.assertIn("16-address", result.evidence)
+    self.assertEqual(result.status, "PASS")
+    self.assertIn("10.0.0.16", result.evidence)
+    self.assertNotIn("10.0.0.17", result.evidence)
+    self.assertIn("only the first 16", result.evidence)
 
   def test_render_report_escapes_external_text(self):
     config = healthctl.HealthConfig("/tmp/x", (healthctl.DiskFreeCheck("disk", "/", 1),))
@@ -548,6 +733,81 @@ class HealthCtlTests(unittest.TestCase):
     self.assertEqual(stdout.getvalue(), "")
     self.assertIn("internal error", stderr.getvalue())
     self.assertNotIn("Traceback", stderr.getvalue())
+
+  def write_config(self, tempdir, checks):
+    path = Path(tempdir) / "health.json"
+    path.write_text(json.dumps({"version": 1, "checks": checks}), encoding="utf-8")
+    return str(path)
+
+  def test_malformed_location_errors_one_check_and_still_reports_the_rest(self):
+    record = (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", 8080))
+    real_head = healthctl.run_http_head
+    def fake_server(check, **kwargs):
+      return real_head(
+        check, resolver=lambda *args: [record],
+        socket_factory=lambda *args: ResponseSocket(MALFORMED_REDIRECT), clock=lambda: 0.0, **kwargs,
+      )
+    with tempfile.TemporaryDirectory() as tempdir:
+      present = Path(tempdir) / "present"
+      present.write_bytes(b"x")
+      path = self.write_config(tempdir, [
+        {"name": "present", "type": "file_exists", "path": str(present)},
+        {"name": "web", "type": "http", "url": "http://127.0.0.1:8080/health"},
+      ])
+      stdout, stderr = io.StringIO(), io.StringIO()
+      with mock.patch.object(healthctl, "run_http_head", side_effect=fake_server), \
+           contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+        code = healthctl.main([path])
+    self.assertEqual(code, 3)
+    self.assertEqual(stderr.getvalue(), "")
+    report = stdout.getvalue()
+    self.assertIn("1. [PASS] present", report)
+    self.assertIn("2. [ERROR] web", report)
+    self.assertIn("Evidence: redirect URL is malformed", report)
+    self.assertIn("Conclusion: [CRITICAL]", report)
+
+  def test_warn_failure_skips_dependents_without_escalating(self):
+    with tempfile.TemporaryDirectory() as tempdir:
+      path = self.write_config(tempdir, [
+        {"name": "dns", "type": "dns", "host": "db.example.test", "severity": "WARN"},
+        {"name": "db", "type": "tcp_connect", "host": "127.0.0.1", "port": 5432, "depends_on": ["dns"]},
+        {"name": "app", "type": "tcp_connect", "host": "127.0.0.1", "port": 8080, "depends_on": ["db"]},
+      ])
+      outputs = {}
+      unresolvable = socket.gaierror(socket.EAI_NONAME, "Name or service not known")
+      with mock.patch.object(healthctl.socket, "getaddrinfo", side_effect=unresolvable):
+        for mode in ("--json", "--brief"):
+          stdout = io.StringIO()
+          with contextlib.redirect_stdout(stdout):
+            outputs[mode] = (healthctl.main([path, mode]), stdout.getvalue())
+    code, text = outputs["--json"]
+    document = json.loads(text)
+    self.assertEqual((code, document["status"]), (1, "WARN"))
+    self.assertEqual(
+      document["observations"]["summary"],
+      {"pass": 0, "fail_warn": 1, "fail_critical": 0, "error": 0, "skipped": 2},
+    )
+    checks = {item["name"]: item for item in document["observations"]["checks"]}
+    self.assertEqual((checks["dns"]["status"], checks["dns"]["severity"]), ("FAIL", "WARN"))
+    for name, dependency in (("db", "dns"), ("app", "db")):
+      item = checks[name]
+      self.assertEqual((item["status"], item["severity"], item["attempts"], item["elapsed_seconds"]), ("SKIPPED", "OK", 0, 0.0))
+      self.assertEqual(item["evidence"], f"dependency did not pass: {dependency}")
+    code, text = outputs["--brief"]
+    self.assertEqual(code, 1)
+    self.assertIn("PASS/FAIL/ERROR/SKIPPED: 0/1/0/2\n  [FAIL] dns\n  [SKIPPED] db\n  [SKIPPED] app\n", text)
+    self.assertIn("Conclusion: [WARN]", text)
+
+  def test_main_returns_130_when_interrupted_during_output(self):
+    config = healthctl.HealthConfig("/health.json", (healthctl.DiskFreeCheck("disk", "/", 1),))
+    result = healthctl.CheckResult("disk", "disk_free_percent", "PASS", "/", "ok")
+    stderr = io.StringIO()
+    with mock.patch.object(healthctl, "load_config", return_value=config), \
+         mock.patch.object(healthctl, "evaluate_config", return_value=(result,)), \
+         mock.patch.object(healthctl, "emit_output", side_effect=KeyboardInterrupt), \
+         contextlib.redirect_stderr(stderr):
+      self.assertEqual(healthctl.main(["health.json"]), 130)
+    self.assertIn("healthctl: interrupted", stderr.getvalue())
 
   def test_main_help_returns_0(self):
     stdout = io.StringIO()

@@ -2,6 +2,8 @@
 
 DiskHound v0.1 was validated with both automated tests and manual Linux/WSL2 checks before the first-version behavior was frozen.
 
+Scope: this record covers DiskHound v0.1 behavior. Later changes, listed in [CHANGELOG.md](../CHANGELOG.md), are covered by the automated suite but were not re-recorded here.
+
 ## Automated validation
 
 From the repository root:

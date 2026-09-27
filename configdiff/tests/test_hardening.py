@@ -23,7 +23,7 @@ class DirectoryAnchoringTests(unittest.TestCase):
 
   def collect(self, root, **options):
     return configdiff.collect_directory(str(root), max_files=options.get('max_files', 20),
-      max_depth=options.get('max_depth', 4), symlinks=options.get('symlinks', False))[1]
+      max_depth=options.get('max_depth', 4))[1]
 
   def test_symlink_root_refused(self):
     with tempfile.TemporaryDirectory() as temp:
@@ -40,8 +40,7 @@ class DirectoryAnchoringTests(unittest.TestCase):
       (root / 'link').symlink_to(root / 'nested', target_is_directory=True)
       entries = self.collect(root)
       self.assertEqual([item.relative_path for item in entries], ['link', 'nested', 'nested/file'])
-      self.assertIsNone(entries[0].symlink_target)
-      self.assertEqual(self.collect(root, symlinks=True)[0].symlink_target, str(root / 'nested'))
+      self.assertEqual(entries[0].symlink_target, str(root / 'nested'))
 
   def swap_child(self, symlink=False, regular=False):
     with tempfile.TemporaryDirectory() as temp:
@@ -69,7 +68,7 @@ class DirectoryAnchoringTests(unittest.TestCase):
           self.assertEqual(os.lstat(child).st_dev, os.lstat(root).st_dev)
         return original(path, flags, *args, **kwargs)
       with mock.patch.object(configdiff.os, 'open', side_effect=open_swapped), \
-           mock.patch.object(configdiff, 'read_exact_snapshot', wraps=configdiff.read_exact_snapshot) as read:
+           mock.patch.object(configdiff, 'hash_exact_snapshot', wraps=configdiff.hash_exact_snapshot) as read:
         with self.assertRaises(configdiff.ObservationError):
           self.collect(root)
         read.assert_not_called()

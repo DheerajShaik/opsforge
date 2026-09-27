@@ -12,3 +12,14 @@ recursive-include netdoctor README.md
 recursive-include portlens README.md
 recursive-include procwatch README.md
 recursive-include svcdoctor README.md
+recursive-include certwatch/tests *.py
+recursive-include configdiff/tests *.py
+recursive-include diskhound/tests *.py
+recursive-include healthctl/tests *.py
+recursive-include incidentsnapshot/tests *.py
+recursive-include loghound/tests *.py
+recursive-include netdoctor/tests *.py
+recursive-include opsforge_common/tests *.py
+recursive-include portlens/tests *.py
+recursive-include procwatch/tests *.py
+recursive-include svcdoctor/tests *.py

@@ -1,5 +1,7 @@
 # CertWatch v0.1 validation record
 
+Scope: this record covers CertWatch v0.1 behavior. Later changes, listed in [CHANGELOG.md](../CHANGELOG.md), are covered by the automated suite but were not re-recorded here.
+
 Validation recorded at **2026-08-14T10:44:30Z**.
 
 ## Environment

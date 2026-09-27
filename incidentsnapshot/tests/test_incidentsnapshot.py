@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
 import stat
+import subprocess
 import tempfile
 import types
 import unittest
@@ -291,13 +292,14 @@ class BoundedReaderTests(unittest.TestCase):
       close.assert_called_once_with(43)
 
   def test_bounded_command_interrupt_terminates_and_reaps_child(self):
-    real_popen = incident.subprocess.Popen
+    real_popen = subprocess.Popen
     children = []
     def capture(*args, **kwargs):
       process = real_popen(*args, **kwargs)
       children.append(process)
       return process
-    with mock.patch.object(incident.subprocess, "Popen", side_effect=capture), \
+    with mock.patch.object(subprocess, "Popen", side_effect=capture), \
+         mock.patch.object(incident, "resolve_executable", return_value=sys.executable), \
          mock.patch.object(incident.time, "monotonic", side_effect=[0.0, KeyboardInterrupt]):
       with self.assertRaises(KeyboardInterrupt):
         incident.run_bounded_command(
@@ -334,8 +336,8 @@ class SnapshotAndRenderingTests(unittest.TestCase):
       "/proc/net/udp6": b"sl local_address rem_address st\n",
     }
     bounded = lambda path, limit: sources[path]
-    self.assertEqual(incident.collect_routes(bounded)[0]["gateway"], "192.168.1.1")
-    listeners = incident.collect_listeners(bounded)
+    self.assertEqual(incident.collect_routes(bounded).value[0]["gateway"], "192.168.1.1")
+    listeners = incident.collect_listeners(bounded).value
     self.assertEqual([(item["protocol"], item["port"], item["bind_scope"]) for item in listeners], [
       ("TCP", 8080, "loopback"), ("UDP", 53, "wildcard"),
     ])
@@ -422,7 +424,7 @@ class SnapshotAndRenderingTests(unittest.TestCase):
   def test_display_safe_escapes_controls_formats_surrogates_and_backslash(self):
     value = "a\\\n\t\x1b\x7f\u202e\u2028\udcff"
     rendered = incident.display_safe(value)
-    self.assertEqual(rendered, "a\\\\\\x0a\\x09\\x1b\\x7f\\u202e\\u2028\\udcff")
+    self.assertEqual(rendered, "a\\\\\\x0a\\x09\\x1b\\x7f\\u202e\\u2028\\xff")
 
   def test_no_hostname_version_or_ignored_tokens_rendered(self):
     report = incident.render_report(snapshot())

@@ -28,6 +28,31 @@ class RealFilesystemScanningTests(unittest.TestCase):
     self.assertFalse(result.incomplete)
     self.assertGreaterEqual(result.unique_allocated_bytes, 0)
 
+  def test_depth_truncation_is_partial_and_explained(self):
+    with tempfile.TemporaryDirectory() as directory:
+      deep = Path(directory, "a", "b", "c")
+      deep.mkdir(parents=True)
+      (deep / "big.bin").write_bytes(b"\x01" * 65536)
+      Path(directory, "empty").mkdir()
+      shallow = diskhound.scan(directory, diskhound.ScanOptions(max_depth=1))
+      full = diskhound.scan(directory)
+    self.assertTrue(shallow.incomplete)
+    self.assertEqual(shallow.depth_limited_directories, 1)
+    self.assertIn("not descended at --max-depth 1", "; ".join(shallow.incomplete_reasons()))
+    self.assertFalse(full.incomplete)
+    self.assertEqual(full.depth_limited_directories, 0)
+
+  def test_depth_zero_is_rejected(self):
+    with self.assertRaises(SystemExit):
+      diskhound.build_argument_parser().parse_args(["/tmp", "--max-depth", "0"])
+
+  def test_largest_files_keep_size_then_path_order(self):
+    with tempfile.TemporaryDirectory() as directory:
+      for name, size in (("b", 10), ("a", 10), ("c", 30), ("d", 5), ("e", 20)):
+        Path(directory, name).write_bytes(b"x" * size)
+      result = diskhound.scan(directory, diskhound.ScanOptions(top=3))
+    self.assertEqual([Path(item.path).name for item in result.largest_files], ["c", "e", "a"])
+
   def test_nested_files_hard_links_and_symlinks(self):
     with tempfile.TemporaryDirectory() as directory:
       root = Path(directory)
@@ -86,7 +111,7 @@ class RealFilesystemScanningTests(unittest.TestCase):
         created.append(current)
       result = diskhound.scan(directory)
       self.assertEqual(len(result.branches), 1)
-      self.assertFalse(result.incomplete)
+      self.assertTrue(result.incomplete)
       self.assertGreater(result.depth_limited_directories, 0)
     finally:
       for path in reversed(created):

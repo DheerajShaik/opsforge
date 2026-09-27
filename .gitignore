@@ -21,3 +21,12 @@ build/
 dist/
 *.egg-info/
 .venv/
+venv/
+.tox/
+
+# Test, type-check, lint, and coverage caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/

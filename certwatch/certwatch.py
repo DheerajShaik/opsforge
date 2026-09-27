@@ -6,14 +6,9 @@ from __future__ import annotations
 import argparse
 import hashlib
 import ipaddress
-import os
 import re
-import selectors
-import signal
-import shutil
 import socket
 import ssl
-import subprocess
 import sys
 import time
 import unicodedata
@@ -28,17 +23,28 @@ from opsforge_common import (
     add_output_arguments,
     emit_output,
     make_conclusion,
+    sanitize_text as sanitize,
     validate_output_arguments,
+)
+from opsforge_common.process import (
+    ProcessOutputLimitError,
+    ProcessSpawnError,
+    ProcessTimeoutError,
+    resolve_executable,
+    run_bounded,
 )
 
 TCP_TIMEOUT = 5.0
 TLS_TIMEOUT = 5.0
+CONNECT_BUDGET_SECONDS = 20.0
 DECODER_TIMEOUT = 5.0
 MAX_CERTIFICATE_BYTES = 1024 * 1024
 MAX_DECODER_OUTPUT = 64 * 1024
 UNAVAILABLE = "-"
 MAX_TARGETS = 32
 MAX_RESOLVER_CANDIDATES = 16
+DEFAULT_CRITICAL_DAYS = 7
+STATUS_RANK = {"VALID": 0, "WARNING": 1, "DRIFT": 2, "CRITICAL": 3, "FAIL": 4, "EXPIRED": 5, "ERROR": 6}
 
 
 class CertWatchError(Exception):
@@ -75,11 +81,12 @@ class LeafObservation:
     cipher: Optional[str] = None
     tcp_seconds: float = 0.0
     tls_seconds: float = 0.0
+    candidate: Optional[ConnectionCandidate] = None
 
 
 @dataclass(frozen=True)
 class VerificationEvidence:
-    trust_verified: bool
+    trust_verified: Optional[bool]
     hostname_verified: Optional[bool]
     verification_error: Optional[str]
     chain_certificates: Optional[int] = None
@@ -182,25 +189,9 @@ def parse_target(value: str) -> Target:
         kind, sni = "ipv4", None
     except ValueError:
         host = _hostname(host_text)
-        kind, sni = "hostname", host
+        # RFC 6066 forbids a trailing dot in SNI even though the resolver accepts one.
+        kind, sni = "hostname", host.rstrip(".")
     return Target(value, host, port, kind, sni, f"{host}:{port}")
-
-
-def sanitize(value: object) -> str:
-    result = []
-    for char in str(value):
-        code = ord(char)
-        category = unicodedata.category(char)
-        if char == "\\" or category in {"Cc", "Cf", "Cs", "Zl", "Zp"}:
-            if code <= 0xFF:
-                result.append(f"\\x{code:02X}")
-            elif code <= 0xFFFF:
-                result.append(f"\\u{code:04X}")
-            else:
-                result.append(f"\\U{code:08X}")
-        else:
-            result.append(char)
-    return "".join(result)
 
 
 def fingerprint(der: bytes) -> str:
@@ -249,23 +240,33 @@ def resolve_candidates(target: Target, resolver=socket.getaddrinfo) -> list[Conn
         key = (candidate.family, candidate.socket_type, candidate.protocol, candidate.sockaddr)
         if key in seen:
             continue
-        if len(candidates) >= MAX_RESOLVER_CANDIDATES:
-            raise CertWatchError("name resolution exceeded the 16-candidate limit")
         seen.add(key)
         candidates.append(candidate)
+        if len(candidates) >= MAX_RESOLVER_CANDIDATES:
+            break
     if not candidates:
         raise CertWatchError("name resolution returned no TCP candidates")
     return candidates
 
 
-def _connect(candidates: list[ConnectionCandidate], socket_factory=socket.socket):
+def _connect(
+    candidates: list[ConnectionCandidate], socket_factory=socket.socket, budget: float = CONNECT_BUDGET_SECONDS,
+) -> tuple[socket.socket, ConnectionCandidate]:
+    """Connect to the first reachable candidate within one overall budget; return the socket and candidate."""
+    deadline = time.monotonic() + budget
     timed_out = 0
     for candidate in candidates:
-        sock = socket_factory(candidate.family, candidate.socket_type, candidate.protocol)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise CertWatchError("TCP connection timed out")
         try:
-            sock.settimeout(TCP_TIMEOUT)
+            sock = socket_factory(candidate.family, candidate.socket_type, candidate.protocol)
+        except OSError:
+            continue
+        try:
+            sock.settimeout(min(TCP_TIMEOUT, remaining))
             sock.connect(candidate.sockaddr)
-            return sock
+            return sock, candidate
         except (TimeoutError, socket.timeout):
             timed_out += 1
             sock.close()
@@ -289,6 +290,11 @@ def _peer_address(peer: object) -> str:
     return f"[{ip}]" if ip.version == 6 else str(ip)
 
 
+def _handshake_reason(exc: BaseException) -> str:
+    reason = getattr(exc, "reason", None)
+    return str(reason) if reason else type(exc).__name__
+
+
 def observe_leaf(
     target: Target,
     resolver=socket.getaddrinfo,
@@ -297,11 +303,14 @@ def observe_leaf(
 ) -> LeafObservation:
     candidates = resolve_candidates(target, resolver)
     tcp_started = time.monotonic()
-    tcp = _connect(candidates, socket_factory)
+    tcp, candidate = _connect(candidates, socket_factory)
     tcp_seconds = time.monotonic() - tcp_started
     tls = None
     try:
-        connected = _peer_address(tcp.getpeername())
+        try:
+            connected = _peer_address(tcp.getpeername())
+        except OSError as exc:
+            raise CertWatchError("TCP peer disconnected before the TLS handshake") from exc
         try:
             context = context_factory()
             context.check_hostname = False
@@ -317,9 +326,9 @@ def observe_leaf(
             tls.do_handshake()
             tls_seconds = time.monotonic() - tls_started
         except (TimeoutError, socket.timeout) as exc:
-            raise CertWatchError("TLS handshake timed out after 5 seconds") from exc
-        except Exception as exc:
-            raise CertWatchError("TLS handshake failed") from exc
+            raise CertWatchError(f"TLS handshake timed out after {TLS_TIMEOUT:g} seconds") from exc
+        except (ssl.SSLError, OSError, ValueError) as exc:
+            raise CertWatchError(f"TLS handshake failed: {_handshake_reason(exc)}") from exc
         try:
             der = tls.getpeercert(binary_form=True)
         except (OSError, ssl.SSLError, ValueError) as exc:
@@ -333,7 +342,7 @@ def observe_leaf(
         version = version_method() if callable(version_method) else None
         cipher_value = cipher_method() if callable(cipher_method) else None
         cipher = cipher_value[0] if isinstance(cipher_value, tuple) and cipher_value else None
-        return LeafObservation(connected, der, version, cipher, tcp_seconds, tls_seconds)
+        return LeafObservation(connected, der, version, cipher, tcp_seconds, tls_seconds, candidate)
     finally:
         if tls is not None:
             tls.close()
@@ -358,139 +367,32 @@ OPENSSL_ARGS = (
 )
 
 
-def find_decoder(which=shutil.which) -> str:
+def find_decoder(which=resolve_executable) -> str:
     path = which("openssl")
     if not path:
-        raise CertWatchError("required decoder 'openssl' is not available")
-    return os.path.abspath(path)
+        raise CertWatchError("required decoder 'openssl' is not available in a trusted PATH directory")
+    return path
 
 
-def _stop_decoder(proc: subprocess.Popen[bytes]) -> None:
-    killed_group = False
-    pid = getattr(proc, "pid", None)
-    try:
-        running = proc.poll() is None
-    except OSError:
-        running = False
-    # A helper may exit while descendants still hold its output pipes open.
-    if isinstance(pid, int):
-        try:
-            os.killpg(pid, signal.SIGKILL)
-            killed_group = True
-        except OSError:
-            pass
-    if running and not killed_group:
-        try:
-            if proc.poll() is None:
-                proc.kill()
-        except OSError:
-            pass
-    try:
-        proc.wait(timeout=1.0)
-    except (OSError, subprocess.TimeoutExpired):
-        pass
-
-
-def run_decoder(path: str, der: bytes, popen=subprocess.Popen) -> bytes:
+def run_decoder(path: str, der: bytes) -> bytes:
     """Decode bounded DER input with a bounded, shell-free OpenSSL subprocess."""
-    env = os.environ.copy()
-    env.update({"LC_ALL": "C", "LANG": "C"})
     try:
-        proc = popen(
-            [path, *OPENSSL_ARGS],
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            env=env,
-            start_new_session=True,
+        result = run_bounded(
+            [path, *OPENSSL_ARGS], timeout=DECODER_TIMEOUT, max_output_bytes=MAX_DECODER_OUTPUT, stdin_data=der,
         )
-    except OSError as exc:
-        raise CertWatchError("could not execute certificate decoder") from exc
-
-    if proc.stdin is None or proc.stdout is None or proc.stderr is None:
-        _stop_decoder(proc)
-        raise CertWatchError("could not execute certificate decoder")
-
-    selector = selectors.DefaultSelector()
-    data = {"out": bytearray(), "err": bytearray()}
-    input_view = memoryview(der)
-    input_offset = 0
-    deadline = time.monotonic() + DECODER_TIMEOUT
-
-    try:
-        for stream in (proc.stdin, proc.stdout, proc.stderr):
-            os.set_blocking(stream.fileno(), False)
-        selector.register(proc.stdin, selectors.EVENT_WRITE, "in")
-        selector.register(proc.stdout, selectors.EVENT_READ, "out")
-        selector.register(proc.stderr, selectors.EVENT_READ, "err")
-
-        while selector.get_map():
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise TimeoutError
-            events = selector.select(remaining)
-            if not events:
-                raise TimeoutError
-            for key, _ in events:
-                if key.data == "in":
-                    try:
-                        written = os.write(
-                            key.fileobj.fileno(),
-                            input_view[input_offset : input_offset + 8192],
-                        )
-                    except BlockingIOError:
-                        continue
-                    except BrokenPipeError:
-                        input_offset = len(input_view)
-                    else:
-                        input_offset += written
-                    if input_offset >= len(input_view):
-                        selector.unregister(key.fileobj)
-                        key.fileobj.close()
-                else:
-                    try:
-                        chunk = os.read(key.fileobj.fileno(), 8192)
-                    except BlockingIOError:
-                        continue
-                    if not chunk:
-                        selector.unregister(key.fileobj)
-                        key.fileobj.close()
-                        continue
-                    data[key.data].extend(chunk)
-                    if len(data[key.data]) > MAX_DECODER_OUTPUT:
-                        raise OverflowError
-
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            raise TimeoutError
-        try:
-            status = proc.wait(timeout=remaining)
-        except subprocess.TimeoutExpired as exc:
-            raise TimeoutError from exc
-    except TimeoutError as exc:
-        _stop_decoder(proc)
-        raise CertWatchError("certificate decoder timed out after 5 seconds") from exc
-    except OverflowError as exc:
-        _stop_decoder(proc)
+    except ProcessTimeoutError as exc:
+        raise CertWatchError(f"certificate decoder timed out after {DECODER_TIMEOUT:g} seconds") from exc
+    except ProcessOutputLimitError as exc:
         raise CertWatchError("certificate decoder returned oversized output") from exc
+    except ProcessSpawnError as exc:
+        raise CertWatchError("could not execute certificate decoder") from exc
     except OSError as exc:
-        _stop_decoder(proc)
         raise CertWatchError("certificate decoder failed") from exc
-    except BaseException:
-        _stop_decoder(proc)
-        raise
-    finally:
-        selector.close()
-        input_view.release()
-        for stream in (proc.stdin, proc.stdout, proc.stderr):
-            if stream is not None and not stream.closed:
-                stream.close()
-
-    if status != 0:
+    if result.returncode != 0:
         raise CertWatchError("certificate decoder failed")
-    if not data["out"]:
+    if not result.stdout:
         raise CertWatchError("certificate decoder returned malformed output")
-    return bytes(data["out"])
+    return result.stdout
 
 
 def _parse_time(value: str) -> datetime:
@@ -503,15 +405,20 @@ def _parse_time(value: str) -> datetime:
 
 
 def _split_sans(text: str) -> tuple[tuple[str, str], ...]:
-    # Split only unescaped separators. Escaped commas are rejected conservatively below.
+    # Split only unescaped separators; DNS and IP values stay strict because identity depends on them.
     parts = re.split(r"(?<!\\),\s*", text.strip())
     values = []
     labels = {"DNS": "DNS", "IP Address": "IP", "URI": "URI", "email": "email"}
     for part in parts:
         match = re.fullmatch(r"(DNS|IP Address|URI|email):(.+)", part)
-        if not match or "\\," in match.group(2):
-            raise ValueError
+        if not match:
+            if not part or any(unicodedata.category(char) in {"Cc", "Cs", "Zl", "Zp"} for char in part):
+                raise ValueError
+            values.append(("other", part))
+            continue
         label, value = labels[match.group(1)], match.group(2)
+        if label in {"DNS", "IP"} and "\\," in value:
+            raise ValueError
         if label == "IP":
             value = str(ipaddress.ip_address(value))
         if any(unicodedata.category(char) in {"Cc", "Cs", "Zl", "Zp"} for char in value):
@@ -592,20 +499,20 @@ def decode_certificate(path: str, der: bytes) -> CertificateInfo:
 
 
 def verify_hostname(target: Target, certificate: CertificateInfo) -> Optional[bool]:
-    """Verify identity from parsed SANs without implying chain trust."""
-    if target.kind == "hostname":
+    """Verify identity from parsed SANs against the name a client would verify: SNI when sent, else the IP."""
+    expected_name = target.sni_name.rstrip(".").lower() if target.sni_name else None
+    if expected_name is not None:
         identities = [value.rstrip(".").lower() for kind, value in certificate.sans if kind == "DNS"]
     else:
         identities = [value for kind, value in certificate.sans if kind == "IP"]
     if not identities:
-        return None
-    if target.kind != "hostname":
+        return False if certificate.sans else None
+    if expected_name is None:
         try:
             expected = ipaddress.ip_address(target.host)
             return any(ipaddress.ip_address(value) == expected for value in identities)
         except ValueError:
             return False
-    expected_name = target.host.rstrip(".").lower()
     for pattern in identities:
         if "*" not in pattern and pattern == expected_name:
             return True
@@ -623,13 +530,15 @@ def verify_endpoint(
     resolver=socket.getaddrinfo,
     socket_factory=socket.socket,
     context_factory=ssl.create_default_context,
+    candidate: Optional[ConnectionCandidate] = None,
 ) -> VerificationEvidence:
-    """Perform a separate bounded CA-trust handshake and local SAN identity check."""
+    """Perform a bounded CA-trust handshake, on the observed address when known, plus a SAN identity check."""
     identity = verify_hostname(target, certificate)
     tcp = None
     tls = None
     try:
-        tcp = _connect(resolve_candidates(target, resolver), socket_factory)
+        candidates = [candidate] if candidate is not None else resolve_candidates(target, resolver)
+        tcp, _ = _connect(candidates, socket_factory)
         tcp.settimeout(TLS_TIMEOUT)
         context = context_factory()
         context.check_hostname = False
@@ -640,15 +549,19 @@ def verify_endpoint(
         verified_der = tls.getpeercert(binary_form=True)
         if not isinstance(verified_der, bytes) or not verified_der or len(verified_der) > MAX_CERTIFICATE_BYTES:
             return VerificationEvidence(
-                False, identity, "trusted handshake leaf certificate was unavailable", chain_count, False,
+                None, identity, "trusted handshake leaf certificate was unavailable", chain_count, False,
             )
         matched = fingerprint(verified_der) == certificate.sha256_fingerprint
-        error = None if matched else "trusted handshake presented a different leaf certificate"
-        return VerificationEvidence(True, identity, error, chain_count, matched)
+        if matched:
+            return VerificationEvidence(True, identity, None, chain_count, True)
+        return VerificationEvidence(
+            None, identity, "trusted handshake presented a different leaf certificate; the observed leaf's trust is unknown",
+            chain_count, False,
+        )
     except ssl.SSLCertVerificationError as exc:
         return VerificationEvidence(False, identity, sanitize(exc)[:256], None)
     except (OSError, ssl.SSLError, CertWatchError) as exc:
-        return VerificationEvidence(False, identity, f"verification handshake unavailable: {sanitize(exc)[:192]}", None)
+        return VerificationEvidence(None, identity, f"verification handshake unavailable: {sanitize(exc)[:192]}", None)
     finally:
         if tls is not None:
             tls.close()
@@ -683,9 +596,13 @@ def render_report(
             "The presented leaf certificate is currently within its encoded validity period.",
             "It is outside the configured expiration warning window.",
         ]
-    elif assessment.status in {ValidityStatus.WARNING, ValidityStatus.CRITICAL}:
+    elif assessment.status is ValidityStatus.WARNING:
         words = [
             "The presented leaf certificate is currently within its encoded validity period but is inside the configured expiration warning window."
+        ]
+    elif assessment.status is ValidityStatus.CRITICAL:
+        words = [
+            "The presented leaf certificate is currently within its encoded validity period but is inside the configured critical expiration window."
         ]
     elif assessment.status is ValidityStatus.NOT_YET:
         words = ["The presented leaf certificate is not yet within its encoded validity period."]
@@ -723,7 +640,7 @@ def render_report(
             f"  Remaining:     {_remaining(assessment.remaining)}",
             "",
             "Verification",
-            f"  CA trust:      {'verified' if verification and verification.trust_verified else 'not verified'}",
+            f"  CA trust:      {_trust_label(verification)}",
             f"  Host identity: {('verified' if verification.hostname_verified else 'mismatch') if verification and verification.hostname_verified is not None else 'unavailable'}",
             f"  Trusted leaf:  {('matched' if verification.leaf_matches_observation else 'different') if verification and verification.leaf_matches_observation is not None else 'unavailable'}",
             f"  Chain count:   {verification.chain_certificates if verification and verification.chain_certificates is not None else UNAVAILABLE}",
@@ -739,7 +656,54 @@ def render_report(
 class Parser(argparse.ArgumentParser):
     def error(self, message):
         self.print_usage(sys.stderr)
-        self.exit(2, f"certwatch: error: {message}\n")
+        self.exit(2, f"certwatch: error: {sanitize(message)}\n")
+
+
+def _trust_label(verification: Optional[VerificationEvidence]) -> str:
+    if verification is None or verification.trust_verified is None:
+        return "not assessed"
+    return "verified" if verification.trust_verified else "not verified"
+
+
+def classify_target(
+    assessment: ValidityAssessment, verification: VerificationEvidence, baseline_changed: Optional[bool],
+) -> str:
+    """Return the most severe per-target condition so drift never hides expiry."""
+    conditions = ["VALID"]
+    validity = {
+        ValidityStatus.EXPIRED: "EXPIRED", ValidityStatus.NOT_YET: "FAIL",
+        ValidityStatus.CRITICAL: "CRITICAL", ValidityStatus.WARNING: "WARNING",
+    }
+    if assessment.status in validity:
+        conditions.append(validity[assessment.status])
+    if baseline_changed:
+        conditions.append("DRIFT")
+    if (
+        verification.trust_verified is not True
+        or verification.hostname_verified is not True
+        or verification.leaf_matches_observation is not True
+    ):
+        conditions.append("WARNING")
+    return max(conditions, key=STATUS_RANK.__getitem__)
+
+
+def aggregate_status(statuses: Sequence[str]) -> str:
+    if statuses and all(status == "ERROR" for status in statuses):
+        return "ERROR"
+    if "ERROR" in statuses:
+        return "PARTIAL"
+    return max(statuses, key=STATUS_RANK.__getitem__) if statuses else "ERROR"
+
+
+def render_failure(target: Target, detail: str) -> str:
+    return "\n".join([
+        f"CertWatch: {sanitize(target.display_endpoint)}",
+        "Scope: leaf TLS certificate presented by the selected endpoint",
+        "",
+        "Observation",
+        "  Status:        ERROR",
+        f"  Detail:        {detail}",
+    ])
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -755,11 +719,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="non-negative expiration warning threshold (default: 30)",
     )
     parser.add_argument(
-        "--critical-days", default="7", metavar="N",
-        help="non-negative critical expiration threshold (default: 7; cannot exceed warning threshold)",
+        "--critical-days", default=None, metavar="N",
+        help=f"non-negative critical expiration threshold (default: the smaller of {DEFAULT_CRITICAL_DAYS} and --warn-days)",
     )
-    parser.add_argument("--sni", metavar="HOST", help="explicit ASCII SNI name (single target only)")
-    parser.add_argument("--baseline-sha256", metavar="HEX", help="compare the leaf SHA-256 fingerprint with an explicit baseline")
+    parser.add_argument("--sni", metavar="HOST", help="explicit ASCII SNI name (single target only); identity is verified against it")
+    parser.add_argument("--baseline-sha256", metavar="HEX", help="compare the leaf SHA-256 fingerprint with an explicit baseline (single target only)")
     add_output_arguments(parser)
     return parser
 
@@ -772,7 +736,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         validate_output_arguments(parser, args)
         try:
             warn_days = _ascii_decimal(args.warn_days, "--warn-days", 0)
-            critical_days = _ascii_decimal(args.critical_days, "--critical-days", 0)
+            if args.critical_days is None:
+                critical_days = min(DEFAULT_CRITICAL_DAYS, warn_days)
+            else:
+                critical_days = _ascii_decimal(args.critical_days, "--critical-days", 0)
             if warn_days > 36500 or critical_days > 36500:
                 raise TargetError("warning thresholds must not exceed 36500 days")
             if critical_days > warn_days:
@@ -783,10 +750,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             if args.sni is not None:
                 if len(targets) != 1:
                     raise TargetError("--sni requires exactly one target")
-                sni = _hostname(args.sni)
+                try:
+                    ipaddress.ip_address(args.sni)
+                except ValueError:
+                    pass
+                else:
+                    raise TargetError("--sni must be a hostname; TLS clients do not send IP literals as SNI")
+                sni = _hostname(args.sni).rstrip(".")
                 targets[0] = replace(targets[0], sni_name=sni)
             baseline = None
             if args.baseline_sha256 is not None:
+                if len(targets) != 1:
+                    raise TargetError("--baseline-sha256 requires exactly one target")
                 baseline = args.baseline_sha256.replace(":", "").upper()
                 if not re.fullmatch(r"[0-9A-F]{64}", baseline):
                     raise TargetError("--baseline-sha256 must contain exactly 64 hexadecimal digits")
@@ -807,25 +782,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     certificate.not_before, certificate.not_after, warn_days,
                     critical_days=critical_days,
                 )
-                verification = verify_endpoint(target, certificate)
+                verification = verify_endpoint(target, certificate, candidate=observation.candidate)
                 baseline_changed = None if baseline is None else certificate.sha256_fingerprint.replace(":", "") != baseline
-                if baseline_changed:
-                    status = "DRIFT"
-                    exit_code = max(exit_code, 1)
-                elif assessment.status is ValidityStatus.EXPIRED:
-                    status = "EXPIRED"
-                elif assessment.status is ValidityStatus.NOT_YET:
-                    status = "FAIL"
-                elif assessment.status in {ValidityStatus.WARNING, ValidityStatus.CRITICAL}:
-                    status = "WARNING"
-                elif (
-                    not verification.trust_verified
-                    or verification.hostname_verified is not True
-                    or verification.leaf_matches_observation is not True
-                ):
-                    status = "WARNING"
-                else:
-                    status = "VALID"
+                status = classify_target(assessment, verification, baseline_changed)
                 exit_code = max(exit_code, assessment.exit_code)
                 if status != "VALID":
                     exit_code = max(exit_code, 1)
@@ -853,23 +812,20 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     "baseline_changed": baseline_changed,
                 })
             except CertWatchError as exc:
-                if len(targets) == 1:
-                    raise
                 detail = sanitize(exc)
                 warnings.append(f"{target.display_endpoint}: {detail}")
+                reports.append(render_failure(target, detail))
                 statuses.append("ERROR")
                 observations.append({"target": target.display_endpoint, "error": detail})
                 exit_code = 3
-        if all(status == "VALID" for status in statuses):
-            overall_status = "VALID"
+        overall_status = aggregate_status(statuses)
+        if overall_status == "VALID":
             finding = f"all {len(statuses)} target certificate observations were valid and verified"
             next_action = "no certificate-layer issue was detected; revocation was not checked"
-        elif any(status == "ERROR" for status in statuses):
-            overall_status = "PARTIAL" if len(statuses) > 1 else "ERROR"
+        elif "ERROR" in statuses:
             finding = f"{statuses.count('ERROR')} of {len(statuses)} target observations failed"
             next_action = "review the target-specific warning and retry only the failed endpoint"
         else:
-            overall_status = statuses[0] if len(statuses) == 1 else "WARNING"
             finding = f"certificate attention is required for {sum(status != 'VALID' for status in statuses)} of {len(statuses)} targets"
             next_action = "review validity, identity, trust, and baseline evidence separately"
         target_label = targets[0].display_endpoint if len(targets) == 1 else f"{len(targets)} TLS targets"
@@ -889,7 +845,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             elapsed_seconds=time.monotonic() - started,
         )
         for warning in warnings:
-            print(f"certwatch: warning: {sanitize(warning)}", file=sys.stderr)
+            print(f"certwatch: warning: {warning}", file=sys.stderr)
         emit_output(
             record,
             detailed="\n\n".join(reports),

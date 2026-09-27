@@ -5,6 +5,7 @@ import io
 import json
 import os
 import pathlib
+import selectors
 import stat
 import subprocess
 import sys
@@ -114,13 +115,39 @@ class TestCli(unittest.TestCase):
     self.assertIn("Conclusion: [WARNING]", stdout)
     self.assertIn("untrusted", stderr)
 
-  def test_operational_failure(self):
+  def test_critical_is_a_distinct_status(self):
+    code, stdout, _ = self.successful(c.ValidityStatus.CRITICAL, ("--json",))
+    self.assertEqual((code, json.loads(stdout)["status"]), (1, "CRITICAL"))
+
+  def test_small_warn_days_without_critical_days_is_valid(self):
+    before = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    certificate = c.CertificateInfo("CN=x", "CN=i", "01", (("DNS", "example.com"),), before, before + timedelta(days=40), "AA")
+    with mock.patch.object(c, "find_decoder", return_value="/openssl"), \
+         mock.patch.object(c, "observe_leaf", return_value=c.LeafObservation("1.2.3.4", b"x")), \
+         mock.patch.object(c, "decode_certificate", return_value=certificate), \
+         mock.patch.object(c, "verify_endpoint", return_value=c.VerificationEvidence(True, True, None, 2, True)):
+      code, stdout, _ = self.invoke(["--warn-days", "3", "--json", "example.com"])
+    self.assertNotEqual(code, 2)
+    self.assertEqual(json.loads(stdout)["observations"]["critical_days"], 3)
+
+  def test_invalid_sni_and_baseline_combinations(self):
+    for arguments in (["--sni", "192.0.2.1", "x"], ["--baseline-sha256", "A" * 64, "a", "b"]):
+      with self.subTest(arguments=arguments):
+        self.assertEqual(self.invoke(arguments)[0], 2)
+
+  def test_operational_failure_still_reports_and_emits_json(self):
     with mock.patch.object(c, "find_decoder", return_value="/openssl"), mock.patch.object(
       c, "observe_leaf", side_effect=c.CertWatchError("TCP connection failed")
     ):
       code, stdout, stderr = self.invoke(["x"])
-    self.assertEqual((code, stdout), (3, ""))
-    self.assertEqual(stderr, "certwatch: TCP connection failed\n")
+      json_code, json_stdout, _ = self.invoke(["--json", "x"])
+    self.assertEqual(code, 3)
+    self.assertIn("TCP connection failed", stdout)
+    self.assertIn("Conclusion: [ERROR]", stdout)
+    self.assertIn("certwatch: warning: x:443: TCP connection failed", stderr)
+    payload = json.loads(json_stdout)
+    self.assertEqual((json_code, payload["status"]), (3, "ERROR"))
+    self.assertEqual(payload["observations"]["targets"][0]["error"], "TCP connection failed")
 
   def test_internal_and_interrupt(self):
     for error, code, text in (
@@ -146,8 +173,10 @@ class TestCli(unittest.TestCase):
         child = real_popen(*args, **kwargs)
         children.append(child)
         return child
-      with mock.patch.object(c.selectors.DefaultSelector, "select", side_effect=KeyboardInterrupt), self.assertRaises(KeyboardInterrupt):
-        c.run_decoder(str(executable), b"DER", popen=capture)
+      with mock.patch.object(subprocess, "Popen", side_effect=capture), \
+           mock.patch.object(selectors.DefaultSelector, "select", side_effect=KeyboardInterrupt), \
+           self.assertRaises(KeyboardInterrupt):
+        c.run_decoder(str(executable), b"DER")
       self.assertEqual(len(children), 1)
       self.assertIsNotNone(children[0].poll())
 

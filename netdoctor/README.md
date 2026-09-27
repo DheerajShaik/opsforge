@@ -15,13 +15,13 @@ Host is a strict ASCII DNS-style name or unbracketed IPv4/IPv6 literal; port is 
 
 ## Evidence and network activity
 
-NetDoctor times the OS resolver and each TCP attempt, suppresses exact duplicate candidates, and accepts at most 16 distinct IPv4/IPv6 results. It reports candidate/peer endpoints, selected local source IP, IPv4 default-route context, nameservers from bounded `/etc/resolv.conf`, and only the names—not values—of recognized proxy environment variables.
+NetDoctor times the OS resolver and each TCP attempt, suppresses exact duplicate candidates, and uses only the first 16 distinct IPv4/IPv6 results. It reports candidate/peer endpoints, selected local source IP, IPv4 default-route context, nameservers from bounded `/etc/resolv.conf` (a symlink is followed when it resolves to a regular file), and only the names—not values—of recognized proxy environment variables. JSON `warnings` notes when the resolver returned more than 16 candidates and when no nameserver could be read.
 
-The IPv4 default-route gateway/interface is context only: policy routes, IPv6, VPNs, subnet routes, and namespaces can select a different path. It does not establish the successful connection's interface, even for loopback. JSON uses `ipv4_default_route_context`; `selected_interface` remains `null`, and human output calls the connection interface unavailable. No route interface is inferred from a successful TCP connection.
+The IPv4 default-route gateway/interface is context only: policy routes, IPv6, VPNs, subnet routes, and namespaces can select a different path. The reported route is the lowest-metric IPv4 default route that is up and not a reject route, shown as `GATEWAY via IFACE` or `direct via IFACE (no gateway)`. It does not establish the successful connection's interface, even for loopback. JSON uses `ipv4_default_route_context`; `selected_interface` remains `null`, and human output calls the connection interface unavailable. No route interface is inferred from a successful TCP connection.
 
-Network/host-unreachable outcomes are classified at the route stage; other failures remain resolution, TCP, or TLS stage evidence. Optional TLS performs one additional targeted handshake to the successful candidate, reports version/cipher/time, intentionally disables certificate trust and identity verification, sends no application data, and explicitly does not assess revocation or application readiness.
+When every attempt is network or host unreachable, the failure is classified at the route stage; other failures remain resolution, TCP, or TLS stage evidence. Optional TLS reconnects to the successful candidate for one additional targeted handshake, reports version/cipher and handshake-only time, intentionally disables certificate trust and identity verification, sends no application data, and explicitly does not assess revocation or application readiness. Its status reports TLS library errors as `failed: TLS protocol error (REASON)` and a failed reconnect as `failed: TCP reconnect for TLS failed (OUTCOME)`.
 
-Socket attempts use explicit timeouts. The platform resolver call itself is not cancellable through Python's standard `getaddrinfo()` API and may exceed the TCP timeout.
+Socket attempts use explicit timeouts. A candidate whose socket cannot be created is recorded as an attempt such as `socket unavailable (EAFNOSUPPORT)`, and the next candidate is tried. The platform resolver call itself is not cancellable through Python's standard `getaddrinfo()` API and may exceed the TCP timeout.
 
 ## Output and exits
 
