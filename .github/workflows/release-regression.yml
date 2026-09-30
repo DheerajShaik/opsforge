@@ -29,17 +29,13 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
       - name: Compile shared code, utilities, and tests
-        run: >-
-          python -m compileall -q
-          opsforge_common portlens diskhound certwatch svcdoctor loghound
-          procwatch configdiff netdoctor healthctl incidentsnapshot
+        run: python -m compileall -q opsforge
       - name: Run all utility test suites
         shell: bash
         run: |
           set -euo pipefail
-          python -m unittest discover -s opsforge_common/tests -v
-          for utility in portlens diskhound certwatch svcdoctor loghound procwatch configdiff netdoctor healthctl incidentsnapshot; do
-            python -m unittest discover -s "$utility/tests" -v
+          for package in common portlens diskhound certwatch svcdoctor loghound procwatch configdiff netdoctor healthctl incidentsnapshot; do
+            python -m unittest discover -s "opsforge/$package/tests" -v
           done
 
   package:
@@ -72,8 +68,8 @@ jobs:
           artifact=(dist/*.tar.gz)
           tar -xzf "${artifact[0]}" -C "$sdist_dir" --strip-components=1
           cd "$sdist_dir"
-          for package in opsforge_common portlens diskhound certwatch svcdoctor loghound procwatch configdiff netdoctor healthctl incidentsnapshot; do
-            python -m unittest discover -s "$package/tests"
+          for package in common portlens diskhound certwatch svcdoctor loghound procwatch configdiff netdoctor healthctl incidentsnapshot; do
+            python -m unittest discover -s "opsforge/$package/tests"
           done
       - name: Install distribution into a clean environment
         shell: bash
@@ -98,16 +94,16 @@ jobs:
           import importlib.metadata
 
           modules = (
-              "portlens.portlens",
-              "diskhound.diskhound",
-              "certwatch.certwatch",
-              "svcdoctor.svcdoctor",
-              "loghound.loghound",
-              "procwatch.procwatch",
-              "configdiff.configdiff",
-              "netdoctor.netdoctor",
-              "healthctl.healthctl",
-              "incidentsnapshot.incidentsnapshot",
+              "opsforge.portlens.portlens",
+              "opsforge.diskhound.diskhound",
+              "opsforge.certwatch.certwatch",
+              "opsforge.svcdoctor.svcdoctor",
+              "opsforge.loghound.loghound",
+              "opsforge.procwatch.procwatch",
+              "opsforge.configdiff.configdiff",
+              "opsforge.netdoctor.netdoctor",
+              "opsforge.healthctl.healthctl",
+              "opsforge.incidentsnapshot.incidentsnapshot",
           )
           assert importlib.metadata.version("opsforge") == "0.2.0b1"
           assert not importlib.metadata.requires("opsforge")

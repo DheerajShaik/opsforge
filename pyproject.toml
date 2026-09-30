@@ -33,30 +33,31 @@ Issues = "https://github.com/DheerajShaik/opsforge/issues"
 Repository = "https://github.com/DheerajShaik/opsforge.git"
 
 [project.scripts]
-portlens = "portlens.portlens:main"
-diskhound = "diskhound.diskhound:main"
-certwatch = "certwatch.certwatch:main"
-svcdoctor = "svcdoctor.svcdoctor:main"
-loghound = "loghound.loghound:main"
-procwatch = "procwatch.procwatch:main"
-configdiff = "configdiff.configdiff:main"
-netdoctor = "netdoctor.netdoctor:main"
-healthctl = "healthctl.healthctl:main"
-incident-snapshot = "incidentsnapshot.incidentsnapshot:main"
+portlens = "opsforge.portlens.portlens:main"
+diskhound = "opsforge.diskhound.diskhound:main"
+certwatch = "opsforge.certwatch.certwatch:main"
+svcdoctor = "opsforge.svcdoctor.svcdoctor:main"
+loghound = "opsforge.loghound.loghound:main"
+procwatch = "opsforge.procwatch.procwatch:main"
+configdiff = "opsforge.configdiff.configdiff:main"
+netdoctor = "opsforge.netdoctor.netdoctor:main"
+healthctl = "opsforge.healthctl.healthctl:main"
+incident-snapshot = "opsforge.incidentsnapshot.incidentsnapshot:main"
 
 [tool.setuptools]
 packages = [
-  "opsforge_common",
-  "certwatch",
-  "configdiff",
-  "diskhound",
-  "healthctl",
-  "incidentsnapshot",
-  "loghound",
-  "netdoctor",
-  "portlens",
-  "procwatch",
-  "svcdoctor",
+  "opsforge",
+  "opsforge.common",
+  "opsforge.certwatch",
+  "opsforge.configdiff",
+  "opsforge.diskhound",
+  "opsforge.healthctl",
+  "opsforge.incidentsnapshot",
+  "opsforge.loghound",
+  "opsforge.netdoctor",
+  "opsforge.portlens",
+  "opsforge.procwatch",
+  "opsforge.svcdoctor",
 ]
 
 # MANIFEST.in adds tests to the sdist; include-package-data would otherwise copy them into the wheel.
