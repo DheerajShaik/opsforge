@@ -4,10 +4,27 @@ Notable changes to OpsForge will be recorded here.
 
 ## Unreleased
 
+### Breaking
+
+- Everything now lives under one `opsforge` package instead of eleven generically named top-level packages. `opsforge_common` is `opsforge.common`, and each utility module is `opsforge.<utility>.<utility>` (for example `opsforge.portlens.portlens`). The installed commands are unchanged. Anything that imported the old names must be updated.
+- One status and exit-code policy for all ten utilities, defined once in `opsforge.common.status`. Exit 0 is a trustworthy observation with nothing to report, 1 a finding, 2 invalid invocation or a missing or wrong-type target, 3 no trustworthy answer, and 130 interrupted. An established finding decides the exit even when other parts of the run could not be observed, and a gap with no finding is never success: verdict utilities exit 3 (`INCOMPLETE` or `ERROR`), observation-only utilities report `PARTIAL` and exit 1. An `--output` failure is always 3.
+- Exit codes that change: PortLens, SvcDoctor, and LogHound permission failures, missing tools, malformed or oversized output, and internal errors now exit 3 instead of 2; SvcDoctor exits 3 for a stopped unit whose dependencies could not be checked (`INCOMPLETE`) and 2 for a service that does not exist; ProcWatch exits 2 for a process that is gone but 3 for one that cannot be read; HealthCtl exits 3 only when no check failed, and a failed check exits 1 even if another check errored.
+- Renamed or removed states: CertWatch's not-yet-valid state is `NOT_YET_VALID` (was `FAIL`), a CertWatch target not attempted because of the overall time limit is `SKIPPED`, and its partial aggregate is `INCOMPLETE` (was `PARTIAL`); HealthCtl's `fail_warn` summary key is `fail_warning`, its severities are `WARNING` and `CRITICAL` (`WARN` is still accepted in configuration), and `ERROR` and `SKIPPED` results have no severity (JSON `null`) instead of `CRITICAL` or `OK`.
+- The ten per-tool GitHub Actions workflows are gone. `release-regression.yml` compiles the code and runs every suite on CPython 3.10 through 3.14 for each pull request and push to `main`, so they were redundant.
+
+### Added
+
+- `opsforge.common.net`: one strict host grammar (ASCII only, no name ending in a numeric label that a resolver would read as an IPv4 address), bounded TCP resolution that separates negative answers from resolver failures, SNI handling, and a connect loop with per-attempt and overall deadlines. NetDoctor, HealthCtl, and CertWatch use it instead of three near-copies.
+- SvcDoctor reports the limit that really applies: the tightest of the unit's own `MemoryMax`, `MemoryHigh`, `CPUQuotaPerSecUSec`, and `TasksMax` and those of every slice above it, naming the slice that sets it. It also names exit statuses and signals (`203 (EXEC)`, `signal 9 (SIGKILL)`) and classifies `systemctl` failures from its stderr.
+- DiskHound skips remote and network mounts unless `--include-remote-mounts` is given, and reports a `directory-limit` when a tree has more directories than it will visit.
+- CertWatch reads the leaf from one verified handshake and reconnects only when verification fails (it used two connections and two handshakes per target), inspects up to eight targets at once, and keeps input order.
+- HealthCtl runs checks on daemon threads as soon as their own dependencies finish, stops scheduling on Ctrl-C, and gives blocking probes (name resolution, capacity, `lstat`, hashing) a bound so a hung filesystem or resolver becomes an `ERROR` instead of a hang.
+- Tests now cover real behavior: captured `ss`, `systemctl`, `journalctl`, and `/proc/self/mountinfo` output, loopback TCP, HTTP, and TLS servers with throwaway certificates (valid, expired, not yet valid, wrong name), real process, thread, and zombie PIDs, and real temporary directory trees.
+
 ### Fixed
 
 - Shared output: `--force` replaces files atomically through a private temporary file, a reader closing stdout early (for example `| head`) no longer causes a traceback, non-finite numbers are emitted as JSON `null` so output stays standard JSON, and an empty `--output` path is refused.
-- Shared helpers: terminal escaping, bounded subprocesses with trusted helper resolution and a minimal environment, regular-file opening, procfs parsing, and systemd unit-name normalization now have one implementation in `opsforge_common` instead of drifting per-tool copies.
+- Shared helpers: terminal escaping, bounded subprocesses with trusted helper resolution and a minimal environment, regular-file opening, procfs parsing, and systemd unit-name normalization now have one implementation in `opsforge.common` instead of drifting per-tool copies.
 - PortLens attributes socket owners by socket inode from `/proc/PID/fd` instead of trusting `ss -p` process text, and handles scoped IPv6 binds, dual-stack IPv4 matches, newline or non-UTF-8 process names, kernel-truncated names, and unparseable `ss` rows.
 - DiskHound reports directories cut off by `--max-depth` as `PARTIAL` with reasons instead of omitting them silently, and counts skipped cross-device entries.
 - ConfigDiff semantic JSON compares typed values (`true` no longer equals `1`); directory mode compares the root directory and symlink targets and reports unexamined directories; non-regular files are checked before opening; unified diffs are bounded.
@@ -18,12 +35,23 @@ Notable changes to OpsForge will be recorded here.
 - LogHound parses RFC 3164 syslog and common ISO 8601 timestamp variants, so recurrence works on syslog-style files; `--window-seconds` reports undated lines instead of silently filtering them; syslog PIDs, ports, IPv6 addresses, JSON-quoted labels, and any UUID version are normalized; explicit log levels win over keywords and `failed=0` is not an error; stack traces group across source, caret, exception, and cause lines and JDK 9+ frames; NUL bytes and overlong lines, a failed rotation, or a crafted timestamp no longer abort analysis; memory is bounded at 100,000 distinct patterns.
 - ProcWatch keeps earlier samples when a later one fails, stops at zombie or dead states, labels thread and child caps as truncated, and reads the tightest cgroup limits up the hierarchy from the real cgroup2 mount.
 - Incident Snapshot reads socket tables up to 16 MiB, truncates capped lists with totals instead of discarding sections, keeps IPv4 evidence on hosts without IPv6, reports only unconnected UDP sockets as bound, and counts processes whose `stat` could not be parsed.
+- PortLens no longer fails outright when `ss` output exceeds 8 MiB: matches in the complete rows before the limit are reported with a warning, and no match exits 3 instead of claiming the port is unused.
+- CertWatch inspects multiple targets within a 120-second overall limit; targets not started in time are reported as `SKIPPED` (not attempted), and targets still running at the limit are abandoned and reported as `ERROR` so the run ends on time.
+- A temporary or non-recoverable resolver failure (`EAI_AGAIN`, `EAI_FAIL`) is now a resolver failure (exit 3 in NetDoctor, `ERROR` in HealthCtl) instead of an unreachable or failed-check finding; only "no such name" and "no address records" remain negative answers.
+- PortLens no longer reports `NOT_FOUND` when an `ss` row could not be parsed and nothing else matched; it exits 3 because absence cannot be established.
+- Name resolution is bounded: `opsforge.common.net.resolve_tcp` takes a `timeout` and abandons a hung lookup on a daemon thread. CertWatch waits 5 seconds and NetDoctor 10 (both fail with exit 3), and CertWatch warns when a resolver returns more than 16 addresses.
+- ConfigDiff directory mode reports an entry it cannot read (permission denied) or that vanished during the walk as not examined (`INCOMPLETE`, exit 3 unless drift is found) instead of aborting the whole run; paths under it are not reported as added or removed.
+- JSON output spells lone surrogates (undecodable filename bytes) as visible `\udcXX` text instead of emitting ill-formed strings.
+- PortLens JSON adds a typed `owners` array next to the comma-joined `pid`, `user`, and related fields; ProcWatch `--brief` shows CPU and RSS; SvcDoctor shows `StateChangeTimestamp` and `ExecMainExitTimestamp`.
+- Documentation corrections: CertWatch's validation record no longer claims no key is committed, SvcDoctor's privacy note lists only what it collects, HealthCtl documents the disk percentage formula and `SSL_CERT_FILE`/`SSL_CERT_DIR`, PortLens documents NSS lookups and unconnected-only UDP, and DiskHound notes that `--include-remote-mounts` can use the network.
 
 ### Changed
 
+- Internal restructuring without behavior changes: CertWatch's `main` is split into option parsing, per-target inspection, and summary steps; HealthCtl parses each check type with its own small parser registered with that type's allowed fields; test-only PortLens helpers are removed; PortLens and SvcDoctor gain tests driven by real `ss`, `systemctl`, and `journalctl` output captured on Ubuntu 24.04.
 - New states: SvcDoctor adds `LOAD-ERROR`, `RESTARTING`, `DEGRADED`, and `DEPENDENCY-FAILED` (exit 1); ConfigDiff adds `INCOMPLETE` (exit 3); CertWatch adds `CRITICAL`; HealthCtl adds `SKIPPED`. Conditions that previously looked healthy can now return a non-zero exit.
 - LogHound JSON patterns carry a bounded `key` excerpt with `key_truncated`, `key_length`, and `key_digest` instead of the full line, and LogHound results that include truncated lines, removed NUL bytes, undated lines under a window, or pattern limits are `PARTIAL` (exit 1).
 - CI workflows use least-privilege permissions, `persist-credentials: false`, and pinned build tooling; the release workflow runs the unit tests from the extracted sdist; Dependabot tracks GitHub Actions. Tests ship in the sdist but not the wheel.
+
 ## 0.2.0-beta.1 - 2026-09-13
 
 ### Common output and safety

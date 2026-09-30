@@ -12,7 +12,17 @@ The user's completed WSL2 manual campaign reported functional PASS across all te
 
 The previous local record referenced `f3dc8775b4ad11e7ff3bc043a8217b43d70f3188`. A Git diff of all Python files between that commit and `96a61406...` is empty: the previously validated runtime matched the reviewed runtime. The new hardening changes require the regression and targeted revalidation below; the older manual results do not claim execution of the new code.
 
-Changes listed under **Unreleased** in [CHANGELOG.md](CHANGELOG.md) postdate this record. They are covered by the repository test suite and CI, but the results below were not re-executed for them.
+Changes listed under **Unreleased** in [CHANGELOG.md](CHANGELOG.md) postdate the records for the beta candidate below. Their local validation is recorded in the next section; hosted CI has not yet run on them, and the other CPython versions have not been exercised for them.
+
+## Unreleased changes: local validation
+
+Executed locally on Ubuntu 24.04 under WSL2 with CPython 3.12.3, OpenSSL 3.0.13, systemd 255 (PID 1), and `ss` 6.1.0:
+
+- **Suites.** All eleven suites passed, 826 tests: `opsforge.common` 62, PortLens 57, DiskHound 70, CertWatch 99, SvcDoctor 113, LogHound 67, ProcWatch 50, ConfigDiff 52, NetDoctor 39, HealthCtl 117, Incident Snapshot 100. Many now use real data rather than fakes: captured `ss`, `systemctl`, `journalctl`, and `mountinfo` output; loopback TCP, HTTP, and TLS servers presenting throwaway certificates (valid, expired, not yet valid, wrong name; `opsforge/common/tests/tls_fixtures.py`); real process, thread, and zombie PIDs; and real directory trees.
+- **Live runs as root in WSL2** (everything started was stopped and removed afterwards). A single CertWatch run against four `openssl s_server` processes with a private CA ranked `VALID`, `EXPIRED`, `NOT_YET_VALID`, and `WARNING` (wrong name) and exited 1; an unreachable target next to an expired one still exited 1, and next to a valid one exited 3 (`INCOMPLETE`); eight targets against a server that never answers the handshake finished in about 5.4 seconds, not 40. HealthCtl ran eleven mixed real checks (TLS certificates, TCP, DNS, PID 1, disk, file) with the expected per-check results and exit 1, exited 3 when nothing could be evaluated, and exited 130 at once on SIGINT during a slow check (the run lasted 1.0 seconds against a check bounded at 5). SvcDoctor read the real `systemd-resolved` unit through its alias with the real slice chain, exited 2 for a missing service, and exited 3 with a classified message in a PID namespace without systemd. PortLens without `ss` exited 3; LogHound exited 3 for a file `nobody` cannot read and 2 for a missing file; ConfigDiff exited 3 for an unwritable `--output`; DiskHound skipped the 9p `/mnt/c` mount; NetDoctor and CertWatch rejected `127.1` with exit 2.
+- **Packaging.** An sdist and wheel built from a copy of the tree contain all 39 test modules in the sdist, none in the wheel, and a single top-level `opsforge` package; all ten console-script entry points ran `--help` from the extracted wheel alone. This was built offline with setuptools 68, which predates string licence metadata, so the licence fields were rewritten for that build only.
+
+Not executed for these changes: CPython 3.10, 3.11, 3.13, and 3.14, hosted CI, native non-WSL hosts, and Kubernetes.
 
 ## Local environment
 
@@ -69,7 +79,7 @@ Executed on 2026-09-19 against the hardened runtime:
 - LogHound: rotations eight hours apart produced a 28,801-second span; overlapping minute counts summed correctly.
 - HealthCtl certificate candidate/deadline/trust paths: deterministic controlled socket/resolver tests.
 
-No public endpoints were contacted during this pass. Historical CertWatch controlled/public validation is retained in `certwatch/VALIDATION.md`; the new CertWatch change concerns interrupted socket/helper cleanup, not certificate interpretation.
+No public endpoints were contacted during this pass. Historical CertWatch controlled/public validation is retained in `opsforge/certwatch/VALIDATION.md`; the new CertWatch change concerns interrupted socket/helper cleanup, not certificate interpretation.
 
 ## Packaging
 
