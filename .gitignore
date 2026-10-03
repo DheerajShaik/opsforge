@@ -30,3 +30,6 @@ venv/
 .ruff_cache/
 .coverage
 htmlcov/
+
+# Private AI review continuity and working plans
+.local/

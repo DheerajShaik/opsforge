@@ -34,3 +34,12 @@ Status is `OBSERVED` or `PARTIAL`; `PARTIAL` reasons (observation failures, entr
 ## Permissions, privacy, and limits
 
 DiskHound performs no network activity of its own, except that `--include-remote-mounts` enters network, FUSE, and autofs mounts, which can block and generate network traffic. It never mutates or elevates privileges. Paths, metadata, sizes, ages, and filenames can still be sensitive. Directory trees are live rather than atomic; entries may change or disappear. Mount-namespace visibility and caller permissions define scope. The tool does not decide what is safe to remove, diagnose storage hardware, inspect file content, or remediate capacity.
+
+## Automation and development references
+
+For JSON fields, output destinations, quiet-mode behavior, and cross-utility exit
+semantics, see [CLI and evidence contracts](../../docs/CONTRACTS.md). The tool-specific
+inputs, evidence, bounds, and limitations above remain authoritative for this utility.
+See [AI-assisted usage](../../docs/AI_USAGE.md) before interpreting observations as health
+or taking a follow-up action. Contributors can use the focused test commands in
+[CONTRIBUTING.md](../../CONTRIBUTING.md).

@@ -1,5 +1,13 @@
 # OpsForge v0.2.0-beta.1 candidate validation
 
+## Reading this record
+
+This file preserves historical, revision-specific execution evidence. Repeatable
+commands live in [CONTRIBUTING.md](CONTRIBUTING.md); output semantics live in
+[docs/CONTRACTS.md](docs/CONTRACTS.md). New documentation or review notes do not
+revalidate the runtime. Add new evidence with its actual revision and environment,
+keeping previous results distinct.
+
 Hardening validation updated on 2026-09-19 for PR #16, branch `feat/opsforge-v0.2`. This record separates executed tests from support policy and outstanding environments. It is not production certification or a formal security audit.
 
 ## Candidate and release gate

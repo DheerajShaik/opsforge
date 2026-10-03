@@ -32,3 +32,12 @@ Status is `CONNECTED`, `UNREACHABLE`, or `INCOMPLETE`; the JSON `observations.st
 ## Privacy and limits
 
 NetDoctor deliberately performs DNS and destination-specific TCP/TLS activity. Hosts, IPs, routes, sources, interfaces, resolver addresses, proxy-variable presence, and timing can be sensitive. It does not ping, traceroute, inspect firewalls/neighbors, capture packets, send HTTP, authenticate, prove application readiness, identify root cause, or remediate.
+
+## Automation and development references
+
+For JSON fields, output destinations, quiet-mode behavior, and cross-utility exit
+semantics, see [CLI and evidence contracts](../../docs/CONTRACTS.md). The tool-specific
+inputs, evidence, bounds, and limitations above remain authoritative for this utility.
+See [AI-assisted usage](../../docs/AI_USAGE.md) before interpreting observations as health
+or taking a follow-up action. Contributors can use the focused test commands in
+[CONTRIBUTING.md](../../CONTRIBUTING.md).

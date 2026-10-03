@@ -32,3 +32,12 @@ Status is `OBSERVED` or `PARTIAL`. Exit 0 means `OBSERVED` (a stable requested o
 ## Privacy, permissions, and limits
 
 ProcWatch never reads `cmdline`, `environ`, memory maps, file contents, or socket payloads. Process names, IDs, cgroup paths, children, and resource values can still be sensitive. Kernel hidepid, namespaces, cgroups, and caller permissions can reduce visibility. Local syscalls have no hard cancellation guarantee. ProcWatch does not discover/rank processes, attach a debugger, send signals, diagnose leaks, determine root cause, or remediate.
+
+## Automation and development references
+
+For JSON fields, output destinations, quiet-mode behavior, and cross-utility exit
+semantics, see [CLI and evidence contracts](../../docs/CONTRACTS.md). The tool-specific
+inputs, evidence, bounds, and limitations above remain authoritative for this utility.
+See [AI-assisted usage](../../docs/AI_USAGE.md) before interpreting observations as health
+or taking a follow-up action. Contributors can use the focused test commands in
+[CONTRIBUTING.md](../../CONTRIBUTING.md).

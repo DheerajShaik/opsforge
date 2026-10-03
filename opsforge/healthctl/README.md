@@ -61,3 +61,12 @@ Each result is `PASS`, `FAIL` (a finding: the criterion was observed and not met
 ## Safety, privacy, and limits
 
 HealthCtl never accepts shell commands, scripts, plugins, environment interpolation, credentials, headers, or request bodies and never remediates. HTTP(S) checks ignore ambient proxy configuration. HTTPS and certificate checks use Python's default trust store, which honors `SSL_CERT_FILE` and `SSL_CERT_DIR` from the environment; `SSLKEYLOGFILE` is ignored. It reads only explicit local targets and contacts only configured network targets. Paths, names, endpoints, hashes, and results can be sensitive. A passed criterion proves only that narrow observation during this run—not overall host/service health or root cause.
+
+## Automation and development references
+
+For JSON fields, output destinations, quiet-mode behavior, and cross-utility exit
+semantics, see [CLI and evidence contracts](../../docs/CONTRACTS.md). The tool-specific
+inputs, evidence, bounds, and limitations above remain authoritative for this utility.
+See [AI-assisted usage](../../docs/AI_USAGE.md) before interpreting observations as health
+or taking a follow-up action. Contributors can use the focused test commands in
+[CONTRIBUTING.md](../../CONTRIBUTING.md).

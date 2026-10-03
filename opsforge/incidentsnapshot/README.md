@@ -37,3 +37,12 @@ Human output includes elapsed collection time, per-section state, interpretation
 ## Requirements and limitations
 
 Linux with procfs is required; sysfs, PSI, cgroup/systemd visibility depend on the environment. The snapshot is sequential rather than atomic, and local syscalls do not have universal hard cancellation. CPU ranking uses lifetime ticks rather than instantaneous CPU rate. Root capacity/inodes cover only `/` in the current mount namespace. Evidence does not determine severity, application health, root cause, or remediation, and no archive/upload/support bundle is created.
+
+## Automation and development references
+
+For JSON fields, output destinations, quiet-mode behavior, and cross-utility exit
+semantics, see [CLI and evidence contracts](../../docs/CONTRACTS.md). The tool-specific
+inputs, evidence, bounds, and limitations above remain authoritative for this utility.
+See [AI-assisted usage](../../docs/AI_USAGE.md) before interpreting observations as health
+or taking a follow-up action. Contributors can use the focused test commands in
+[CONTRIBUTING.md](../../CONTRIBUTING.md).

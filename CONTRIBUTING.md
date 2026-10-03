@@ -103,8 +103,102 @@ Avoid hidden telemetry and unexpected outbound communication. Diagnostic tools s
 
 Pull requests should be scoped and explain the reason for the change. When applicable, include documentation updates and tests with behavior changes.
 
-One GitHub Actions workflow (`release-regression.yml`) compiles the code and runs the `unittest` suite of `opsforge.common` and of every utility across the supported Python range, and validates packaging in a clean environment. Before opening a pull request, run the documented compile and test commands for the code you changed (`python -m unittest discover -s <utility>/tests`), and if you change `opsforge.common`, run every utility's suite too. A new utility must be added to that workflow's compile list and test loop.
+One GitHub Actions workflow (`release-regression.yml`) compiles the code and runs the `unittest` suite of `opsforge.common` and of every utility across the supported Python range, and validates packaging in a clean environment. Before opening a pull request, run the documented compile and test commands for the code you changed (`python -m unittest discover -s opsforge/<utility>/tests`), and if you change `opsforge.common`, run every utility's suite too. A new utility must be added to that workflow's compile list and test loop.
 
 Status names and exit codes are shared. Use the constants in `opsforge.common.status` (`EXIT_OK`, `EXIT_FINDING`, `EXIT_USAGE`, `EXIT_FAILURE`, `EXIT_INTERRUPTED`, and the status names) rather than integer or string literals, and follow the rules in the README's "Status and exit codes" section: a finding decides exit 1 even when other parts are missing, a gap with no finding is exit 3 (or `PARTIAL` and exit 1 for an observation-only utility), and an `--output` failure is always 3. Resolution, host parsing, and TCP connection code belong in `opsforge.common.net`, not in a utility.
 
 Packaging or release changes should additionally build the wheel and source distribution, install the wheel into a clean environment, exercise every installed command, and run `git diff --check`. Do not add runtime dependencies, install hooks, platform claims, or version declarations without explicit evidence and review.
+
+## Reproducible development commands
+
+Run these Bash commands from the repository root on a supported Linux environment
+(including a suitable WSL Linux environment). See the root README for support policy.
+The runtime uses only the standard library; packaging checks additionally need build tooling.
+
+```bash
+python3 -m venv .venv
+. .venv/bin/activate
+python --version
+```
+
+### Focused utility change
+
+Replace `configdiff` with the affected utility name under `opsforge/`. Source-tree tests do not
+require installing the package. Run modules from the repository root.
+
+```bash
+python -m compileall -q opsforge/common opsforge/configdiff
+python -m unittest discover -s opsforge/configdiff/tests -v
+python -m opsforge.configdiff.configdiff --help
+git diff --check
+```
+
+### Shared behavior or repository-wide validation
+
+Run each suite explicitly: top-level unittest discovery is not a substitute for
+the independently structured test directories. This mirrors the release workflow.
+
+```bash
+python -m compileall -q opsforge
+for component in common portlens diskhound certwatch svcdoctor loghound procwatch configdiff netdoctor healthctl incidentsnapshot; do
+  python -m unittest discover -s "opsforge/$component/tests" -v || exit "$?"
+done
+git diff --check
+```
+
+### Packaging changes
+
+Build from a clean checkout or worktree so stale artifacts cannot be mistaken for
+new builds. Package-manager installation may contact the package index for build tooling.
+
+```bash
+python -m pip install "build==1.2.2.post1"
+python -m build
+```
+
+Then install each newly built distribution into its own temporary environment and
+run checks outside the source tree. For example, in Bash:
+
+```bash
+repo_dir="$PWD"
+for artifact in "$repo_dir"/dist/*.whl "$repo_dir"/dist/*.tar.gz; do
+  package_env="$(mktemp -d)"
+  python -m venv "$package_env/venv"
+  "$package_env/venv/bin/python" -m pip install --no-deps "$artifact" || exit "$?"
+  (
+    cd "$package_env" || exit 1
+    "$package_env/venv/bin/python" -m pip check || exit "$?"
+    for command in portlens diskhound certwatch svcdoctor loghound procwatch configdiff netdoctor healthctl incident-snapshot; do
+      "$package_env/venv/bin/$command" --help >/dev/null || exit "$?"
+    done
+  ) || exit "$?"
+  printf 'Packaging environment retained for inspection: %s\n' "$package_env"
+done
+```
+
+These help/import smoke checks are only part of packaging validation. Follow
+[release-regression.yml](.github/workflows/release-regression.yml) for metadata,
+empty runtime dependencies, controlled installed JSON invocations, tests from the
+extracted sdist, uninstall checks, and both distribution matrices across supported
+interpreters. Do not replace
+controlled fixtures with unsolicited public-network checks.
+
+### Documentation, plans, and reviews
+
+For documentation-only changes, check relative links, example syntax, and agreement
+with current code/CLI help; run `git diff --check`. Run behavioral tests only when
+the change affects behavior or reveals an unresolved concern.
+
+Record executed validation with the commit, environment, commands, results, and
+limitations. Historical [VALIDATION.md](VALIDATION.md) results remain attached to
+their original revisions; do not copy them forward as new execution evidence.
+
+Use [docs/PLANS.md](docs/PLANS.md) for substantial changes and
+[docs/decisions/](docs/decisions/README.md) for lasting decisions. Keep utility README
+sections discoverable for inputs/examples, evidence, exits, permissions/activity,
+bounds, and interpretation limits. Link shared contracts rather than duplicating them.
+
+For requested PR reviews, use
+[opsforge-pr-review](.agents/skills/opsforge-pr-review/SKILL.md). Local review records
+and private working plans live under ignored `.local/`; review notes are not release
+evidence until their specific checks and revisions are verified.
