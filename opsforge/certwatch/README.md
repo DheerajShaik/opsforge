@@ -44,3 +44,12 @@ The overall status is the most severe finding. With no finding it is `VALID` whe
 ## Requirements, privacy, and limits
 
 Linux/Python plus the system `openssl` executable are required; `openssl` is used only from an absolute `PATH` directory, and both that directory and the executable must be modifiable only by root or the caller. CertWatch initiates DNS, TCP, and TLS only to caller-selected targets; it stops waiting for a name lookup after five seconds, and a resolver answer of more than 16 distinct addresses is reported as a warning. The certificate a peer presents is untrusted input: its bytes reach `openssl x509` (a shell-free, bounded, size-capped process), whose text output is parsed and escaped before display. Certificates, addresses, names, issuers, and fingerprints can be sensitive. Success does not prove revocation status, application readiness, future availability, or overall endpoint health.
+
+## Automation and development references
+
+For JSON fields, output destinations, quiet-mode behavior, and cross-utility exit
+semantics, see [CLI and evidence contracts](../../docs/CONTRACTS.md). The tool-specific
+inputs, evidence, bounds, and limitations above remain authoritative for this utility.
+See [AI-assisted usage](../../docs/AI_USAGE.md) before interpreting observations as health
+or taking a follow-up action. Contributors can use the focused test commands in
+[CONTRIBUTING.md](../../CONTRIBUTING.md).

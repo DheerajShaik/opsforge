@@ -134,3 +134,17 @@ Diagnostic output can contain sensitive operational metadata. Review it before s
 ## Contributing and license
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for development and pull-request expectations. OpsForge is licensed under the Apache License 2.0; see [LICENSE](LICENSE).
+
+## Working with AI assistants
+
+Start at [AGENTS.md](AGENTS.md) for repository instructions. Supporting guides cover
+[architecture](docs/ARCHITECTURE.md), [CLI and evidence contracts](docs/CONTRACTS.md),
+[AI-assisted diagnostic usage](docs/AI_USAGE.md), [substantial-change plans](docs/PLANS.md),
+and [architectural decisions](docs/decisions/README.md).
+
+For repeatable PR reviews, use the repository
+[opsforge-pr-review skill](.agents/skills/opsforge-pr-review/SKILL.md), for example:
+`Use $opsforge-pr-review to review PR 42 and recheck previous findings.`
+It preserves local review notes under `.local/reviews/` for follow-up chats in the
+same checkout. It does not automatically run when a PR opens or retrieve unavailable
+chat history. See [AI_USAGE.md](docs/AI_USAGE.md) for discovery and continuity details.

@@ -43,3 +43,12 @@ Status is `OBSERVED` or `PARTIAL`.
 ## Privacy and limits
 
 Log content, paths, IPs, identifiers, and excerpts may be sensitive even after conservative normalization. Output should be reviewed before sharing; JSON carries bounded excerpts rather than whole lines. LogHound does not follow, tail, decompress, query journald, parse every timestamp/log format, detect secrets, determine incident severity, identify root cause, or remediate. File observation is live rather than atomic.
+
+## Automation and development references
+
+For JSON fields, output destinations, quiet-mode behavior, and cross-utility exit
+semantics, see [CLI and evidence contracts](../../docs/CONTRACTS.md). The tool-specific
+inputs, evidence, bounds, and limitations above remain authoritative for this utility.
+See [AI-assisted usage](../../docs/AI_USAGE.md) before interpreting observations as health
+or taking a follow-up action. Contributors can use the focused test commands in
+[CONTRIBUTING.md](../../CONTRIBUTING.md).

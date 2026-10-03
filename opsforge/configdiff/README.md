@@ -39,3 +39,12 @@ Status is `UNCHANGED`, `DRIFT`, or `INCOMPLETE`; `INCOMPLETE` means directory mo
 Paths are `lstat`-checked before opening, so FIFOs and device nodes are rejected or compared by metadata instead of being opened. Final file targets use no-follow descriptors and are rechecked for identity/size/time changes. Directory traversal is anchored to open no-follow directory descriptors; child opens are relative to their parent descriptor and checked against the observed device/inode before descent. Regular files are identity-checked before reading, and symlink text is rechecked after reading. Root symlinks are refused. Directory trees are live and cannot be atomic; detected replacement races fail visibly. Paths, hashes, metadata, link targets, and explicit unified content can be sensitive. No remediation or baseline creation occurs.
 
 Semantic TOML is deferred because supported CPython 3.10 has no `tomllib`; adding a third-party runtime parser solely for this mode would violate the dependency policy. YAML and format-guessing are intentionally absent.
+
+## Automation and development references
+
+For JSON fields, output destinations, quiet-mode behavior, and cross-utility exit
+semantics, see [CLI and evidence contracts](../../docs/CONTRACTS.md). The tool-specific
+inputs, evidence, bounds, and limitations above remain authoritative for this utility.
+See [AI-assisted usage](../../docs/AI_USAGE.md) before interpreting observations as health
+or taking a follow-up action. Contributors can use the focused test commands in
+[CONTRIBUTING.md](../../CONTRIBUTING.md).

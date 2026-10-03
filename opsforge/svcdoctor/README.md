@@ -45,3 +45,12 @@ When `systemctl` itself fails, the error is classified from its C-locale stderr 
 ## Requirements, privacy, and limits
 
 A Linux systemd system manager, `systemctl`, and (for journal evidence) `journalctl` are required; each is used only from an absolute `PATH` directory, and both that directory and the executable must be modifiable only by root or the caller. Caller permissions and unit/journal policy determine visibility. Unit names, paths, users, slice names, timestamps, resource usage, dependencies, and journal lines may be sensitive. Evidence is live and non-atomic; it does not prove readiness, explain root cause, inspect transitive dependency chains, or remediate failure.
+
+## Automation and development references
+
+For JSON fields, output destinations, quiet-mode behavior, and cross-utility exit
+semantics, see [CLI and evidence contracts](../../docs/CONTRACTS.md). The tool-specific
+inputs, evidence, bounds, and limitations above remain authoritative for this utility.
+See [AI-assisted usage](../../docs/AI_USAGE.md) before interpreting observations as health
+or taking a follow-up action. Contributors can use the focused test commands in
+[CONTRIBUTING.md](../../CONTRIBUTING.md).

@@ -47,3 +47,12 @@ portlens --all --process nginx --json
 ```
 
 Results cover only one namespace and instant(s) in time. They do not establish firewall reachability, application health, port availability, root cause, or remediation.
+
+## Automation and development references
+
+For JSON fields, output destinations, quiet-mode behavior, and cross-utility exit
+semantics, see [CLI and evidence contracts](../../docs/CONTRACTS.md). The tool-specific
+inputs, evidence, bounds, and limitations above remain authoritative for this utility.
+See [AI-assisted usage](../../docs/AI_USAGE.md) before interpreting observations as health
+or taking a follow-up action. Contributors can use the focused test commands in
+[CONTRIBUTING.md](../../CONTRIBUTING.md).
