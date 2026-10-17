@@ -1,6 +1,6 @@
 ---
 name: opsforge-pr-review
-description: Review OpsForge pull requests and follow-up fixes for actionable regressions, preserving commit-specific findings across review rounds. Use for requested OpsForge PR reviews, re-reviews, and merge-readiness assessments.
+description: Review OpsForge pull requests, follow-up fixes, and whole-repository audits for actionable regressions, preserving commit-specific findings across review rounds. Use for requested OpsForge PR reviews, re-reviews, merge-readiness assessments, and codebase health scans or audits.
 ---
 
 # OpsForge PR review
@@ -79,6 +79,23 @@ head or its test merge, older CI, and checks not run. If the head moves during r
 either review the new delta or explicitly limit the report to the reviewed SHA.
 Use the repository's existing readiness policy; do not invent certification gates.
 "No actionable findings" does not imply all checks passed or authorize a merge.
+
+## Repository audits
+
+For a codebase scan without a PR, review the verified local HEAD after comparing
+it with a fresh remote default-branch ref. Run `bash scripts/check.sh all` and
+note which commit hosted CI last tested. Check documentation against code: the
+`pyproject.toml` version against CHANGELOG's Unreleased section, dated claims in
+VALIDATION.md, and CHANGELOG or architecture claims about shared helpers. Use the
+finding format above and keep the record at `.local/reviews/audit-<short-sha>.md`.
+
+## Review-fix loop
+
+Only when the user has authorized fixes, iterate: fix the highest-severity open
+finding with a regression test, run `bash scripts/check.sh` for the affected
+components, re-review the changed lines, and update the record. Stop when no
+actionable findings remain, after three rounds, or when a fix needs a decision
+listed in AGENTS.md, then report what remains.
 
 ## Preserve continuity and return the review
 

@@ -20,6 +20,7 @@ All installed modules live under the single `opsforge` package.
 | `pyproject.toml` | Package metadata, supported Python range, explicit packages, ten console entry points |
 | `MANIFEST.in` | Source-distribution documentation and test inventory |
 | `.github/workflows/release-regression.yml` | One full-suite and wheel/sdist validation workflow across supported interpreters |
+| `scripts/check.sh` | Local compile and unit-test run against a copy of the working tree, mirroring the release workflow; not packaged |
 | `.agents/skills/opsforge-pr-review/` | Reusable development review workflow; not a runtime component |
 
 The utility directories are `portlens`, `diskhound`, `certwatch`, `svcdoctor`,

@@ -146,6 +146,28 @@ done
 git diff --check
 ```
 
+### One-command check and Windows checkouts
+
+`scripts/check.sh` runs the same compile step and selected suites against a
+temporary copy of the working tree, including uncommitted changes, without
+writing into the checkout. It prints one line per suite and ends with a
+`RESULT:` line; it exits 0 on success, 1 on a failure, and 2 on a usage error.
+
+```bash
+bash scripts/check.sh configdiff   # one utility
+bash scripts/check.sh all          # common and every utility
+```
+
+From a Windows checkout, run it through WSL from the repository root in PowerShell:
+
+```powershell
+wsl.exe --cd "$PWD" -e bash scripts/check.sh all
+```
+
+The copy uses LF line endings, as CI does. Run `git diff --check` with the Git
+that manages the checkout: WSL's Git reports every line of a Windows
+`core.autocrlf` checkout as changed.
+
 ### Packaging changes
 
 Build from a clean checkout or worktree so stale artifacts cannot be mistaken for
